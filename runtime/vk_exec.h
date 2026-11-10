@@ -170,6 +170,11 @@ void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
 // textures, samplers) and images.txt (per image value statistics). The hooks run only when vk_dump_armed is set.
 extern int vk_dump_armed;
 void vk_ctrace(uint64_t key, const char *fmt, ...);   // vk_exec_xfer.c: TOTK_COMPACT_TRACE=1, 48 lines per key
+// vk_drawstats.c, MKW_DRAWSTATS=<frame>:<frames>: per-pass draw fingerprints and GPU indirect counts in the log
+void vk_drawstats_draw(VkExec *ex, uint64_t pipe);
+void vk_drawstats_count(VkExec *ex, const VkMemSpan *count);
+void vk_drawstats_mesh(VkExec *ex, uint32_t groups);
+void vk_drawstats_pass_end(VkExec *ex);
 void vk_dump_init(void);                 // reads the environment; vk_exec_record's first call
 void vk_dump_pass_end(VkExec *ex);       // after vkCmdEndRendering
 void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info);   // after a draw's binds

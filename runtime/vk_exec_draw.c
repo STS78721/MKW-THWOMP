@@ -3222,6 +3222,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     feedback_written(ex, &s);
     bind_vertex_buffers(ex);
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info);
+    vk_drawstats_draw(ex, (uint64_t)(uintptr_t)p);
     vk_exec_oq_draw(ex);
     return 1;
 }
@@ -3428,6 +3429,7 @@ static void op_draw_idx_ind_count(VkExec *ex, const p_draw_idx_ind_count *d) {
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset,
                          d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirectCount(ex->cb, ip.buffer, ip.offset, cp.buffer, cp.offset, (uint32_t)d->max_count, stride);
+    vk_drawstats_count(ex, &cp);
     ex->recorded += 2;
     note_work(ex, 1, 0);
     vk_mem_count(ip.cls, VK_MUSE_IND, ind_bytes);

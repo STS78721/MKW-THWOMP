@@ -629,6 +629,7 @@ void vk_exec_pass_end(VkExec *ex) {
     vkCmdEndRendering(ex->cb);
     ex->recorded++;
     ex->in_pass = 0;
+    vk_drawstats_pass_end(ex);
     for (int i = 0; i < ex->pass_ncolor && i < 8; i++)   // stand-ins of 3D BC targets go to their textures
         if (ex->color[i].image && ex->color[i].img && ex->color[i].img->image != ex->color[i].image)
             bc_copy_back(ex, &ex->color[i]);

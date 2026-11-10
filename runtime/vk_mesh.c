@@ -10,6 +10,7 @@
 #include "vk.h"
 #include "vk_exec.h"
 #include "vk_mesh.h"
+#include "cfg.h"
 #include "vk_rec.h"
 
 // Keyed by gfx_shader_nvn2_hash of the raw DKMESH Ampere stages (nvn2_origin is 0: they are never lowered).
@@ -361,6 +362,7 @@ static void mesh_issue_draw(VkExec *ex, const p_draw_mesh *d, const VkPipeState 
         uint32_t count = d->count > 0 ? (uint32_t)d->count : 1u;
         rec_draw_mesh_tasks(ex->cb, count, 1, 1);
         ex->recorded++;
+        vk_drawstats_mesh(ex, count);
         // Log more counts overnight: title foliage often shows count=1 in the first few, then larger
         // indirect batches; the old 4-line cap hid whether those ever ran.
         if (mesh_log_ok < 32) {
@@ -374,9 +376,21 @@ static void mesh_issue_draw(VkExec *ex, const p_draw_mesh *d, const VkPipeState 
             if (mesh_log_fail < 4) rt_log("vk_mesh: indirect draw buffer not backed"), mesh_log_fail++;
             return;
         }
+        // The count word is usually written by the game's culling / LOD compute shader in this same submission, so the
+        // CPU copy read here at record time is the previous frame's (or older): foliage drawn with a stale count blinks
+        // and swaps LOD. Default: always take the count on the GPU (below). MKW_MESH_CPU_COUNT=1: the old CPU read,
+        // for A/B tests.
+        static int cpu_count = -1;
+        if (cpu_count < 0) {
+            const char *e = cfg_get("MKW_MESH_CPU_COUNT");
+            cpu_count = e && *e == '1';
+            rt_log("vk_mesh: DrawMeshTasksIndirect counts are read %s", cpu_count ? "on the CPU at record time (MKW_MESH_CPU_COUNT=1)"
+                                                                                  : "by the GPU at draw time");
+        }
         uint32_t count = 0;
-        if (!sp.alloc && sp.avail >= 8)
+        if (cpu_count && !sp.alloc && sp.avail >= 8)
             memcpy(&count, (const void *)(uintptr_t)d->indirect, 4);
+        vk_drawstats_mesh(ex, count);
         if (count) {
             // CPU-visible NVN record: draw direct as {count,1,1}.
             rec_draw_mesh_tasks(ex->cb, count, 1, 1);
@@ -406,6 +420,7 @@ static void mesh_issue_draw(VkExec *ex, const p_draw_mesh *d, const VkPipeState 
         rec_draw_mesh_tasks_indirect(ex->cb, mesh_args_buf, (VkDeviceSize)slot * 12u, 1, 12);
         ex->recorded++;
         vk_exec_frame.draws++;
+        vk_drawstats_count(ex, &sp);   // the GPU-written group count, read back for MKW_DRAWSTATS
         if (mesh_log_ok < 8)
             rt_log("vk_mesh: DrawMeshTasksIndirect rewritten slot %u program %llu", slot,
                    (unsigned long long)ex->prog->serial),

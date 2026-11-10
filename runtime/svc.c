@@ -6,12 +6,16 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <stdlib.h>
+
+#include "cfg.h"
 #include "fs.h"
 #include "host.h"
 #include "kernel.h"
 #include "vk.h"
 #include "platform/platform.h"
 
+#undef R_OK   // <stdlib.h> on MinGW brings io.h's access() flag of that name
 #define R_OK 0u
 #define ST_FREE 0u
 #define ST_STACK 0xBu
@@ -102,6 +106,31 @@ static uint64_t user_exception_context(void) {
 }
 
 // GetInfo(w1 id, w2 handle, x3 sub id -> x1)
+// MKW_SEED=<number> (diagnostics): the random entropy GetInfo 11 hands the SDK comes from a fixed sequence instead of
+// the system, so its random number generators, and with them the title screen's attract-mode course order, repeat
+// from run to run. Unset: real random bytes.
+static int entropy_seeded(uint64_t *v) {
+    static int state = -1;   // -1 not read, 0 off, 1 on
+    static uint64_t x;
+    static PlatMutex m = PLAT_MUTEX_INIT;
+    if (state < 0) {
+        const char *e = cfg_get("MKW_SEED");
+        state = e && *e;
+        if (state) {
+            x = strtoull(e, NULL, 0) ^ 0x9e3779b97f4a7c15ull;
+            rt_log("svc: MKW_SEED=%s: GetInfo random entropy is a fixed sequence (repeatable runs)", e);
+        }
+    }
+    if (!state) return 0;
+    plat_mutex_lock(&m);
+    uint64_t z = (x += 0x9e3779b97f4a7c15ull);   // splitmix64
+    plat_mutex_unlock(&m);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    *v = z ^ (z >> 31);
+    return 1;
+}
+
 static void get_info(Cpu *c, uint64_t pc) {
     uint32_t id = (uint32_t)c->x[1];
     uint64_t v = 0;
@@ -116,7 +145,7 @@ static void get_info(Cpu *c, uint64_t pc) {
     case 8: v = 0; break;                       // debugger attached
     case 10: v = 0; break;                      // idle tick count
     case 11:                                    // random entropy
-        if (!plat_random(&v, sizeof v)) rt_fatal("GetInfo 11: no random bytes from the system");
+        if (!entropy_seeded(&v) && !plat_random(&v, sizeof v)) rt_fatal("GetInfo 11: no random bytes from the system");
         break;
     case 18: v = PROGRAM_ID; break;
     case 20: v = user_exception_context(); break;   // the SDK keeps e.g. the dying message at +0x1C0
