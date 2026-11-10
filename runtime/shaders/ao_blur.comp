@@ -1,0 +1,46 @@
+#version 450
+// Bilateral Depth-Aware AO Blur Filter (5x5 Cross Filter)
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D aoTex;
+layout(binding = 1) uniform sampler2D depthTex;
+layout(binding = 2, r8) uniform writeonly image2D dstAO;
+
+layout(push_constant) uniform PushConsts {
+    ivec2 size;
+    vec2 step_dir; // (1.0/w, 0) or (0, 1.0/h) or (1, 1)
+    float sharpness;
+    float dummy[3];
+} pc;
+
+const float KERNEL[5] = float[5](0.06136, 0.24477, 0.38774, 0.24477, 0.06136);
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+
+    float center_ao = texelFetch(aoTex, p, 0).r;
+    float center_d = texelFetch(depthTex, p, 0).r;
+
+    float total_ao = 0.0;
+    float total_weight = 0.0;
+
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            ivec2 sp = clamp(p + ivec2(x, y), ivec2(0), pc.size - 1);
+            float sample_ao = texelFetch(aoTex, sp, 0).r;
+            float sample_d = texelFetch(depthTex, sp, 0).r;
+
+            float spatial_w = KERNEL[x + 2] * KERNEL[y + 2];
+            float depth_diff = abs(center_d - sample_d) * 1000.0;
+            float depth_w = exp(-depth_diff * pc.sharpness);
+
+            float w = spatial_w * depth_w;
+            total_ao += sample_ao * w;
+            total_weight += w;
+        }
+    }
+
+    float final_ao = (total_weight > 0.0001) ? (total_ao / total_weight) : center_ao;
+    imageStore(dstAO, p, vec4(final_ao, 0.0, 0.0, 1.0));
+}

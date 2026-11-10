@@ -1,0 +1,92 @@
+#version 450
+// Horizon-Based Ambient Occlusion (HBAO) - Physically Plausible Horizon Ray-Marching
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D depthTex;
+layout(binding = 1, r8) uniform writeonly image2D dstAO;
+
+layout(push_constant) uniform PushConsts {
+    ivec2 size;
+    vec4 proj_info; // (2/P00, 2/P11, -(1+P02)/P00, -(1+P12)/P11)
+    vec4 params;    // (radius, bias, intensity, reverse_z)
+} pc;
+
+const int NUM_DIRECTIONS = 4;
+const int NUM_STEPS = 4;
+const float PI = 3.14159265359;
+
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+vec3 reconstruct_view_pos(ivec2 p, float d) {
+    vec2 uv = (vec2(p) + 0.5) / vec2(pc.size);
+    float z = (pc.params.w > 0.5) ? (1.0 / max(d, 0.0001)) : (1.0 / max(1.0 - d, 0.0001));
+    vec2 ndc = uv * 2.0 - 1.0;
+    return vec3(ndc * pc.proj_info.xy + pc.proj_info.zw, 1.0) * z;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+
+    float d = texelFetch(depthTex, p, 0).r;
+    if ((pc.params.w > 0.5 && d <= 0.0001) || (pc.params.w <= 0.5 && d >= 0.9999)) {
+        imageStore(dstAO, p, vec4(1.0));
+        return;
+    }
+
+    vec3 P = reconstruct_view_pos(p, d);
+
+    // Reconstruct normal
+    ivec2 pr = min(p + ivec2(1, 0), pc.size - 1);
+    ivec2 pb = min(p + ivec2(0, 1), pc.size - 1);
+    float dr = texelFetch(depthTex, pr, 0).r;
+    float db = texelFetch(depthTex, pb, 0).r;
+    vec3 Pr = reconstruct_view_pos(pr, dr);
+    vec3 Pb = reconstruct_view_pos(pb, db);
+    vec3 N = normalize(cross(Pr - P, Pb - P));
+    if (N.z < 0.0) N = -N;
+
+    float radius = pc.params.x;
+    float bias = pc.params.y;
+    float jitter = hash(vec2(p));
+    float step_radius_px = min(radius * 50.0 / max(P.z, 0.1), float(min(pc.size.x, pc.size.y)) * 0.1);
+
+    float ao = 0.0;
+
+    for (int i = 0; i < NUM_DIRECTIONS; i++) {
+        float angle = (float(i) + jitter) * (2.0 * PI / float(NUM_DIRECTIONS));
+        vec2 dir = vec2(cos(angle), sin(angle));
+
+        float max_sin_h = sin(bias);
+
+        for (int j = 1; j <= NUM_STEPS; j++) {
+            float step_scale = (float(j) / float(NUM_STEPS));
+            vec2 sample_offset = dir * (step_radius_px * step_scale);
+            ivec2 sample_p = ivec2(vec2(p) + sample_offset);
+
+            if (sample_p.x < 0 || sample_p.x >= pc.size.x || sample_p.y < 0 || sample_p.y >= pc.size.y)
+                continue;
+
+            float sample_d = texelFetch(depthTex, sample_p, 0).r;
+            vec3 S = reconstruct_view_pos(sample_p, sample_d);
+
+            vec3 V = S - P;
+            float dist = length(V);
+
+            if (dist < radius) {
+                // Horizon elevation angle sine: V.z / dist
+                float sin_h = V.z / max(dist, 0.001);
+                if (sin_h > max_sin_h) {
+                    float falloff = clamp(1.0 - (dist / radius), 0.0, 1.0);
+                    ao += (sin_h - max_sin_h) * falloff;
+                    max_sin_h = sin_h;
+                }
+            }
+        }
+    }
+
+    ao = clamp(1.0 - (ao / float(NUM_DIRECTIONS)), 0.0, 1.0);
+    imageStore(dstAO, p, vec4(ao, 0.0, 0.0, 1.0));
+}

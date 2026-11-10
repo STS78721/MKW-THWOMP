@@ -1,0 +1,27 @@
+#version 450
+// Ambient Occlusion Compositing (Multiplicative Blend)
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D srcColor;
+layout(binding = 1) uniform sampler2D aoTex;
+layout(binding = 2, rgba16f) uniform writeonly image2D dstColor;
+
+layout(push_constant) uniform PushConsts {
+    ivec2 size;
+    float intensity;
+    float dummy;
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+
+    vec4 color = texelFetch(srcColor, p, 0);
+    float ao = texelFetch(aoTex, p, 0).r;
+
+    // Modulate color by AO based on user intensity: ao^intensity
+    float ao_factor = clamp(pow(max(ao, 0.0), pc.intensity), 0.0, 1.0);
+    color.rgb *= ao_factor;
+
+    imageStore(dstColor, p, color);
+}

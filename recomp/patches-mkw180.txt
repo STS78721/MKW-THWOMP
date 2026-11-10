@@ -1,0 +1,2 @@
+# Code patches for Mario Kart World 1.8.0 main (recomp/patches.py). Each original word is checked against main.
+# Mario Kart World 1.8.0 lifts with zero instruction errors out of the box.

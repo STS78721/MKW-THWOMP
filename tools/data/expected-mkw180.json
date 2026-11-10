@@ -1,0 +1,13 @@
+{
+  "_comment": "Mario Kart World 1.8.0 ExeFS. Hashes only; no game data.",
+  "title_id": "0400C3F00006E000",
+  "display_version": "1.8.0",
+  "exefs_sha256": {
+    "main": "29040941362bf30175134a580a06fff7ffb8bb27e9cfed60d9ace9e9e2d982fe",
+    "main.npdm": "e3eff180c8680aed549ed4ff5d87c48b323c08c1df7032bbcb19808f0dab059b",
+    "rtld": "5d6298a77a759a7de4e494ef9a2e35fbb32b0b7166924bc86b3ef2a66def7311",
+    "sdk": "acdc4a29bb809955d6a680f3f8515e0bd1d6eb1028e6a38182f00dea08c309bd",
+    "subsdk0": "398f2c5ec3611251c28eb14c564b56b2ebd3e5eda31985011c8729c373764364",
+    "subsdk1": "722dca41f85069027a840c317928fd54e7933fdd062268a5cff802544b720684"
+  }
+}

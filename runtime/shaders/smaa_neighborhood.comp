@@ -1,0 +1,51 @@
+#version 450
+// SMAA Neighborhood Blending - Subpixel Morphological Anti-Aliasing
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D srcColor;
+layout(binding = 1) uniform sampler2D blendTex;
+layout(binding = 2, rgba16f) uniform writeonly image2D dstColor;
+
+layout(push_constant) uniform PushConsts {
+    ivec2 size;
+    vec4 rt_metrics; // (1/w, 1/h, w, h)
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+
+    vec4 a;
+    a.x = texelFetch(blendTex, min(p + ivec2(1, 0), pc.size - 1), 0).a;
+    a.y = texelFetch(blendTex, min(p + ivec2(0, 1), pc.size - 1), 0).g;
+    a.zw = texelFetch(blendTex, p, 0).xz;
+
+    if (dot(a, vec4(1.0)) < 1e-5) {
+        vec4 color = texelFetch(srcColor, p, 0);
+        imageStore(dstColor, p, color);
+        return;
+    }
+
+    bool h = max(a.x, a.z) > max(a.y, a.w);
+
+    vec4 blendingOffset = vec4(0.0, a.y, 0.0, a.w);
+    vec2 blendingWeight = a.yw;
+    if (h) {
+        blendingOffset = vec4(a.x, 0.0, a.z, 0.0);
+        blendingWeight = a.xz;
+    }
+
+    float sum = blendingWeight.x + blendingWeight.y;
+    if (sum > 0.0) {
+        blendingWeight /= sum;
+    }
+
+    vec2 uv = (vec2(p) + 0.5) * pc.rt_metrics.xy;
+    vec2 coord1 = uv + blendingOffset.xy * pc.rt_metrics.xy;
+    vec2 coord2 = uv - blendingOffset.zw * pc.rt_metrics.xy;
+
+    vec4 color = blendingWeight.x * textureLod(srcColor, coord1, 0.0);
+    color += blendingWeight.y * textureLod(srcColor, coord2, 0.0);
+
+    imageStore(dstColor, p, color);
+}

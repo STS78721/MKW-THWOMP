@@ -1,0 +1,47 @@
+#version 450
+// SMAA Edge Detection (Luma-based) - Subpixel Morphological Anti-Aliasing
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D srcColor;
+layout(binding = 1, rg8) uniform writeonly image2D dstEdges;
+
+layout(push_constant) uniform PushConsts {
+    ivec2 size;
+    float threshold;
+    float dummy;
+} pc;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+
+    vec3 c = texelFetch(srcColor, p, 0).rgb;
+    float L = dot(c, LUMA);
+
+    ivec2 p_l = max(p - ivec2(1, 0), ivec2(0));
+    ivec2 p_t = max(p - ivec2(0, 1), ivec2(0));
+    ivec2 p_r = min(p + ivec2(1, 0), pc.size - 1);
+    ivec2 p_b = min(p + ivec2(0, 1), pc.size - 1);
+
+    float L_l = dot(texelFetch(srcColor, p_l, 0).rgb, LUMA);
+    float L_t = dot(texelFetch(srcColor, p_t, 0).rgb, LUMA);
+    float L_r = dot(texelFetch(srcColor, p_r, 0).rgb, LUMA);
+    float L_b = dot(texelFetch(srcColor, p_b, 0).rgb, LUMA);
+
+    vec2 delta = abs(vec2(L) - vec2(L_l, L_t));
+    vec2 edges = step(vec2(pc.threshold), delta);
+
+    if (dot(edges, vec2(1.0)) == 0.0) {
+        imageStore(dstEdges, p, vec4(0.0));
+        return;
+    }
+
+    // Local contrast adaptation against right and bottom neighbors
+    vec2 delta_rb = abs(vec2(L) - vec2(L_r, L_b));
+    float max_delta = max(max(delta.x, delta.y), max(delta_rb.x, delta_rb.y));
+    edges *= step(0.5 * max_delta, delta);
+
+    imageStore(dstEdges, p, vec4(edges, 0.0, 0.0));
+}

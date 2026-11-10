@@ -1,0 +1,155 @@
+// ---- the window (Switch 2 system settings look, ui/theme.h): a title bar, the category list on the left (L / R or
+// Q / E step it, a click picks one), the page with its help box on the right, and a footer with the controller hints and
+// "Continue" / "Quit game". B on the gamepad and Esc close it.
+
+// A round button glyph with its letter (the footer hints).
+static void hint_glyph(ImDrawList *dl, ImVec2 c, float rad, const char *letter) {
+    using namespace mkw_theme;
+    dl->AddCircleFilled(c, rad, kText);
+    ImFont *font = ImGui::GetFont();
+    float fs = rad * 1.25f;
+    ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0, letter);
+    dl->AddText(font, fs, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), kHeader, letter);
+}
+
+// A pill glyph (L, R) for the category switch.
+static float hint_pill(ImDrawList *dl, ImVec2 p, float h, const char *letter) {
+    using namespace mkw_theme;
+    ImFont *font = ImGui::GetFont();
+    float fs = h * 0.62f;
+    ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0, letter);
+    float w = ts.x + h * 0.9f;
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), kText, h * 0.5f);
+    dl->AddText(font, fs, ImVec2(p.x + (w - ts.x) * 0.5f, p.y + (h - ts.y) * 0.5f), kHeader, letter);
+    return w;
+}
+
+static void layout_menu(uint32_t w, uint32_t h, float scale) {
+    using namespace mkw_theme;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, (float)h), kBackdrop);
+    float ww = fminf(w * 0.86f, 1500 * scale), wh = fminf(h * 0.88f, 880 * scale);
+    ImGui::SetNextWindowPos(ImVec2(w * 0.5f, h * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(ww, wh), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::Begin("##menu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImFont *font = ImGui::GetFont();
+    const ImGuiStyle &st = ImGui::GetStyle();
+    ImVec2 o = ImGui::GetWindowPos();
+    float W = ImGui::GetWindowWidth(), H = ImGui::GetWindowHeight(), fs = ImGui::GetFontSize();
+    float pad = 30 * scale, rounding = st.WindowRounding;
+    float head_h = floorf(fs * 3.1f), foot_h = floorf(fs * 3.3f), side_w = floorf(fminf(W * 0.26f, 380 * scale));
+    float body_y = o.y + head_h, body_h = H - head_h - foot_h;
+
+    // title bar: an accent bar, "Mario Kart World", the page title, and the version on the right
+    dl->AddRectFilled(o, ImVec2(o.x + W, o.y + head_h), kHeader, rounding, ImDrawFlags_RoundCornersTop);
+    dl->AddLine(ImVec2(o.x, o.y + head_h - 0.5f), ImVec2(o.x + W, o.y + head_h - 0.5f), kDivider, 1.0f);
+    float tfs = fs * 1.3f, ty = o.y + (head_h - tfs) * 0.5f;
+    dl->AddRectFilled(ImVec2(o.x + pad, o.y + head_h * 0.27f), ImVec2(o.x + pad + 6 * scale, o.y + head_h * 0.73f),
+                      kAccent, 3 * scale);
+    float tx = o.x + pad + 20 * scale;
+    const char *brand = "Mario Kart World";
+    dl->AddText(font, tfs, ImVec2(tx, ty), kText, brand);
+    tx += font->CalcTextSizeA(tfs, FLT_MAX, 0, brand).x + 14 * scale;
+    dl->AddText(font, fs, ImVec2(tx, o.y + (head_h - fs) * 0.5f + fs * 0.08f), kTextSoft, menu_text(UI_MENU_TITLE));
+    char version[96];
+    const char *game = "1.8.0";   // this project builds the 1.8.0 update (tools/mkw_cli.py prepare --i-confirm-update-180)
+    char gbuf[16];
+    if (rt_game_version) {
+        snprintf(gbuf, sizeof gbuf, "%d.%d.%d", rt_game_version / 100, rt_game_version / 10 % 10, rt_game_version % 10);
+        game = gbuf;
+    }
+    snprintf(version, sizeof version, menu_text(UI_MENU_VERSION), rt_port_version, game);
+    float vw = font->CalcTextSizeA(fs * 0.85f, FLT_MAX, 0, version).x;
+    dl->AddText(font, fs * 0.85f, ImVec2(o.x + W - pad - vw, o.y + (head_h - fs * 0.85f) * 0.5f), kTextDim, version);
+
+    // category list
+    dl->AddRectFilled(ImVec2(o.x, body_y), ImVec2(o.x + side_w, body_y + body_h), kSidebar);
+    dl->AddLine(ImVec2(o.x + side_w - 0.5f, body_y), ImVec2(o.x + side_w - 0.5f, body_y + body_h), kDivider, 1.0f);
+    int step = g_modal || binds_modal()                                                                  ? 0
+             : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
+             : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1
+                                                                                                         : 0;
+    if (step) g_tab_request = (g_tab + step + TAB_COUNT) % TAB_COUNT;
+    float ih = floorf(fs * 2.4f), ix = o.x + 14 * scale, iw = side_w - 28 * scale, iy = body_y + 18 * scale;
+    for (int k = 0; k < TAB_COUNT; k++) {
+        ImVec2 a(ix, iy + k * (ih + 6 * scale)), b(ix + iw, a.y + ih);
+        ImGui::SetCursorScreenPos(a);
+        ImGui::PushID(k);
+        // not in the D-pad navigation (L / R switch pages); the mouse picks one
+        if (ImGui::InvisibleButton("##cat", ImVec2(iw, ih)) && !g_modal && !binds_modal()) g_tab_request = k;
+        bool hov = ImGui::IsItemHovered();
+        ImGui::PopID();
+        bool sel = k == (g_tab_request >= 0 ? g_tab_request : g_tab);
+        if (sel) {
+            dl->AddRectFilled(a, b, kRowSel, 8 * scale);
+            dl->AddRectFilled(ImVec2(a.x + 8 * scale, a.y + ih * 0.22f), ImVec2(a.x + 13 * scale, b.y - ih * 0.22f),
+                              kAccent, 3 * scale);
+        } else if (hov) {
+            dl->AddRectFilled(a, b, kRowHover, 8 * scale);
+        }
+        dl->AddText(ImVec2(a.x + 26 * scale, a.y + (ih - fs) * 0.5f), sel ? kAccentText : kText, menu_text(kTabNames[k]));
+    }
+    // L / R under the list: the controller's page switch
+    {
+        float ph = fs * 1.1f, py = body_y + body_h - ph - 20 * scale, px = ix + 12 * scale;
+        px += hint_pill(dl, ImVec2(px, py), ph, "L") + 8 * scale;
+        hint_pill(dl, ImVec2(px, py), ph, "R");
+    }
+    if (g_tab_request >= 0) {
+        g_tab = g_tab_request;
+        g_focus_page = g_tab_request;   // the new page's first row takes the cursor
+        g_tab_request = -1;
+    }
+
+    // the page: a direct NavFlattened child of this window (option_rows.cpp), so the D-pad moves between its rows and
+    // the footer buttons without a second child level in between
+    ImGui::SetCursorScreenPos(ImVec2(o.x + side_w + pad, body_y + pad * 0.7f));
+    if (g_focus_page == g_tab) {
+        opt_focus_first();
+        g_focus_page = -1;
+    }
+    opt_reserve_bottom(foot_h + pad * 0.5f);
+    opt_reserve_right(pad);
+    switch (g_tab) {
+    case TAB_DISPLAY: tab_display(scale); break;
+    case TAB_SOUND: tab_sound(scale); break;
+    case TAB_CONTROLS: tab_controls(scale); break;
+    case TAB_SYSTEM: tab_system(scale); break;
+    case TAB_ADVANCED: tab_advanced(scale); break;
+    }
+
+    // footer: the hints (or the save failure) on the left, "Continue" and "Quit game" on the right
+    float fy = o.y + H - foot_h;
+    dl->AddRectFilled(ImVec2(o.x, fy), ImVec2(o.x + W, o.y + H), kHeader, rounding, ImDrawFlags_RoundCornersBottom);
+    dl->AddLine(ImVec2(o.x, fy + 0.5f), ImVec2(o.x + W, fy + 0.5f), kDivider, 1.0f);
+    float cy = fy + foot_h * 0.5f, rad = fs * 0.62f, hx = o.x + pad;
+    if (!cfg_last_save_ok()) {   // stays until a save succeeds; the settings hold for the session
+        dl->AddText(ImVec2(hx, cy - fs * 0.5f), kWarn, menu_text(UI_MENU_SAVE_FAILED));
+    } else {
+        const struct { const char *glyph; UiTextId text; } hints[] = {
+            {"A", UI_MENU_HINT_OK}, {"B", UI_MENU_HINT_BACK}};
+        for (const auto &e : hints) {
+            hint_glyph(dl, ImVec2(hx + rad, cy), rad, e.glyph);
+            hx += rad * 2 + 8 * scale;
+            dl->AddText(ImVec2(hx, cy - fs * 0.5f), kTextSoft, menu_text(e.text));
+            hx += ImGui::CalcTextSize(menu_text(e.text)).x + 26 * scale;
+        }
+    }
+    const char *cont = menu_text(UI_MENU_CONTINUE), *quit = menu_text(UI_MENU_QUIT);
+    float bw = fmaxf(ImGui::CalcTextSize(cont).x, ImGui::CalcTextSize(quit).x) + st.FramePadding.x * 4;
+    float bh = ImGui::GetFrameHeight();
+    ImGui::SetCursorScreenPos(ImVec2(o.x + W - pad - bw * 2 - 14 * scale, cy - bh * 0.5f));
+    if (ImGui::Button(cont, ImVec2(bw, 0))) set_open(0);
+    ImGui::SameLine(0, 14 * scale);
+    if (ImGui::Button(quit, ImVec2(bw, 0))) gfx_window_request_close();
+
+    bool was_modal = g_modal || binds_modal();
+    if (g_tab != TAB_SYSTEM) g_modal = false;
+    if (!was_modal && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
+        set_open(0);
+    ImGui::End();
+}
+

@@ -1,0 +1,14 @@
+--- a/src/Ryujinx.Graphics.Shader/Decoders/Decoder.cs
++++ b/src/Ryujinx.Graphics.Shader/Decoders/Decoder.cs
+@@ -500,7 +500,10 @@ namespace Ryujinx.Graphics.Shader.Decoders
+ 
+         public static bool IsUnconditionalBranch(ref InstOp op)
+         {
+-            return IsUnconditional(ref op) && op.Props.HasFlag(InstProps.Bra);
++            // A call returns to the next instruction, so it never ends the flow there even when it is not predicated:
++            // CAL is flagged as a branch only to find its target. Without this the code after an unpredicated CAL
++            // (for example the BRA that skips a fast path after a slow-path call) was unreachable.
++            return IsUnconditional(ref op) && op.Props.HasFlag(InstProps.Bra) && op.Name != InstName.Cal;
+         }
+ 
+         private static bool IsUnconditional(ref InstOp op)

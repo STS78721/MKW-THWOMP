@@ -1,0 +1,77 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitSurface.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitSurface.cs
+@@ -235,13 +235,7 @@
+                 sourcesList.Add(Ra());
+             }
+ 
+-            if (Sample1DAs2D && (type & SamplerType.Mask) == SamplerType.Texture1D)
+-            {
+-                sourcesList.Add(Const(0));
+-
+-                type &= ~SamplerType.Mask;
+-                type |= SamplerType.Texture2D;
+-            }
++            // Preserve 1D storage images: Vulkan image views retain their actual dimensionality.
+ 
+             if (type.HasFlag(SamplerType.Array))
+             {
+@@ -342,13 +336,7 @@
+                 sourcesList.Add(Ra());
+             }
+ 
+-            if (Sample1DAs2D && (type & SamplerType.Mask) == SamplerType.Texture1D)
+-            {
+-                sourcesList.Add(Const(0));
+-
+-                type &= ~SamplerType.Mask;
+-                type |= SamplerType.Texture2D;
+-            }
++            // Preserve 1D storage images: Vulkan image views retain their actual dimensionality.
+ 
+             if (type.HasFlag(SamplerType.Array))
+             {
+@@ -514,13 +502,7 @@
+                 sourcesList.Add(Ra());
+             }
+ 
+-            if (Sample1DAs2D && (type & SamplerType.Mask) == SamplerType.Texture1D)
+-            {
+-                sourcesList.Add(Const(0));
+-
+-                type &= ~SamplerType.Mask;
+-                type |= SamplerType.Texture2D;
+-            }
++            // Preserve 1D storage images: Vulkan image views retain their actual dimensionality.
+ 
+             if (type.HasFlag(SamplerType.Array))
+             {
+@@ -619,13 +601,7 @@
+                 sourcesList.Add(Ra());
+             }
+ 
+-            if (Sample1DAs2D && (type & SamplerType.Mask) == SamplerType.Texture1D)
+-            {
+-                sourcesList.Add(Const(0));
+-
+-                type &= ~SamplerType.Mask;
+-                type |= SamplerType.Texture2D;
+-            }
++            // Preserve 1D storage images: Vulkan image views retain their actual dimensionality.
+ 
+             if (type.HasFlag(SamplerType.Array))
+             {
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -234,6 +234,12 @@
+ 
+                 Dim dim = GetDim(image.Type);
+ 
++                if (dim == Dim.Dim1D)
++                {
++                    context.AddCapability(Capability.Sampled1D);
++                    context.AddCapability(Capability.Image1D);
++                }
++
+                 SpvInstruction imageType = context.TypeImage(
+                     context.GetType(image.Format.GetComponentType()),
+                     dim,
