@@ -1295,11 +1295,21 @@ HOST_OVERRIDE("_ZN2nn7account12AsyncContextaSEOS1_", ov_account_async_move_assig
 
 static void ov_mem_debug_break(Cpu *c) {
     static int s_logged = 0;
-    if (s_logged < 10) {
+    if (s_logged < 40) {
         s_logged++;
         rt_log("mem: nnmem_nlib_debug_break ignored (x0=%#llx x1=%#llx lr=%#llx)%s",
                (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[30],
-               s_logged == 10 ? " (further breaks suppressed)" : "");
+               s_logged == 40 ? " (further breaks suppressed)" : "");
+        // guest frame-pointer chain: who freed a pointer nmalloc does not own
+        char bt[256]; int o = 0;
+        uint64_t fp = c->x[29];
+        for (int i = 0; i < 10 && fp >= 0x100000000ull && fp < 0x8000000000ull && !(fp & 7); i++) {
+            uint64_t lr = *(const uint64_t *)(uintptr_t)(fp + 8);
+            o += snprintf(bt + o, sizeof bt - o, " %#llx", (unsigned long long)lr);
+            if (o >= (int)sizeof bt - 20) break;
+            fp = *(const uint64_t *)(uintptr_t)fp;
+        }
+        rt_log("mem: debug_break backtrace%s", bt);
     }
 }
 HOST_OVERRIDE("nnmem_nlib_debug_break", ov_mem_debug_break);
@@ -1443,20 +1453,52 @@ extern void __real_f_7000cdc2f0(Cpu *c) __attribute__((weak));
 extern void __real_f_70005e10a0(Cpu *c) __attribute__((weak));
 extern void __real_f_70003f2d70(Cpu *c) __attribute__((weak));
 
+// MKW_HEAP_TRACE=1 (diagnostics, foliage plan): the first allocations and free-size queries of the game's sead heaps.
+// MKW_HEAP_LEGACY=1: the old workarounds for a starving game heap (report 32 MiB when a heap is full, satisfy a
+// failed ExpHeap::alloc from a bump region). They were masking the loader binding the SDK's operator delete to the
+// SDK's own _ZdlPv (game-heap blocks were never freed, see loader.c resolve); the bump region also lands inside a
+// live game heap. Off by default: the game's own answers are used.
+static int heap_legacy(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("MKW_HEAP_LEGACY");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
+static int heap_trace(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("MKW_HEAP_TRACE");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
 void __wrap_f_70005e10a0(Cpu *c) {
+    uint64_t trace_heap = c->x[0], trace_lr = c->x[30], zheap = trace_heap, zlr = trace_lr;
     if (__real_f_70005e10a0) {
         __real_f_70005e10a0(c);
     } else {
         GuestFn orig = rt_dispatch_lookup(0x70005e10a0ull);
         if (orig) orig(c);
     }
+    static volatile int32_t nq;
+    if (heap_trace() && __atomic_fetch_add(&nq, 1, __ATOMIC_RELAXED) < 60)
+        rt_log("htrace maxalloc heap %#llx -> %#llx (lr %#llx)", (unsigned long long)trace_heap,
+               (unsigned long long)c->x[0], (unsigned long long)trace_lr);
     if (c->x[0] == 0) {
-        rt_log("heap: f_70005e10a0 getMaxAllocatableSize returned 0, providing fallback 32 MiB");
-        c->x[0] = 32 * 1024 * 1024;
+        static volatile int32_t nz;
+        if (__atomic_fetch_add(&nz, 1, __ATOMIC_RELAXED) < 20)
+            rt_log("heap: f_70005e10a0 getMaxAllocatableSize heap %#llx returned 0 (lr %#llx)%s", (unsigned long long)zheap,
+                   (unsigned long long)zlr, heap_legacy() ? ", legacy: reporting 32 MiB" : "");
+        if (heap_legacy()) c->x[0] = 32 * 1024 * 1024;
     }
 }
 
 void __wrap_f_70003f2d70(Cpu *c) {
+    uint64_t zheap = c->x[0], zlr = c->x[30];
     if (__real_f_70003f2d70) {
         __real_f_70003f2d70(c);
     } else {
@@ -1464,8 +1506,11 @@ void __wrap_f_70003f2d70(Cpu *c) {
         if (orig) orig(c);
     }
     if (c->x[0] == 0) {
-        rt_log("heap: f_70003f2d70 getMaxAllocatableSize returned 0, providing fallback 32 MiB");
-        c->x[0] = 32 * 1024 * 1024;
+        static volatile int32_t nz;
+        if (__atomic_fetch_add(&nz, 1, __ATOMIC_RELAXED) < 20)
+            rt_log("heap: f_70003f2d70 getMaxAllocatableSize heap %#llx returned 0 (lr %#llx)%s", (unsigned long long)zheap,
+                   (unsigned long long)zlr, heap_legacy() ? ", legacy: reporting 32 MiB" : "");
+        if (heap_legacy()) c->x[0] = 32 * 1024 * 1024;
     }
 }
 
@@ -1504,8 +1549,19 @@ void __wrap_f_70003f24c0(Cpu *c) {
         }
     }
 
+    static volatile int32_t na;
+    if (heap_trace() && __atomic_fetch_add(&na, 1, __ATOMIC_RELAXED) < 300)
+        rt_log("htrace alloc heap %#llx size %#llx align %lld -> %#llx (lr %#llx)", (unsigned long long)heap,
+               (unsigned long long)size, (long long)raw_align, (unsigned long long)c->x[0], (unsigned long long)lr);
     if (c->x[0] != 0) {
         return; // Normal guest allocation succeeded
+    }
+    if (!heap_legacy()) {
+        static volatile int32_t nf;
+        if (__atomic_fetch_add(&nf, 1, __ATOMIC_RELAXED) < 20)
+            rt_log("heap: ExpHeap::alloc heap %#llx size %#llx align %d failed (lr %#llx)", (unsigned long long)heap,
+                   (unsigned long long)size, raw_align, (unsigned long long)lr);
+        return;
     }
 
     // Allocation failed - provide fallback allocation.
@@ -2014,6 +2070,27 @@ void __wrap_f_700259aac0(Cpu *c) {
     mkw_soft_av_call(__real_f_700259aac0, c, "f_700259aac0");
 }
 
+
+// MKW_HEAP_TRACE=1: logging pass-throughs on the ExpHeap vtable slots around alloc (sead Heap order): adjust (-1),
+// free (+1), resizeFront (+2), resizeBack (+3). They call the game's own function and log heap, arguments and result.
+static uint64_t ht_orig[4];
+static const char *const ht_name[4] = {"adjust", "free", "resizeFront", "resizeBack"};
+static void ht_call(Cpu *c, int k) {
+    uint64_t heap = c->x[0], a1 = c->x[1], a2 = c->x[2], lr = c->x[30];
+    GuestFn orig = rt_dispatch_lookup(ht_orig[k]);
+    if (orig) orig(c);
+    static volatile int32_t n;
+    // free is frequent: log only the large ones (a pointer into a heap header region is a heap being freed)
+    int big = k != 1;
+    if (big && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 400)
+        rt_log("htrace %s heap %#llx a1 %#llx a2 %#llx -> %#llx (lr %#llx)", ht_name[k], (unsigned long long)heap,
+               (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)c->x[0], (unsigned long long)lr);
+}
+static void ht_adjust(Cpu *c) { ht_call(c, 0); }
+static void ht_free(Cpu *c) { ht_call(c, 1); }
+static void ht_resize_front(Cpu *c) { ht_call(c, 2); }
+static void ht_resize_back(Cpu *c) { ht_call(c, 3); }
+
 void ov_system_post_load(void) {
     if (rt_application_id == 0x0400C3F00006E000ull) {
         mkw_enable_soft_skip();
@@ -2021,6 +2098,17 @@ void ov_system_post_load(void) {
         s_expheap_hook_addr = hostfn_register("sead__ExpHeap__alloc", ov_expheap_alloc_hook);
         uint64_t *vtable1 = (uint64_t *)(uintptr_t)0x700363a330ull;
         uint64_t *vtable2 = (uint64_t *)(uintptr_t)0x70036e1e18ull;
+        if (heap_trace()) {
+            static const int slot[4] = {-1, 1, 2, 3};
+            static const GuestFn fn[4] = {ht_adjust, ht_free, ht_resize_front, ht_resize_back};
+            for (int k = 0; k < 4; k++) {
+                ht_orig[k] = vtable1[slot[k]];
+                uint64_t h = hostfn_register(ht_name[k], fn[k]);
+                if (vtable1[slot[k]] == ht_orig[k]) vtable1[slot[k]] = h;
+                if (vtable2[slot[k]] == ht_orig[k]) vtable2[slot[k]] = h;
+                rt_log("htrace hooked ExpHeap %s (%#llx)", ht_name[k], (unsigned long long)ht_orig[k]);
+            }
+        }
         rt_log("heap: patching ExpHeap::alloc vtable at %p (%#llx -> %#llx)",
                vtable1, (unsigned long long)*vtable1, (unsigned long long)s_expheap_hook_addr);
         *vtable1 = s_expheap_hook_addr;

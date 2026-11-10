@@ -327,13 +327,18 @@ static void mark_used(int observers, const char *name) {
         if (!strcmp(hostfn_table_name(observers, i), name)) (observers ? obs_used : ovr_used)[i] = 1;
 }
 
-// Order (MNG loader.c:216-224): observer (JUMP_SLOT only), override by name, own definition, other modules in load
-// order, weak -> 0, strong -> named fatal stub. Overrides also replace a module's own symbols.
+// Order: observer (JUMP_SLOT only), override by name, first definition in load order (rtld global lookup; the
+// module's own definition only if no earlier module has one), weak -> 0, strong -> named fatal stub. Overrides also replace a module's own symbols.
 static Res resolve(Mod *m, uint32_t si, int jump) {
     Res *cache = jump ? &m->res_jump[si] : &m->res_plain[si];
     if (cache->kind != RES_UNSET) return *cache;
     const char *name = sym_name(m, si);
-    uint64_t guest = sym_defined(m, si) ? m->pub.base + m->syms[si].value : find_symbol(name, NULL);
+    // Like the console's rtld (no DT_SYMBOLIC in these modules): a global lookup in load order, main first, so a
+    // module's reference to a symbol it also defines binds to an earlier module's definition. The SDK's sized
+    // operator delete calls _ZdlPv through its PLT; that must reach the game's heap-aware _ZdlPv in main, not the
+    // SDK's weak one (which frees game-heap blocks with nmalloc: NotNMallocPtrError, the block leaks, heaps starve).
+    uint64_t guest = find_symbol(name, NULL);
+    if (!guest && sym_defined(m, si)) guest = m->pub.base + m->syms[si].value;
     GuestFn f;
     Res r;
     if (jump && (f = hostfn_observer(name))) {

@@ -217,3 +217,20 @@ void vk_drawstats_oq(uint64_t rec_frame, uint64_t addr, uint64_t count, uint32_t
     rt_log("doq f%llu at f%llu a%llx v%llu q%u", (unsigned long long)rec_frame, (unsigned long long)now,
            (unsigned long long)addr, (unsigned long long)count, queries);
 }
+
+// Timestamp reports (the game's GPU timing): per frame the number of reports and the spread between the first and the
+// last tick the game will read, in microseconds. Logged when the next frame's first report comes.
+//   dts f<frame> n<reports> span <us> us
+void vk_drawstats_ts(uint64_t frame, uint64_t addr, uint64_t ticks) {
+    (void)addr;
+    static uint64_t cur, lo, hi;
+    static uint32_t n;
+    if (frame != cur) {
+        if (cur && ds_state > 0 && cur >= ds_from && cur < ds_to)
+            rt_log("dts f%llu n%u span %llu us", (unsigned long long)cur, n, (unsigned long long)(rt_ticks_to_ns(hi - lo) / 1000));
+        cur = frame, lo = hi = ticks, n = 0;
+    }
+    if (ticks < lo) lo = ticks;
+    if (ticks > hi) hi = ticks;
+    n++;
+}

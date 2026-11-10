@@ -83,3 +83,16 @@ Phase 2 fixes is needed; the mesh-shader rewrite is the largest piece if that is
 - Fixed on the way: DrawMeshTasksIndirect read its group count on the CPU at record time (stale).
 - Open: whether the remaining cactus toggles are visible on screen (edge-of-view / distance cut-off) and the dotted LOD
   fade on trees (check the temporal anti-aliasing history next).
+
+## Heap starvation root cause (2026-11-10)
+
+- Symptom: `getMaxAllocatableSize` returned 0 at boot, and Grok's workaround handed out a fake 32 MiB plus a bump
+  allocator placed inside a live game heap (6.8 GB of fallback allocations per boot, memory corruption).
+- Cause: the loader bound a module's references to its *own* definitions first. The SDK's sized `operator delete`
+  (`_ZdlPvm`) calls `_ZdlPv` through its PLT; on the console, rtld does a global lookup in load order (no DT_SYMBOLIC),
+  so that reaches the game's heap-aware `_ZdlPv` in main. Ours bound the SDK's weak `_ZdlPv` → `free` → nmalloc,
+  which rejected every game-heap block (`NotNMallocPtrError`), so the blocks leaked, child heaps could not shrink
+  back on `adjust`, and their parents starved.
+- Fix: `loader.c` resolve() uses the first definition in load order. Result on a boot run: 40 → 0 bad frees, 467 → 0
+  fallback allocations, no failed allocations in 40 s. The workarounds are now opt-in (`MKW_HEAP_LEGACY=1`).
+- Still to check in a real race: whether pop-in, low-poly models and the old crashes improved.

@@ -174,6 +174,7 @@ void vk_ctrace(uint64_t key, const char *fmt, ...);   // vk_exec_xfer.c: TOTK_CO
 void vk_drawstats_draw(VkExec *ex, uint64_t pipe, uint64_t prog);
 void vk_drawstats_skip(VkExec *ex, uint64_t prog);       // a draw conditional rendering dropped
 void vk_drawstats_cond(int result);
+void vk_drawstats_ts(uint64_t frame, uint64_t addr, uint64_t ticks);   // a timestamp report the game will read
 void vk_drawstats_oq(uint64_t rec_frame, uint64_t addr, uint64_t count, uint32_t queries);   // completion thread                     // 0 skip, 1 render, 2 render (report not done yet)
 void vk_drawstats_count(VkExec *ex, const VkMemSpan *count);
 void vk_drawstats_mesh(VkExec *ex, uint32_t groups);

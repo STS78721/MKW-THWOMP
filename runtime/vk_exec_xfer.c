@@ -337,7 +337,25 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
     else {
         CounterWrite *a = malloc(sizeof *a);
         if (!a) rt_fatal("vk: out of memory");
-        *a = (CounterWrite){p->addr, ex->submitted_ticks};
+        uint64_t ticks = ex->submitted_ticks;
+        // MKW_GPU_TIME=zero (experiment, foliage plan): every timestamp of a frame reads that frame's first submission
+        // tick, so the game measures its GPU frame time as 0. The default (each submission's entry tick) puts the
+        // replay's CPU cost of the earlier submissions into the game's GPU timing, which a game that scales detail by
+        // GPU time reads as an overloaded GPU.
+        static int zero = -1;
+        static uint64_t z_frame, z_ticks;
+        if (zero < 0) {
+            const char *e = cfg_get("MKW_GPU_TIME");
+            zero = e && !strcmp(e, "zero");
+            if (zero) rt_log("vk: MKW_GPU_TIME=zero: the timestamps of a frame all read its first submission's tick");
+        }
+        uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+        if (zero) {
+            if (frame != z_frame) z_frame = frame, z_ticks = ticks;
+            ticks = z_ticks;
+        }
+        vk_drawstats_ts(frame, p->addr, ticks);
+        *a = (CounterWrite){p->addr, ticks};
         vk_completion_add(ex->fence, counter_cb, a);
     }
     pending[pending_head++ % PENDING] = (typeof(pending[0])){p->addr, ex->fence, samples};
