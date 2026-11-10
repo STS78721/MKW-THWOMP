@@ -171,7 +171,10 @@ void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
 extern int vk_dump_armed;
 void vk_ctrace(uint64_t key, const char *fmt, ...);   // vk_exec_xfer.c: TOTK_COMPACT_TRACE=1, 48 lines per key
 // vk_drawstats.c, MKW_DRAWSTATS=<frame>:<frames>: per-pass draw fingerprints and GPU indirect counts in the log
-void vk_drawstats_draw(VkExec *ex, uint64_t pipe);
+void vk_drawstats_draw(VkExec *ex, uint64_t pipe, uint64_t prog);
+void vk_drawstats_skip(VkExec *ex, uint64_t prog);       // a draw conditional rendering dropped
+void vk_drawstats_cond(int result);
+void vk_drawstats_oq(uint64_t rec_frame, uint64_t addr, uint64_t count, uint32_t queries);   // completion thread                     // 0 skip, 1 render, 2 render (report not done yet)
 void vk_drawstats_count(VkExec *ex, const VkMemSpan *count);
 void vk_drawstats_mesh(VkExec *ex, uint32_t groups);
 void vk_drawstats_pass_end(VkExec *ex);

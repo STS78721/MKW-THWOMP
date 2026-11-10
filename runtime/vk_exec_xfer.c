@@ -186,7 +186,7 @@ static uint32_t oq_nseg, oq_capseg;
 static int oq_lost;                      // replay: the segment missed a draw (ring full)
 static uint64_t oq_count;                // completion thread: samples since the last reset
 
-typedef struct { uint64_t addr; int reset, lost; uint32_t n; uint32_t q[]; } OqSegment;
+typedef struct { uint64_t addr, frame; int reset, lost; uint32_t n; uint32_t q[]; } OqSegment;   // frame: recorded in
 
 static int oq_ready(void) {
     if (oq_state) return oq_state > 0;
@@ -281,6 +281,7 @@ static void oq_cb(void *arg) {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
         if (s->addr) write_counter(s->addr, oq_count);
+        vk_drawstats_oq(s->frame, s->addr, oq_count, s->n);   // MKW_DRAWSTATS: when the answer lands, and what it is
     }
     free(s);
 }
@@ -291,6 +292,7 @@ static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     OqSegment *s = malloc(sizeof *s + sizeof *s->q * oq_nseg);
     if (!s) rt_fatal("vk: out of memory");
     s->addr = addr, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
+    s->frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
     oq_nseg = 0, oq_lost = 0;
     vk_completion_add(ex->fence, oq_cb, s);
@@ -364,8 +366,10 @@ static int cond_enabled(const p_render_cond *c) {
         warn_once(W_BUFFER, "conditional render counters at %#llx are not readable: rendering", (unsigned long long)c->addr);
         return 1;
     }
-    if (rx == 2 || ry == 2) return 1;   // a samples-passed count not done yet
-    return c->mode == 0 ? x == y : x != y;
+    if (rx == 2 || ry == 2) return vk_drawstats_cond(2), 1;   // a samples-passed count not done yet
+    int on = c->mode == 0 ? x == y : x != y;
+    vk_drawstats_cond(on);
+    return on;
 }
 
 // ---- textures

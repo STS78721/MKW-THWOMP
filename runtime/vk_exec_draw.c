@@ -3063,7 +3063,19 @@ unsupported:
 
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
-    if (ex->render_disabled) return 0;
+    if (ex->render_disabled) return vk_drawstats_skip(ex, ex->prog ? ex->prog->serial : 0), 0;
+    // MKW_SKIP_PROG=<serial>[,<serial>...] (diagnostics): drop the draws of those shader programs, to see on screen what
+    // a program the MKW_DRAWSTATS log names actually draws.
+    static int nskip = -1;
+    static uint64_t skip_prog[16];
+    if (nskip < 0) {
+        nskip = 0;
+        const char *e = cfg_get("MKW_SKIP_PROG");
+        for (char *q = (char *)e; q && *q && nskip < 16; q += *q == ',') skip_prog[nskip++] = strtoull(q, &q, 10);
+        if (nskip) rt_log("vk_exec: MKW_SKIP_PROG: draws of %d shader program(s) are dropped", nskip);
+    }
+    for (int i = 0; i < nskip && ex->prog; i++)
+        if (ex->prog->serial == skip_prog[i]) return 0;
     static int skip_all = -1;   // MKW_SKIP_DRAWS=1: drop every draw (bisecting GPU faults)
     if (skip_all < 0) skip_all = getenv("MKW_SKIP_DRAWS") != NULL;
     if (skip_all) return 0;
@@ -3222,7 +3234,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     feedback_written(ex, &s);
     bind_vertex_buffers(ex);
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info);
-    vk_drawstats_draw(ex, (uint64_t)(uintptr_t)p);
+    vk_drawstats_draw(ex, (uint64_t)(uintptr_t)p, ex->prog ? ex->prog->serial : 0);
     vk_exec_oq_draw(ex);
     return 1;
 }

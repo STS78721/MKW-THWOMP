@@ -612,6 +612,14 @@ static VkFormat zero_format(int type) {
     return type == GFX_TYPE_UINT ? VK_FORMAT_R32_UINT : type == GFX_TYPE_SINT ? VK_FORMAT_R32_SINT : VK_FORMAT_R32_SFLOAT;
 }
 
+// The FNV-1a hash of a shader's SPIR-V: the "vs <hash>" name MKW_DUMP's passes.txt uses (vk_dump.c shader_hash).
+static uint64_t vs_spirv_hash(const GfxShader *sh) {
+    uint64_t words = 0, h = 0xcbf29ce484222325ull;
+    const uint8_t *b = (const uint8_t *)gfx_shader_spirv(sh, &words);
+    for (uint64_t i = 0; b && i < words * 4; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
 // Attributes for the Locations the vertex shader reads; one without a usable NVN attribute reads VK_PIPE_ZERO_BINDING.
 static void vertex_input(const VkPipeState *s, VtxInput *v) {
     GfxShaderIo io[32];
@@ -632,6 +640,12 @@ static void vertex_input(const VkPipeState *s, VtxInput *v) {
         } else {
             a->binding = VK_PIPE_ZERO_BINDING, a->format = zero_format(io[l].type);
             zero = 1;
+            // Diagnostics (foliage plan, black cacti): which shader inputs read the zero buffer, and why.
+            static volatile int32_t nzero;
+            if (__atomic_fetch_add(&nzero, 1, __ATOMIC_RELAXED) < 48)
+                rt_log("vk_pipeline: vertex shader %016llx input location %d reads zeros (NVN attribute fmt %#x stream %u%s)",
+                       (unsigned long long)vs_spirv_hash(s->vs), l, (unsigned)va.fmt, (unsigned)va.stream,
+                       l >= 16 ? ", location past the 16 NVN attributes" : va.fmt ? ", format has no Vulkan vertex format" : ", no attribute set");
         }
     }
     for (uint32_t b = 0; b < 16; b++) {
@@ -1331,9 +1345,11 @@ static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w
     static int fmz_mode = -1;   // 0 off, 1 vertex stage only, 2 every stage
     if (fmz_mode < 0) {
         const char *e = cfg_get("TOTK_FMZ");
-        // On by default for vertex stages (#75): the end-of-tutorial cutscene loses the NVIDIA device without it.
-        fmz_mode = !e ? 1 : !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "vertex") ? 1 : !strcmp(e, "all") ? 2 : 1;
-        if (e && *e && strcmp(e, "0") && strcmp(e, "vertex") && strcmp(e, "all")) rt_log("vk: MKW_FMZ=%s ignored, using vertex (use 0, vertex or all)", e);
+        // Default every stage for MKW: its fragment shaders rely on Maxwell's 0 * x = 0 too. Without it the near-camera
+        // dither fade of the desert cacti computes NaN, and they draw as opaque black silhouettes (foliage plan,
+        // 2026-11-10). MKW_FMZ=vertex: vertex stages only (the original default, #75); 0: off.
+        fmz_mode = !e ? 2 : !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "vertex") ? 1 : !strcmp(e, "all") ? 2 : 2;
+        if (e && *e && strcmp(e, "0") && strcmp(e, "vertex") && strcmp(e, "all")) rt_log("vk: MKW_FMZ=%s ignored, using all (use 0, vertex or all)", e);
     }
     // MKW_FMZ_SEL=<mask>:<value> (hex, bisection aid for #75): only modules whose FNV-1a 64 hash before the rewrite
     // satisfies (hash & mask) == value get the FMZ rewrite, so a run can cover a fixed half, quarter, ... of them.

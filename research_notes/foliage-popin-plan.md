@@ -72,3 +72,14 @@ frame to the next, and sometimes stay half-dithered (a dotted tree); the user al
 
 Phase 0 (seed + detector) first: about a day, and every later step depends on it. Then Phase 1 decides which of the
 Phase 2 fixes is needed; the mesh-shader rewrite is the largest piece if that is where the blinking lives.
+
+## Results so far (2026-11-10)
+
+- Phase 0 tools: MKW_SEED (same course every run), MKW_DRAWSTATS + tools/drawstats_report.py, MKW_SKIP_PROG.
+- The A-B-A blinking in the desert is the cacti (one shader program); one cactus at a time is added and dropped by the
+  game's CPU logic. Not conditional rendering (steady 7/6), not occlusion queries (none in the scene), not GPU culling.
+- **Black cacti fixed**: MKW fragment shaders need the FMZ rewrite (Maxwell 0 * x = 0). Without it the near-camera
+  dither fade computes NaN and the cactus draws as an opaque black silhouette. MKW_FMZ now defaults to all stages.
+- Fixed on the way: DrawMeshTasksIndirect read its group count on the CPU at record time (stale).
+- Open: whether the remaining cactus toggles are visible on screen (edge-of-view / distance cut-off) and the dotted LOD
+  fade on trees (check the temporal anti-aliasing history next).
