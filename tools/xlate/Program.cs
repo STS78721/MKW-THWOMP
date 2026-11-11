@@ -28,7 +28,7 @@ using System.Text.Json.Nodes;
 
 static class SwshXlate
 {
-    const int TexBase = 0x168, SampBase = 0x568;   // NVN 分离贴图 / 采样器句柄在 c[2] 的字节基址（每槽 8 字节；dm/gfx/tools/maxwell_refs.py 全量实测） | byte base of NVN separate texture / sampler handles in c[2] (8 bytes per slot; full measurement in dm/gfx/tools/maxwell_refs.py)
+    const int CombBase = 0x20, ImgBase = 0x120, TexBase = 0x168, SampBase = 0x568;   // NVN 组合贴图 (0x20)、图像 (0x120) 与分离贴图 / 采样器句柄在 c[2] 的字节基址（每槽 8 字节） | byte bases of NVN combined (0x20), image (0x120), and separate texture / sampler handles in c[2] (8 bytes per slot)
 
     sealed class Accessor : IGpuAccessor
     {
@@ -178,7 +178,16 @@ static class SwshXlate
                 if (bytes >= img && bytes < img + 8 * (int)c[0] && (bytes - img) % 8 == 0) return (bytes - img) / 8;
                 return -1;
             }
-            return (cbufSlot < 0 || (cbufSlot & 0xffff) == 2) && bytes >= TexBase && bytes < SampBase && (bytes - TexBase) % 8 == 0 ? (bytes - TexBase) / 8 : -1;
+            if (cbufSlot >= 0 && (cbufSlot & 0xffff) != 2) return -1;
+            if (bytes >= CombBase && bytes < ImgBase && (bytes - CombBase) % 8 == 0) return (bytes - CombBase) / 8;
+            return bytes >= TexBase && bytes < SampBase && (bytes - TexBase) % 8 == 0 ? (bytes - TexBase) / 8 : -1;
+        }
+        static string StripSamplerSuffix(string t)
+        {
+            if (t == null) return null;
+            if (t.EndsWith("_depth")) return t.Substring(0, t.Length - 6);   // depth-format texture: same sampler type here; the host binds a depth view
+            if (t.EndsWith("_uint") || t.EndsWith("_sint")) return t.Substring(0, t.Length - 5);
+            return t;
         }
         public SamplerType QuerySamplerType(int handle, int cbufSlot = -1)
         {
@@ -186,7 +195,7 @@ static class SwshXlate
             if (slot >= 0) TexQueried.Add(slot);
             string t = slot >= 0 ? Get("tex", slot) ?? Get("img", slot) : null;
             if (t == null) { Notes.Add($"贴图句柄 {handle:X}（常量段 {cbufSlot}，槽 {slot}）无 PC 类型，按 2D"); return SamplerType.Texture2D; }
-            if (t.EndsWith("_depth")) t = t.Substring(0, t.Length - 6);   // depth-format texture: same sampler type here; the host binds a depth view
+            t = StripSamplerSuffix(t);
             return t switch
             {
                 "1d" => SamplerType.Texture1D, "1darray" => SamplerType.Texture1D | SamplerType.Array,
@@ -196,9 +205,24 @@ static class SwshXlate
                 _ => SamplerType.Texture2D,
             };
         }
-        public TextureFormat QueryTextureFormat(int handle, int cbufSlot = -1)
+        public TextureFormat QuerySamplerFormat(int handle, int cbufSlot = -1)
         {
             int slot = TexSlot(handle, cbufSlot);
+            if (slot >= 0) TexQueried.Add(slot);
+            string raw = slot >= 0 ? Get("tex", slot) ?? Get("img", slot) : null;
+            if (raw != null && raw.EndsWith("_uint")) return TextureFormat.R32Uint;
+            if (raw != null && raw.EndsWith("_sint")) return TextureFormat.R32Sint;
+            return TextureFormat.Unknown;
+        }
+        public TextureFormat QueryTextureFormat(int handle, int cbufSlot = -1)
+        {
+            int slot;
+            if (_job["c0"] is JsonArray) slot = TexSlot(handle, cbufSlot);
+            else {
+                int bytes = (handle & 0x3fff) * 4;
+                slot = (cbufSlot < 0 || (cbufSlot & 0xffff) == 2) && bytes >= ImgBase && bytes < TexBase && (bytes - ImgBase) % 8 == 0
+                    ? (bytes - ImgBase) / 8 : -1;
+            }
             if (slot >= 0) ImgQueried.Add(slot);
             string f = _job["img"] is JsonObject t && slot >= 0 && t[slot.ToString()] is JsonObject o ? (string)o["fmt"] : null;
             if (f == null) { Notes.Add($"图像句柄 {handle:X} 槽 {slot} 无 PC 格式，按 R8G8B8A8Unorm"); return TextureFormat.R8G8B8A8Unorm; }

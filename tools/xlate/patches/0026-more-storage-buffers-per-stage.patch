@@ -1,0 +1,42 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -22,7 +22,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+         private readonly SetBindingPair[] _cbSlotToBindingMap;
+         private readonly SetBindingPair[] _sbSlotToBindingMap;
+-        private uint _sbSlotWritten;
++        private readonly bool[] _sbSlotWritten;
+ 
+         private readonly Dictionary<int, int> _sbSlots;
+         private readonly Dictionary<int, int> _sbSlotsReverse;
+@@ -67,9 +67,9 @@ namespace Ryujinx.Graphics.Shader.Translation
+             _stagePrefix = GetShaderStagePrefix(stage);
+ 
+             _cbSlotToBindingMap = new SetBindingPair[18];
+-            // MKW: 32 storage buffers per stage, not Maxwell's 16. Switch 2 compute shaders read up to 25 base addresses
+-            // from the driver bank (c0 0x60 + 16 r); past 16 the rest of their global accesses were dropped.
+-            _sbSlotToBindingMap = new SetBindingPair[32];
++            // Match host MAX_BINDINGS (128) so guarded multi-candidate compute shaders with >32 candidates compile cleanly.
++            _sbSlotToBindingMap = new SetBindingPair[128];
++            _sbSlotWritten = new bool[128];
+             _cbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+             _sbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+ 
+@@ -189,7 +189,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+             if (write)
+             {
+-                _sbSlotWritten |= 1u << slot;
++                _sbSlotWritten[slot] = true;
+             }
+ 
+             binding = setAndBinding.Binding;
+@@ -501,7 +501,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+                 if (setAndBinding.Binding >= 0)
+                 {
+                     (int sbCbSlot, int sbCbOffset) = UnpackSbCbInfo(key);
+-                    BufferUsageFlags flags = (_sbSlotWritten & (1u << slot)) != 0 ? BufferUsageFlags.Write : BufferUsageFlags.None;
++                    BufferUsageFlags flags = _sbSlotWritten[slot] ? BufferUsageFlags.Write : BufferUsageFlags.None;
+                     if ((key & (1 << 24)) != 0)
+                     {
+                         flags |= BufferUsageFlags.Guarded;

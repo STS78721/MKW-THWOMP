@@ -403,13 +403,15 @@ typedef struct {
 } Sub;
 
 // Resolves tex, its view and a copy region to image coordinates. 0 (warned) when the copy cannot be replayed.
+// allow_mode: 0 strict, 1 allow decoded/expanded (buffer->image), 2 allow promoted depth-stencil & dual aspect (clears/t2t).
 static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopyRegion *r, int defaults_to_level,
-                       int allow_decoded, Sub *s) {
+                       int allow_mode, Sub *s) {
     memset(s, 0, sizeof *s);
     if (!t) return 0;
     TexVkFormat f;
     if (!tex_vk_format(t->d.format, &f)) return 0;
-    if (!allow_decoded && (f.vk != f.ideal || f.expand_rgb || f.astc_bw)) {
+    int promoted_ds = (allow_mode & 2) && (f.depth || f.stencil);
+    if (!(allow_mode & 1) && !promoted_ds && (f.vk != f.ideal || f.expand_rgb || f.astc_bw)) {
         warn_once(W_FORMAT, "copy of format %#x texture (decoded or expanded on upload): skipped", t->d.format);
         return 0;
     }
@@ -422,7 +424,9 @@ static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopy
     }
     const VkTexImage *img = s->img;
     if (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT) s->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    else if (img->aspect == VK_IMAGE_ASPECT_DEPTH_BIT) s->aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    else if (img->aspect == VK_IMAGE_ASPECT_DEPTH_BIT ||
+             ((allow_mode & 2) && (img->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))))
+        s->aspect = img->aspect;
     else {
         warn_once(W_FORMAT, "copy of depth-stencil format %#x texture: skipped", t->d.format);
         return 0;
@@ -945,8 +949,8 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     if (copy_decoded_astc(ex, p)) return;
     Sub s, d;
-    if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, 0, &s)) return;
-    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, 0, &d)) return;
+    if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, 2, &s)) return;
+    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, 2, &d)) return;
     d.nz = s.nz;
     int same_size = s.w == d.w && s.h == d.h;
     int same_format = s.img->format == d.img->format;
@@ -969,13 +973,30 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
         vkCmdCopyImage(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, d.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     } else {   // scaled or converting copy: nearest, or linear when asked for (colour only)
         int is3d = s.img->type == VK_IMAGE_TYPE_3D;
-        VkImageBlit bl = {.srcSubresource = sl, .dstSubresource = dl};
-        bl.srcOffsets[0] = sub_offset(&s);
-        bl.srcOffsets[1] = (VkOffset3D){s.x + (int32_t)s.w, s.y + (int32_t)s.h, is3d ? s.z + (int32_t)s.nz : 1};
-        bl.dstOffsets[0] = sub_offset(&d);
-        bl.dstOffsets[1] = (VkOffset3D){d.x + (int32_t)d.w, d.y + (int32_t)d.h, is3d ? d.z + (int32_t)d.nz : 1};
+        VkImageBlit bl[2];
+        uint32_t nbl = 0;
+        if (s.aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+            static const VkImageAspectFlags kAsp[2] = {VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT};
+            for (int i = 0; i < 2; i++) {
+                VkImageSubresourceLayers sla = sl, dla = dl;
+                sla.aspectMask = dla.aspectMask = kAsp[i];
+                bl[i] = (VkImageBlit){.srcSubresource = sla, .dstSubresource = dla};
+                bl[i].srcOffsets[0] = sub_offset(&s);
+                bl[i].srcOffsets[1] = (VkOffset3D){s.x + (int32_t)s.w, s.y + (int32_t)s.h, is3d ? s.z + (int32_t)s.nz : 1};
+                bl[i].dstOffsets[0] = sub_offset(&d);
+                bl[i].dstOffsets[1] = (VkOffset3D){d.x + (int32_t)d.w, d.y + (int32_t)d.h, is3d ? d.z + (int32_t)d.nz : 1};
+            }
+            nbl = 2;
+        } else {
+            bl[0] = (VkImageBlit){.srcSubresource = sl, .dstSubresource = dl};
+            bl[0].srcOffsets[0] = sub_offset(&s);
+            bl[0].srcOffsets[1] = (VkOffset3D){s.x + (int32_t)s.w, s.y + (int32_t)s.h, is3d ? s.z + (int32_t)s.nz : 1};
+            bl[0].dstOffsets[0] = sub_offset(&d);
+            bl[0].dstOffsets[1] = (VkOffset3D){d.x + (int32_t)d.w, d.y + (int32_t)d.h, is3d ? d.z + (int32_t)d.nz : 1};
+            nbl = 1;
+        }
         int linear = (p->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && s.aspect == VK_IMAGE_ASPECT_COLOR_BIT;
-        vkCmdBlitImage(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, d.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+        vkCmdBlitImage(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, d.img->image, VK_IMAGE_LAYOUT_GENERAL, nbl, bl,
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     ex->recorded++;
@@ -1062,19 +1083,51 @@ static int int_format(VkFormat f) {
     }
 }
 
-// Whole levels only (vkCmdClear*Image has no rectangle); partial regions, channel masks and a view that reinterprets
-// the format are skipped (MacNativeGames does not replay them either, nvn_mtl.m).
+// Whole levels only (vkCmdClear*Image has no rectangle); partial Z-slice clears of 2D-array-compatible 3D colour
+// textures are cleared via a single dynamic rendering clear pass over their slice range.
 static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     const tex_t *t = p->tex;
     if (!t) return;
     Sub s;
-    if (!sub_resolve(t, &p->view, p->has_view, &p->r, 1, 0, &s)) return;
+    if (!sub_resolve(t, &p->view, p->has_view, &p->r, 1, 2, &s)) return;
     const VkTexImage *img = s.img;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     uint32_t lw = max1(img->width >> s.level), lh = max1(img->height >> s.level);
     int reformat = p->has_view && p->view.set_format && p->view.format != t->d.format;
-    if (s.x || s.y || s.w != lw || s.h != lh || (p->mask & 0xf) != 0xf || reformat ||
-        (is3d && (s.z || s.nz != max1(img->depth >> s.level)))) {
+    int partial_3d = is3d && (s.z || s.nz != max1(img->depth >> s.level));
+    if (partial_3d && !s.x && !s.y && s.w == lw && s.h == lh && (p->mask & 0xf) == 0xf && !reformat &&
+        (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && (img->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+        img->samples == 1) {
+        if (int_format(img->format) != (p->is_uint != 0)) {
+            warn_once(W_CLEAR, "texture clear value kind (uint %d) does not match format %d: skipped", p->is_uint,
+                      (int)img->format);
+            return;
+        }
+        VkClearColorValue cv;
+        memcpy(&cv, &p->c, sizeof cv);
+        VkImageView view = vk_exec_target_view(img, img->format,
+                                               s.nz > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+                                               VK_IMAGE_ASPECT_COLOR_BIT, s.level, (uint32_t)s.z, s.nz, 0);
+        VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                                        .imageView = view,
+                                        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                                        .clearValue = {.color = cv}};
+        VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                              .renderArea = {{0, 0}, {lw, lh}},
+                              .layerCount = s.nz,
+                              .colorAttachmentCount = 1,
+                              .pColorAttachments = &ca};
+        vk_exec_pass_end(ex);
+        vk_exec_barrier(ex);
+        vkCmdBeginRendering(ex->cb, &ri);
+        vkCmdEndRendering(ex->cb);
+        ex->recorded += 2;
+        vk_texture_gpu_written(t);
+        return;
+    }
+    if (s.x || s.y || s.w != lw || s.h != lh || (p->mask & 0xf) != 0xf || reformat || partial_3d) {
         warn_once(W_CLEAR, "texture clear of region %d,%d %ux%u mask %#x (level %ux%u, view format change %d): skipped",
                   s.x, s.y, s.w, s.h, p->mask, lw, lh, reformat);
         return;

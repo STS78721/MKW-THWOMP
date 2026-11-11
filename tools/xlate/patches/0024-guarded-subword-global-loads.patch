@@ -1,0 +1,107 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
+@@ -406,10 +406,11 @@ namespace Ryujinx.Graphics.Shader.Instructions
+             int offset,
+             bool extended)
+         {
++            // Sub-word global loads (U8/S8/U16/S16) are single-register scalar loads lowered by GlobalToStorage.
+             if (context.TranslatorContext.GpuAccessor.QueryStorageBufferRuntimeCandidates() &&
+-                size is not (LsSize.B32 or LsSize.B64 or LsSize.B128))
++                size is not (LsSize.B32 or LsSize.B64 or LsSize.B128 or LsSize.U8 or LsSize.S8 or LsSize.U16 or LsSize.S16))
+             {
+-                throw new System.NotSupportedException("Storage candidates v1 supports naturally aligned B32/B64/B128 global loads only.");
++                throw new System.NotSupportedException("Storage candidates v1 supports B32/B64/B128 and sub-word U8/S8/U16/S16 global loads only.");
+             }
+             // Naturally aligned 8/16-byte accesses cannot carry between their
+             // scalar words. Get40BitsAddress handles the initial offset carry;
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -418,14 +418,19 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             GtsContext gtsContext, ResourceManager resourceManager, IGpuAccessor gpuAccessor,
+             TargetLanguage targetLanguage, BasicBlock block, Operation operation)
+         {
+-            // The halfword store is the only sub-word global operation admitted here.
++            // Sub-word global loads (U8/S8/U16/S16) and the U16 store are admitted in candidate mode.
+             bool halfwordStore = operation.StorageKind == StorageKind.GlobalMemoryU16 && operation.Inst == Instruction.Store;
++            bool byteLoad = operation.Inst == Instruction.Load &&
++                operation.StorageKind is StorageKind.GlobalMemoryU8 or StorageKind.GlobalMemoryS8;
++            bool halfwordLoad = operation.Inst == Instruction.Load &&
++                operation.StorageKind is StorageKind.GlobalMemoryU16 or StorageKind.GlobalMemoryS16;
++            bool subwordLoad = byteLoad || halfwordLoad;
+             // The packed half2 reduction, as a 32-bit aligned compare-exchange; no other F16x2 operation is admitted.
+             bool packedHalfAdd = operation.StorageKind == StorageKind.GlobalMemoryF16x2 && operation.Inst == Instruction.AtomicAdd;
+-            if ((operation.StorageKind != StorageKind.GlobalMemory && !halfwordStore && !packedHalfAdd) ||
++            if ((operation.StorageKind != StorageKind.GlobalMemory && !halfwordStore && !subwordLoad && !packedHalfAdd) ||
+                 (operation.Inst != Instruction.Load && operation.Inst != Instruction.Store && !operation.Inst.IsAtomic()))
+             {
+-                throw new NotSupportedException("Storage candidates v1 supports aligned 32-bit global operations and the U16 store only.");
++                throw new NotSupportedException("Storage candidates v1 supports aligned 32-bit global operations, sub-word loads and the U16 store only.");
+             }
+ 
+             bool storageUnaligned = gpuAccessor.QueryHasUnalignedStorageBuffer();
+@@ -523,15 +528,15 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+                 Operand words = context.StorageBufferLength(binding);
+                 Operand inRange = context.BitwiseAnd(context.ICompareEqual(deltaHigh, Const(0)),
+                     context.ICompareLessUnsigned(word, words));
+-                if (halfwordStore)
++                if (halfwordStore || halfwordLoad)
+                 {
+-                    // A halfword that starts at byte 3 of a word also writes the next word, which must be in range.
++                    // A halfword that starts at byte 3 of a word also touches the next word, which must be in range.
+                     Operand crosses = context.ConditionalSelect(
+                         context.ICompareEqual(context.BitwiseAnd(deltaLow, Const(3)), Const(3)), Const(1), Const(0));
+                     inRange = context.BitwiseAnd(inRange,
+                         context.ICompareLessUnsigned(context.IAdd(word, crosses), words));
+                 }
+-                else
++                else if (!byteLoad)
+                 {
+                     inRange = context.BitwiseAnd(inRange, context.ICompareEqual(context.BitwiseAnd(deltaLow, Const(3)), Const(0)));
+                 }
+@@ -1146,6 +1151,46 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             }
+             else
+             {
++                if (guarded && storageKind is StorageKind.GlobalMemoryU16 or StorageKind.GlobalMemoryS16)
++                {
++                    Operand crossing = context.ICompareEqual(context.BitwiseAnd(offset, Const(3)), Const(3));
++                    Operand single = Label();
++                    Operand done = Label();
++                    Operand res = Local();
++                    context.BranchIfFalse(single, crossing);
++
++                    Operand lowWord = context.Load(StorageKind.StorageBuffer, binding, Const(0), wordOffset);
++                    Operand nextWord = context.Load(StorageKind.StorageBuffer, binding, Const(0), context.IAdd(wordOffset, Const(1)));
++                    Operand combined = context.BitwiseOr(
++                        context.ShiftRightU32(lowWord, Const(24)),
++                        context.ShiftLeft(context.BitwiseAnd(nextWord, Const(0xFF)), Const(8)));
++                    if (storageKind == StorageKind.GlobalMemoryS16)
++                    {
++                        combined = context.BitfieldExtractS32(combined, Const(0), Const(16));
++                    }
++                    context.Copy(res, combined);
++                    context.Branch(done);
++
++                    context.MarkLabel(single);
++                    Operand singleVal = context.Load(StorageKind.StorageBuffer, binding, Const(0), wordOffset);
++                    Operand bitOffset = HelperFunctionManager.GetBitOffset(context, offset);
++                    if (storageKind == StorageKind.GlobalMemoryS16)
++                    {
++                        singleVal = context.ShiftRightS32(singleVal, bitOffset);
++                        singleVal = context.BitfieldExtractS32(singleVal, Const(0), Const(16));
++                    }
++                    else
++                    {
++                        singleVal = context.ShiftRightU32(singleVal, bitOffset);
++                        singleVal = context.BitwiseAnd(singleVal, Const(ushort.MaxValue));
++                    }
++                    context.Copy(res, singleVal);
++                    context.MarkLabel(done);
++                    value = res;
++                    resultValue = value;
++                    return true;
++                }
++
+                 value = context.Load(StorageKind.StorageBuffer, binding, Const(0), wordOffset);
+ 
+                 if (IsSmallInt(storageKind))

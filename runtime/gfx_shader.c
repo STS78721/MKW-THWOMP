@@ -929,6 +929,7 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
         int bytes = (handle & 0x3fff) * 4, at = (int)nvn2_c0_part(&s->c0, kind == GFX_RES_IMG ? 4 : 3);
         int n = kind == GFX_RES_IMG ? s->c0.images : s->c0.textures;
         r->slot = (int16_t)(bytes >= at && bytes < at + 8 * n && (bytes - at) % 8 == 0 ? (bytes - at) / 8 : -1);
+        if (kind == GFX_RES_IMG && r->slot < 0 && s->c0.images == 1) r->slot = 0;
     }
 }
 
@@ -1534,15 +1535,22 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
     if (a) {
         const char *sep = "";
         o += sprintf(o, ",\"tex\":{");
-        for (int i = 0; i < 32; i++)
-            if (a->tex_type[i] && a->tex_type[i] < COUNT(tex_names)) o += sprintf(o, "%s\"%d\":\"%s\"", sep, i, tex_names[a->tex_type[i]]), sep = ",";
+        for (int i = 0; i < 32; i++) {
+            uint8_t raw = a->tex_type[i], base = raw & GFX_TEX_MASK, num = raw & (GFX_TEX_SINT | GFX_TEX_UINT);
+            if (base && base < COUNT(tex_names)) {
+                const char *sfx = num == GFX_TEX_UINT ? "_uint" : num == GFX_TEX_SINT ? "_sint" : "";
+                o += sprintf(o, "%s\"%d\":\"%s%s\"", sep, i, tex_names[base], sfx), sep = ",";
+            }
+        }
         sep = "";
         o += sprintf(o, "},\"img\":{");
-        for (int i = 0; i < 32; i++)
-            if (a->img_type[i] && a->img_type[i] < COUNT(tex_names)) {
+        for (int i = 0; i < 32; i++) {
+            uint8_t base = a->img_type[i] & GFX_TEX_MASK;
+            if (base && base < COUNT(tex_names)) {
                 const char *f = a->img_format[i] && a->img_format[i] < COUNT(fmt_names) ? fmt_names[a->img_format[i]] : "R8G8B8A8Unorm";
-                o += sprintf(o, "%s\"%d\":{\"type\":\"%s\",\"fmt\":\"%s\"}", sep, i, tex_names[a->img_type[i]], f), sep = ",";
+                o += sprintf(o, "%s\"%d\":{\"type\":\"%s\",\"fmt\":\"%s\"}", sep, i, tex_names[base], f), sep = ",";
             }
+        }
         sep = "";
         o += sprintf(o, "},\"attr\":{");
         for (int i = 0; i < 32; i++)

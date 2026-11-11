@@ -1338,10 +1338,161 @@ static uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int vertex_only, uint6
     return o;
 }
 
+// Base instance in NVN 2 vertex shaders (phantom trees on Mario Circuit, foliage plan 2026-11-11). On NVN 2,
+// SR_InstanceId (0x2F8) is zero-based (InstanceIndex - BaseInstance, which the translator already emits), whereas
+// c0+0x644 (vp_c0 member 0 [100].y) holds the draw's baseInstance (firstInstance). The replay fills c0+0x644 only for
+// direct draws (an indirect draw's firstInstance is in its GPU-written arguments, and c0 cannot be patched inside a
+// render pass). Vulkan's BaseInstance builtin follows firstInstance for every draw kind, so every vertex-stage load of
+// vp_c0[0][100].y is rewritten to load BuiltIn BaseInstance (synthesising the Input variable when the module did not
+// already declare one). MKW_BASE_INSTANCE=c0 keeps the c0 load. Returns NULL when nothing was rewritten.
+static uint32_t *spirv_base_instance(const uint32_t *w, uint64_t n, uint64_t *out_n, unsigned *n_rw) {
+    enum { OP_NAME = 5, OP_ENTRY_POINT = 15, OP_CAPABILITY = 17, OP_TYPE_INT = 21, OP_TYPE_POINTER = 32,
+           OP_CONSTANT = 43, OP_CONSTANT_NULL = 46, OP_FUNCTION = 54, OP_VARIABLE = 59, OP_LOAD = 61,
+           OP_ACCESS_CHAIN = 65, OP_IN_BOUNDS_ACCESS_CHAIN = 66, OP_DECORATE = 71, OP_COPY_OBJECT = 83,
+           OP_BITCAST = 124, SC_INPUT = 1, DEC_BUILTIN = 11, BUILTIN_BASE_INSTANCE = 4425, CAP_DRAW_PARAMETERS = 4427 };
+    *n_rw = 0;
+    if (n < 6 || w[0] != 0x07230203u) return NULL;
+    uint32_t bound = w[3];
+    uint32_t *cval = calloc(bound, sizeof *cval);   // OpConstant value + 1 (0: not a scalar constant)
+    uint32_t *ptr_pointee = calloc(bound, sizeof *ptr_pointee);
+    uint32_t *ptr_sc = calloc(bound, sizeof *ptr_sc);
+    uint8_t *mark = calloc(bound, 1);               // 1: c0+0x644 access chain
+    if (!cval || !ptr_pointee || !ptr_sc || !mark) {
+        free(cval), free(ptr_pointee), free(ptr_sc), free(mark);
+        return NULL;
+    }
+    uint32_t c0 = 0, base_var = 0, base_ptr_type = 0, sint_type = 0;
+    uint64_t ep_at = 0, ann_end = 0, fn_at = 0;
+    int vertex = 0, has_draw_params = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t len = w[i] >> 16, op = w[i] & 0xffff;
+        if (!len || i + len > n) break;
+        if (op == OP_CAPABILITY && len >= 2 && w[i + 1] == CAP_DRAW_PARAMETERS) has_draw_params = 1;
+        if (op == OP_ENTRY_POINT && len >= 3 && w[i + 1] == 0 && !ep_at) vertex = 1, ep_at = i;
+        if (op == OP_NAME && len >= 3 && !strcmp((const char *)&w[i + 2], "vp_c0")) c0 = w[i + 1];
+        if (!fn_at && (op == OP_DECORATE || op == 72 || op == 73 || op == 74 || op == 75 || op == 332 || op == 5632 || op == 5633))
+            ann_end = i + len;
+        if (op == OP_DECORATE && len >= 4 && w[i + 2] == DEC_BUILTIN && w[i + 3] == BUILTIN_BASE_INSTANCE) base_var = w[i + 1];
+        if (op == OP_TYPE_INT && len == 4 && w[i + 2] == 32 && w[i + 3] == 1) sint_type = w[i + 1];
+        if (op == OP_TYPE_POINTER && len == 4 && w[i + 1] < bound) ptr_sc[w[i + 1]] = w[i + 2], ptr_pointee[w[i + 1]] = w[i + 3];
+        if (op == OP_CONSTANT && len == 4 && w[i + 2] < bound) cval[w[i + 2]] = w[i + 3] + 1;
+        if (op == OP_CONSTANT_NULL && len == 3 && w[i + 2] < bound) cval[w[i + 2]] = 1;
+        if (op == OP_VARIABLE && len >= 4 && base_var && w[i + 2] == base_var) base_ptr_type = w[i + 1];
+        if (op == OP_FUNCTION && !fn_at) fn_at = i;
+        i += len;
+    }
+    if (!vertex || !c0 || !ep_at || !fn_at) {
+        free(cval), free(ptr_pointee), free(ptr_sc), free(mark);
+        return NULL;
+    }
+    unsigned c0_loads = 0;
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t len = w[i] >> 16, op = w[i] & 0xffff;
+        if (!len || i + len > n) break;
+        if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len == 7 && w[i + 3] == c0 &&
+            w[i + 2] < bound && w[i + 4] < bound && w[i + 5] < bound && w[i + 6] < bound &&
+            cval[w[i + 4]] == 1 && cval[w[i + 5]] == 101 && cval[w[i + 6]] == 2)
+            mark[w[i + 2]] |= 1;
+        if (op == OP_LOAD && len >= 4 && w[i + 3] < bound && (mark[w[i + 3]] & 1)) c0_loads++;
+        i += len;
+    }
+    if (!c0_loads) {
+        free(cval), free(ptr_pointee), free(ptr_sc), free(mark);
+        return NULL;
+    }
+    uint32_t nb = bound, base_type = base_ptr_type < bound ? ptr_pointee[base_ptr_type] : 0;
+    uint32_t add_cap = !has_draw_params, synth = !base_var;
+    uint32_t new_types[12];
+    int nt = 0;
+    if (synth) {
+        if (!ann_end || ann_end < ep_at + (w[ep_at] >> 16) || fn_at < ann_end) {
+            free(cval), free(ptr_pointee), free(ptr_sc), free(mark);
+            return NULL;
+        }
+        if (!sint_type) {
+            sint_type = nb++;
+            new_types[nt++] = 4u << 16 | OP_TYPE_INT, new_types[nt++] = sint_type, new_types[nt++] = 32, new_types[nt++] = 1;
+        } else {
+            for (uint32_t id = 1; id < bound; id++)
+                if (ptr_sc[id] == SC_INPUT && ptr_pointee[id] == sint_type) { base_ptr_type = id; break; }
+        }
+        if (!base_ptr_type) {
+            base_ptr_type = nb++;
+            new_types[nt++] = 4u << 16 | OP_TYPE_POINTER, new_types[nt++] = base_ptr_type, new_types[nt++] = SC_INPUT,
+            new_types[nt++] = sint_type;
+        }
+        base_type = sint_type;
+        base_var = nb++;
+        new_types[nt++] = 4u << 16 | OP_VARIABLE, new_types[nt++] = base_ptr_type, new_types[nt++] = base_var,
+        new_types[nt++] = SC_INPUT;
+    } else if (!base_type) {
+        free(cval), free(ptr_pointee), free(ptr_sc), free(mark);
+        return NULL;
+    }
+    uint64_t extra = (add_cap ? 2 : 0) + (synth ? 1 + 4 + (uint64_t)nt : 0) + 4 * (uint64_t)c0_loads;
+    uint32_t *o = malloc((n + extra) * 4);
+    if (!o) {
+        free(cval), free(ptr_pointee), free(ptr_sc), free(mark);
+        return NULL;
+    }
+    uint64_t p = 5;
+    if (add_cap) o[p++] = 2u << 16 | OP_CAPABILITY, o[p++] = CAP_DRAW_PARAMETERS;
+    if (synth) {
+        uint32_t ep_len = w[ep_at] >> 16;
+        memcpy(o + p, w + 5, (size_t)(ep_at - 5) * 4), p += ep_at - 5;
+        o[p++] = (ep_len + 1) << 16 | OP_ENTRY_POINT;
+        memcpy(o + p, w + ep_at + 1, (size_t)(ep_len - 1) * 4), p += ep_len - 1;
+        o[p++] = base_var;
+        memcpy(o + p, w + ep_at + ep_len, (size_t)(ann_end - ep_at - ep_len) * 4), p += ann_end - ep_at - ep_len;
+        o[p++] = 4u << 16 | OP_DECORATE, o[p++] = base_var, o[p++] = DEC_BUILTIN, o[p++] = BUILTIN_BASE_INSTANCE;
+        memcpy(o + p, w + ann_end, (size_t)(fn_at - ann_end) * 4), p += fn_at - ann_end;
+        memcpy(o + p, new_types, (size_t)nt * 4), p += nt;
+    } else {
+        memcpy(o + p, w + 5, (size_t)(fn_at - 5) * 4), p += fn_at - 5;
+    }
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t len = w[i] >> 16, op = w[i] & 0xffff;
+        if (!len || i + len > n) break;
+        if (op == OP_LOAD && len >= 4 && w[i + 3] < bound && (mark[w[i + 3]] & 1)) {
+            uint32_t t = nb++;
+            o[p++] = 4u << 16 | OP_LOAD, o[p++] = base_type, o[p++] = t, o[p++] = base_var;
+            o[p++] = 4u << 16 | (w[i + 1] == base_type ? OP_COPY_OBJECT : OP_BITCAST), o[p++] = w[i + 1],
+            o[p++] = w[i + 2], o[p++] = t;
+            ++*n_rw;
+        } else {
+            memcpy(o + p, w + i, (size_t)len * 4), p += len;
+        }
+        i += len;
+    }
+    memcpy(o, w, 5 * 4);
+    o[3] = nb;
+    *out_n = p;
+    free(cval), free(ptr_pointee), free(ptr_sc), free(mark);
+    return o;
+}
+
 static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w, uint64_t words, int geometry_chain) {
     uint64_t fixed_n = 0;
     uint32_t *fixed = geometry_chain ? spirv_fixup_linked(w, words, &fixed_n, 1) : spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
+    static int binst_mode = -1;   // 1: c0 base instance -> BaseInstance builtin (default); 0: MKW_BASE_INSTANCE=c0
+    if (binst_mode < 0) {
+        const char *e = cfg_get("MKW_BASE_INSTANCE");
+        binst_mode = !(e && !strcmp(e, "c0"));
+        if (!binst_mode) rt_log("vk: MKW_BASE_INSTANCE=c0: vertex shaders read the base instance from c0 (indirect draws see 0)");
+    }
+    uint32_t *binst = NULL;
+    if (binst_mode) {
+        uint64_t bn = 0;
+        unsigned nrw = 0;
+        binst = spirv_base_instance(w, words, &bn, &nrw);
+        if (binst) {
+            w = binst, words = bn;
+            static volatile int32_t nlog;
+            if (__atomic_fetch_add(&nlog, 1, __ATOMIC_RELAXED) < 8)
+                rt_log("vk: base instance: %u c0+0x644 loads rewritten to BaseInstance in a vertex stage", nrw);
+        }
+    }
     static int fmz_mode = -1;   // 0 off, 1 vertex stage only, 2 every stage
     if (fmz_mode < 0) {
         const char *e = cfg_get("TOTK_FMZ");
@@ -1389,6 +1540,7 @@ static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
     free(ov);
     free(fmz);
+    free(binst);
     free(fixed);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }

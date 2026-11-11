@@ -1,0 +1,130 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -162,6 +162,17 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+                 SpvInstruction imageType;
+                 SpvInstruction sampledImageType;
++                AggregateType sampledAggType = sampler.Format switch
++                {
++                    TextureFormat.R8Uint or TextureFormat.R16Uint or TextureFormat.R32Uint or
++                    TextureFormat.R8G8Uint or TextureFormat.R16G16Uint or TextureFormat.R32G32Uint or
++                    TextureFormat.R8G8B8A8Uint or TextureFormat.R16G16B16A16Uint or TextureFormat.R32G32B32A32Uint or
++                    TextureFormat.R10G10B10A2Uint => AggregateType.U32,
++                    TextureFormat.R8Sint or TextureFormat.R16Sint or TextureFormat.R32Sint or
++                    TextureFormat.R8G8Sint or TextureFormat.R16G16Sint or TextureFormat.R32G32Sint or
++                    TextureFormat.R8G8B8A8Sint or TextureFormat.R16G16B16A16Sint or TextureFormat.R32G32B32A32Sint => AggregateType.S32,
++                    _ => AggregateType.FP32,
++                };
+ 
+                 if (sampler.Type != SamplerType.None)
+                 {
+@@ -176,7 +187,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                     };
+ 
+                     imageType = context.TypeImage(
+-                        context.TypeFP32(),
++                        context.GetType(sampledAggType, 1),
+                         dim,
+                         sampler.Type.HasFlag(SamplerType.Shadow),
+                         sampler.Type.HasFlag(SamplerType.Array),
+@@ -189,6 +200,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                 else
+                 {
+                     imageType = sampledImageType = context.TypeSampler();
++                    sampledAggType = AggregateType.FP32;
+                 }
+ 
+                 SpvInstruction sampledOrSeparateImageType = sampler.Separate ? imageType : sampledImageType;
+@@ -213,7 +225,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                     sampledImageType,
+                     sampledImagePointerType,
+                     sampledImageVariable,
+-                    sampler.ArrayLength != 1));
++                    sampler.ArrayLength != 1,
++                    sampledAggType));
+                 context.SamplersTypes.Add(new(sampler.Set, sampler.Binding), sampler.Type);
+ 
+                 context.Name(sampledImageVariable, sampler.Name);
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1513,7 +1513,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+             bool colorIsVector = isGather || !isShadow;
+ 
+-            SpvInstruction resultType = colorIsVector ? context.TypeVector(context.TypeFP32(), 4) : context.TypeFP32();
++            AggregateType sampledAgg = isShadow ? AggregateType.FP32 : declaration.SampledType;
++            SpvInstruction sampledScalarType = context.GetType(sampledAgg, 1);
++            SpvInstruction resultType = colorIsVector ? context.TypeVector(sampledScalarType, 4) : sampledScalarType;
+ 
+             if (intCoords)
+             {
+@@ -1559,6 +1561,12 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                 result = context.ImageSampleImplicitLod(resultType, image, pCoords, operandsMask, operands);
+             }
+ 
++            if (sampledAgg != AggregateType.FP32)
++            {
++                SpvInstruction fpResultType = colorIsVector ? context.TypeVector(context.TypeFP32(), 4) : context.TypeFP32();
++                result = context.Bitcast(fpResultType, result);
++            }
++
+             AggregateType swizzledResultType = AggregateType.FP32;
+ 
+             if (colorIsVector)
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SamplerDeclaration.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SamplerDeclaration.cs
+@@ -1,3 +1,5 @@
++using Ryujinx.Graphics.Shader.StructuredIr;
++using Ryujinx.Graphics.Shader.Translation;
+ using Spv.Generator;
+ 
+ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+@@ -9,19 +11,22 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+         public readonly Instruction SampledImagePointerType;
+         public readonly Instruction Image;
+         public readonly bool IsIndexed;
++        public readonly AggregateType SampledType;
+ 
+         public SamplerDeclaration(
+             Instruction imageType,
+             Instruction sampledImageType,
+             Instruction sampledImagePointerType,
+             Instruction image,
+-            bool isIndexed)
++            bool isIndexed,
++            AggregateType sampledType = AggregateType.FP32)
+         {
+             ImageType = imageType;
+             SampledImageType = sampledImageType;
+             SampledImagePointerType = sampledImagePointerType;
+             Image = image;
+             IsIndexed = isIndexed;
++            SampledType = sampledType;
+         }
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -425,6 +425,11 @@ namespace Ryujinx.Graphics.Shader
+             return SamplerType.Texture2D;
+         }
+ 
++        TextureFormat QuerySamplerFormat(int handle, int cbufSlot = -1)
++        {
++            return TextureFormat.Unknown;
++        }
++
+         /// <summary>
+         /// Gets the size in bytes of a bound constant buffer for the current shader stage.
+         /// </summary>
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -251,7 +251,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+             if (!isImage)
+             {
+-                format = TextureFormat.Unknown;
++                format = _gpuAccessor.QuerySamplerFormat(handle, cbufSlot);
+             }
+ 
+             SetBindingPair setAndBinding = GetTextureOrImageBinding(

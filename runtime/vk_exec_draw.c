@@ -28,6 +28,7 @@
 #include "nvn_hmap.h"
 #include "nvn_geometry_control.h"
 #include "nvn_indirect_reset.h"
+#include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
@@ -555,19 +556,118 @@ static int dummy_index(VkImageViewType vt, int ms) {
     }
 }
 
+// Numeric type, byte size and optimal-tiling features for sampled views and integer/sRGB view reinterpretation.
+static int vk_fmt_num_type(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16A16_UINT:
+    case VK_FORMAT_R32_UINT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_S8_UINT:
+        return GFX_TYPE_UINT;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32_SINT: case VK_FORMAT_R32G32B32A32_SINT:
+    case VK_FORMAT_A2B10G10R10_SINT_PACK32: case VK_FORMAT_B8G8R8A8_SINT:
+        return GFX_TYPE_SINT;
+    default: return GFX_TYPE_FLOAT;
+    }
+}
+
+static int vk_fmt_is_compressed(VkFormat f) {
+    return (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK) ||
+           (f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK);
+}
+
+static uint32_t vk_fmt_bytes(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT:
+    case VK_FORMAT_R8_SRGB: case VK_FORMAT_S8_UINT:
+        return 1;
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16_SINT: case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT:
+    case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_B5G6R5_UNORM_PACK16:
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_R5G5B5A1_UNORM_PACK16: case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
+    case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+        return 2;
+    case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SNORM: case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_B8G8R8A8_SINT:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_A2B10G10R10_SINT_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+        return 4;
+    case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+        return 8;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT:
+        return 16;
+    default: return 0;
+    }
+}
+
+static VkFormatFeatureFlags sampled_features_of(VkFormat f) {
+    static VkFormatFeatureFlags known[256];
+    static uint8_t have[256];
+    VkCtx *c = vk_ctx();
+    if (!c) return 0;
+    if ((unsigned)f < 256 && have[f]) return known[f];
+    VkFormatProperties p;
+    vkGetPhysicalDeviceFormatProperties(c->phys, f, &p);
+    if ((unsigned)f < 256) known[f] = p.optimalTilingFeatures, have[f] = 1;
+    return p.optimalTilingFeatures;
+}
+
+static VkFormat sampled_view_format(const VkTexImage *img, const view_t *v, int hv, int storage, TexVkFormat *vf_out,
+                                    int *used_vf) {
+    if (vf_out) memset(vf_out, 0, sizeof *vf_out);
+    if (used_vf) *used_vf = 0;
+    VkFormat fmt = img->format;
+    if (storage) {
+        if (fmt == VK_FORMAT_R8G8B8A8_SRGB) fmt = VK_FORMAT_R8G8B8A8_UNORM;
+        else if (fmt == VK_FORMAT_B8G8R8A8_SRGB) fmt = VK_FORMAT_B8G8R8A8_UNORM;
+        return fmt;
+    }
+    if (hv && v->set_format && !img->block_views && (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        TexVkFormat vf;
+        if (tex_vk_format(v->format, &vf) && !vf.depth && !vf.stencil && !vf.expand_rgb) {
+            if (vf.astc_bw && (fmt == VK_FORMAT_R8G8B8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_SRGB)) {
+                fmt = vf.vk;
+            } else if (!vf.astc_bw && !vk_fmt_is_compressed(fmt) && !vk_fmt_is_compressed(vf.vk) &&
+                       vk_fmt_bytes(fmt) && vk_fmt_bytes(fmt) == vk_fmt_bytes(vf.vk)) {
+                fmt = vf.vk;
+                if (vf_out) *vf_out = vf;
+                if (used_vf) *used_vf = 1;
+            }
+        }
+    }
+    return fmt;
+}
+
 // GFX_TEX_* of a bound texture slot (the translator's tex_type / img_type answers).
 static int gfx_type_of(const VkTexImage *img, const view_t *v, int hv) {
-    if (hv && v->set_target) return vk_pipeline_tex_type(v->target);
-    int ms = img->samples > 1;
-    switch (img->view_type) {
-    case VK_IMAGE_VIEW_TYPE_1D: return GFX_TEX_1D;
-    case VK_IMAGE_VIEW_TYPE_1D_ARRAY: return GFX_TEX_1D_ARRAY;
-    case VK_IMAGE_VIEW_TYPE_2D_ARRAY: return ms ? GFX_TEX_2D_MS_ARRAY : GFX_TEX_2D_ARRAY;
-    case VK_IMAGE_VIEW_TYPE_3D: return GFX_TEX_3D;
-    case VK_IMAGE_VIEW_TYPE_CUBE: return GFX_TEX_CUBE;
-    case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: return GFX_TEX_CUBE_ARRAY;
-    default: return ms ? GFX_TEX_2D_MS : GFX_TEX_2D;
+    int shape;
+    if (hv && v->set_target) shape = vk_pipeline_tex_type(v->target);
+    else {
+        int ms = img->samples > 1;
+        switch (img->view_type) {
+        case VK_IMAGE_VIEW_TYPE_1D: shape = GFX_TEX_1D; break;
+        case VK_IMAGE_VIEW_TYPE_1D_ARRAY: shape = GFX_TEX_1D_ARRAY; break;
+        case VK_IMAGE_VIEW_TYPE_2D_ARRAY: shape = ms ? GFX_TEX_2D_MS_ARRAY : GFX_TEX_2D_ARRAY; break;
+        case VK_IMAGE_VIEW_TYPE_3D: shape = GFX_TEX_3D; break;
+        case VK_IMAGE_VIEW_TYPE_CUBE: shape = GFX_TEX_CUBE; break;
+        case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: shape = GFX_TEX_CUBE_ARRAY; break;
+        default: shape = ms ? GFX_TEX_2D_MS : GFX_TEX_2D; break;
+        }
     }
+    if (vk_exec_view_aspect(img, v, hv) == VK_IMAGE_ASPECT_STENCIL_BIT) return shape | GFX_TEX_UINT;
+    VkFormat vfmt = sampled_view_format(img, v, hv, 0, NULL, NULL);
+    int nt = vk_fmt_num_type(vfmt);
+    if (nt == GFX_TYPE_UINT) shape |= GFX_TEX_UINT;
+    else if (nt == GFX_TYPE_SINT) shape |= GFX_TEX_SINT;
+    return shape;
 }
 
 static VkComponentSwizzle swz_of(uint8_t s) {
@@ -642,28 +742,41 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     }
     if (storage && cube) vt = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     uint32_t aspect = vk_exec_view_aspect(img, v, hv);
+    TexVkFormat vf;
+    int used_vf = 0;
+    VkFormat fmt = sampled_view_format(img, v, hv, storage, &vf, &used_vf);
+    if (storage && !(sampled_features_of(fmt) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return VK_NULL_HANDLE;
     uint8_t sw[4] = {NVN_TEXTURE_SWIZZLE_R, NVN_TEXTURE_SWIZZLE_G, NVN_TEXTURE_SWIZZLE_B, NVN_TEXTURE_SWIZZLE_A};
     if (!storage) {   // MNG nvn_mtl.m tex_swizzle_sel: view selectors replace the texture's, then the format remap
+        int alpha_one = used_vf ? vf.alpha_one : img->alpha_one;
+        const uint8_t *chan = used_vf ? vf.chan : img->chan;
         memcpy(sw, hv && v->set_swizzle ? v->swz : img->swz, 4);
-        if (img->alpha_one || img->chan[0])
+        if (alpha_one || chan[0])
             for (int i = 0; i < 4; i++) {
-                if (img->alpha_one && sw[i] == NVN_TEXTURE_SWIZZLE_A) sw[i] = NVN_TEXTURE_SWIZZLE_ONE;
-                else if (img->chan[0] && sw[i] >= NVN_TEXTURE_SWIZZLE_R && sw[i] <= NVN_TEXTURE_SWIZZLE_A)
-                    sw[i] = img->chan[sw[i] - NVN_TEXTURE_SWIZZLE_R];
+                if (alpha_one && sw[i] == NVN_TEXTURE_SWIZZLE_A) sw[i] = NVN_TEXTURE_SWIZZLE_ONE;
+                else if (chan[0] && sw[i] >= NVN_TEXTURE_SWIZZLE_R && sw[i] <= NVN_TEXTURE_SWIZZLE_A)
+                    sw[i] = chan[sw[i] - NVN_TEXTURE_SWIZZLE_R];
             }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
-    ViewKey k = {img->image, img->format, vt, aspect, l0, nl, y0, ny, swz};
+    ViewKey k = {img->image, fmt, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
     if (found) return found;
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image, .viewType = vt,
-                                .format = img->format,
+                                .format = fmt,
                                 .components = {swz_of(sw[0]), swz_of(sw[1]), swz_of(sw[2]), swz_of(sw[3])},
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-                                      .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
-    if (img->block_views) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views' (vk_texture.c)
+                                      .usage = img->block_views ? VK_IMAGE_USAGE_SAMPLED_BIT
+                                                                : (img->usage & ~VK_IMAGE_USAGE_STORAGE_BIT)};
+    // Restrict view usage for block-view BC images, sampled views over STORAGE images (sRGB views lack STORAGE_IMAGE_BIT),
+    // or format-reinterpreted storage views (e.g. R32_UINT over R8G8B8A8_SRGB, where SAMPLED/ATTACHMENT bits may be invalid).
+    if (img->block_views || (!storage && (img->usage & VK_IMAGE_USAGE_STORAGE_BIT))) ci.pNext = &use;
+    else if (storage && fmt != img->format) {
+        use.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        ci.pNext = &use;
+    }
     VkImageView view;
     if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
     ViewNode *n = malloc(sizeof *n);
@@ -690,9 +803,8 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
         VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                           .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
         if (blocks) ci.pNext = &use;   // not the BC image's sampling and transfer usages
-        // A view in another format (an sRGB target over a UNORM texture) drops the image's storage usage, which that
-        // format may lack: every colour texture that allows it is made with storage usage (vk_texture.c create_tex).
-        else if (format != img->format && (img->usage & VK_IMAGE_USAGE_STORAGE_BIT))
+        // Attachment views never use storage and sRGB images carry mutable storage usage from vk_texture.c create_tex.
+        else if (img->usage & VK_IMAGE_USAGE_STORAGE_BIT)
             use.usage = img->usage & ~VK_IMAGE_USAGE_STORAGE_BIT, ci.pNext = &use;
         if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS)
             rt_fatal("vk: render target view (format %d) could not be created", (int)format);
@@ -852,8 +964,8 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
         uint64_t tt = tmiss ? token_of(ex, h) : 0, it = imiss ? token_of(ex, hi) : 0;
         if ((tmiss || imiss || check) && !locked) vk_texture_lock(), locked = 1, BS.ac_miss++;
         if (tmiss) c->tt[slot] = type_of_handle(ex, h), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
-        if (imiss) c->it[slot] = type_of_handle(ex, hi), c->img[slot] = hi, c->itok[slot] = it, c->igen[slot] = gen;
-        if (check && (type_of_handle(ex, h) != c->tt[slot] || type_of_handle(ex, hi) != c->it[slot]))   // TOTK_SHADER_MEMO=check
+        if (imiss) c->it[slot] = type_of_handle(ex, hi) & GFX_TEX_MASK, c->img[slot] = hi, c->itok[slot] = it, c->igen[slot] = gen;
+        if (check && (type_of_handle(ex, h) != c->tt[slot] || (type_of_handle(ex, hi) & GFX_TEX_MASK) != c->it[slot]))   // MKW_SHADER_MEMO=check
             rt_fatal("vk_exec: kept texture types of stage %d slot %d differ from a lookup", st, slot);
         a->tex_type[slot] = c->tt[slot], a->img_type[slot] = c->it[slot];
     }
@@ -1005,10 +1117,10 @@ static void count_use(int cls, int use, uint64_t n) {
 
 // A buffer descriptor for [addr, addr+size) of guest memory: its backing (a pool's VRAM mirror when it has one) when
 // aligned, a copy in transient memory when the backing is host memory with an unaligned offset. 0 when neither works.
-// written: the shader stores into it (a mirror's range goes back to guest memory at the end of the submission).
+// written: the shader stores into it; writeback: schedule a mirror -> host copy at the end of the submission.
 // direct_only: guarded aliases must share the real backing; a transient copy would lose writes and alias coherence.
 static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, uint64_t max, int use, int written,
-                      int direct_only, VkDescriptorBufferInfo *out) {
+                      int writeback, int direct_only, VkDescriptorBufferInfo *out) {
     VkMemSpan sp;
     if (!addr || !vk_mem_resolve(addr, 1, &sp)) return 0;
     uint64_t n = size && size < sp.avail ? size : sp.avail;
@@ -1020,7 +1132,8 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     if (sp.offset % align == 0) {
         VK_MEM_USE(sp);
         *out = (VkDescriptorBufferInfo){sp.buffer, sp.offset, n};
-        if (written) vk_mem_gpu_wrote(&sp, n), vk_usnap_drop(addr, n);
+        if (writeback) vk_mem_gpu_wrote(&sp, n);
+        if (written) vk_usnap_drop(addr, n);
         count_use(sp.cls, use, n);
         VK_MEM_BOUND(sp);
         return 1;
@@ -1329,6 +1442,9 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
     if (stage == NVN_STAGE_CS && c0_lay) {
         if (!nvn2_c0_pack(bank, VK_C0_BYTES, c0_lay, c0_push, ssbo, ubo))
             rt_fatal("vk: invalid NVN 2 compute parameter-block layout");
+        // The dispatch's group counts at c0+0x0..0xb, below the parameter block (which starts at 0x10): NVN 2 compute
+        // programs read them there (seven MKW programs ran with zero counts). Indirect dispatches still read 0 here.
+        memcpy(bank, dispatch, 12);
         // Layout ends before 0x880: same pointer table task/mesh get (Hookshot / EvilOOT culling passes).
         if (nvn2_c0_part(c0_lay, 5) <= PTR_TABLE) c0_pointer_table(bank, ssbo);
         return;
@@ -1427,7 +1543,7 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         uint32_t len, c1;
         if (find_stage(ex->prog, st, &ctl, &code, &len)) {
             memcpy(&c1, ctl + 0x700, 4);
-            if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, VK_MUSE_UBO, 0, 0, &bi))
+            if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, VK_MUSE_UBO, 0, 0, 0, &bi))
                 return bi;
             if (c1 < len && len - c1 <= max) {   // NVN 2 stages: the lowered code (nvn2_lower.cpp) is host memory
                 VkBuffer b;
@@ -1477,7 +1593,7 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
             count_use(VK_MCLS_SCRATCH, VK_MUSE_UBO, bi.range);
             return bi;
         }
-        if (bind_range(ex, b->addr, b->size, align, max, VK_MUSE_UBO, 0, 0, &bi)) return bi;
+        if (bind_range(ex, b->addr, b->size, align, max, VK_MUSE_UBO, 0, 0, 0, &bi)) return bi;
     }
     return zero_info(max);
 }
@@ -1551,6 +1667,8 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
     uint64_t off = (uint64_t)r->handle * 4, a = 0;
     VkMemSpan sp;
     if (!u->addr || u->size < off + 8 || upd_read(ex, u->addr + off, &a, 8)) return a;
+    const uint8_t *sb = vk_usnap_bytes(u->addr + off, 8);
+    if (sb) { memcpy(&a, sb, 8); return a; }
     if (vk_mem_resolve(u->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(u->addr + off), 8);
     return a;
 }
@@ -1595,6 +1713,15 @@ static p_bind_buf guarded_storage_binding(const VkExec *ex, int st, const GfxSha
     return b;
 }
 
+// Explicit NVN 2 compute storage-buffer table slots (c0 part 2..3) carry the exact byte size passed to
+// nvnCommandBufferBindStorageBuffer, unlike speculative root/c1/UBO pointer candidates whose unbounded pool remainder
+// would overwrite adjacent CPU-written buffers if mirrored back to host RAM.
+static int guarded_is_declared_ssbo(int st, const GfxShaderRes *r, const p_bind_buf *b) {
+    if (st != NVN_STAGE_CS || !c0_lay || r->cbuf_slot != 0 || !b || !b->size) return 0;
+    size_t sb = nvn2_c0_part(c0_lay, 2), end = nvn2_c0_part(c0_lay, 3), off = (size_t)r->handle * 4;
+    return off >= sb && off < end && (off - sb) % 16 == 0;
+}
+
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.sbo_max, align = LIM.sbo_align;
@@ -1631,7 +1758,9 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         //   else the bound range when Eden is_written. Bare size: written → 1 MiB, else up to maxStorageBufferRange.
         //   (Sized mesh binds must keep full write-back: capping them to 64 B left the CPU spinning on stale counts.)
         int mesh = st == NVN_STAGE_TS || st == NVN_STAGE_MS;
-        int wb = written && slot != -2;
+        int may_write = written && slot != -2;
+        int real_write = may_write && (!guarded || guarded_is_declared_ssbo(st, r, b));
+        int wb = real_write;
         if (mesh && at) {
             VkMemSpan sp;
             if (!vk_mem_resolve(at, 1, &sp)) return zero_info(max);
@@ -1653,8 +1782,8 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
             // Bare+written: bind the guessed range without write-back, then stamp only the head (Hookshot).
             if (bare && wb) wb = 0;
         }
-        if (bind_range(ex, at, want, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO, wb, guarded, &bi)) {
-            if (written && slot != -2 && bi.buffer != VK_NULL_HANDLE) {
+        if (bind_range(ex, at, want, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO, may_write, wb, guarded, &bi)) {
+            if (real_write && bi.buffer != VK_NULL_HANDLE) {
                 uint64_t wb_n = bi.range;
                 if (mesh && bare) {
                     uint64_t head = (b->addr - at) + 0x40;
@@ -1812,19 +1941,28 @@ static int geometry_feedback_safe(VkExec *ex, const GfxShader *vs, const GfxShad
 }
 
 // Before the pipeline lookup of a draw with fragment shader fs: learns and restarts as the mode says. Returns the
-// sampled attachments in the feedback layout (the pipeline's feedback flag and feedback_barrier).
+// sampled attachments in the feedback layout (the pipeline's feedback flag and feedback_barrier). Even when no draw in
+// the open pass has written the attachment yet (fb_dirty == 0, e.g. read-only depth decals while depth is bound as an
+// attachment in GENERAL), Vulkan requires ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT and the pipeline feedback flag whenever
+// a shader samples an attachment of the active render pass (VUID-vkCmdDraw-None-09000), otherwise Hi-Z/ZCULL or DCC
+// compression on discrete GPUs can return stale or uncompressed values.
 static uint32_t feedback_prepare(VkExec *ex, const GfxShader *fs) {
     int mode = vk_ctx()->feedback;
     if (mode == VK_FEEDBACK_OFF || !fs || !ex->in_pass) return 0;
     uint32_t m = feedback_scan(ex, fs);
     uint32_t d = m & ex->fb_dirty;
     if (d) vk_exec_frame.fb_draws++;
-    if (d & ~(mode == VK_FEEDBACK_LAYOUT ? ex->fbl_mask : 0)) {
-        if (mode == VK_FEEDBACK_LAYOUT)
-            for (uint32_t i = 0; i < 9; i++) {
-                const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
-                if ((d >> i & 1) && t->img && t->img->fb_usage) ((VkTexImage *)t->img)->fb_learned = 1;
+    uint32_t learn = 0;
+    if (mode == VK_FEEDBACK_LAYOUT && (m & ~ex->fbl_mask)) {
+        for (uint32_t i = 0; i < 9; i++) {
+            const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+            if (((m & ~ex->fbl_mask) >> i & 1) && t->img && t->img->fb_usage) {
+                ((VkTexImage *)t->img)->fb_learned = 1;
+                learn |= 1u << i;
             }
+        }
+    }
+    if (learn || (d & ~(mode == VK_FEEDBACK_LAYOUT ? ex->fbl_mask : 0))) {
         vk_exec_pass_end(ex);
         vk_exec_pass_begin(ex);   // learned targets now in the feedback layout; the full barrier cleared fb_dirty
         vk_exec_frame.fb_restarts++;
@@ -1931,9 +2069,13 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         if (!storage && !separate) {
             // A depth texture sampled without a compare reads one texel on the Switch, whatever the sampler's filter:
             // blending neighbouring depths puts reconstructed positions in mid-air at object edges (shadow masks).
+            // Integer formats (UINT/SINT and STENCIL) cannot use linear filtering in Vulkan.
             int sid = (int)(h >> 20 & 0xfff);
-            int point = img && (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !(r->type & 0x400) &&
-                        vk_exec_view_aspect(img, &v, hv) != VK_IMAGE_ASPECT_STENCIL_BIT;
+            VkFormat vfmt = img ? sampled_view_format(img, &v, hv, 0, NULL, NULL) : VK_FORMAT_UNDEFINED;
+            int is_int = img && (vk_exec_view_aspect(img, &v, hv) == VK_IMAGE_ASPECT_STENCIL_BIT ||
+                                 vk_fmt_num_type(vfmt) != GFX_TYPE_FLOAT);
+            int point = img && (is_int || ((img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !(r->type & 0x400) &&
+                                           vk_exec_view_aspect(img, &v, hv) != VK_IMAGE_ASPECT_STENCIL_BIT));
             // CompactLayers: guest LOD is computed for the full guest pyramid; host level 0 is guest mip
             // host_mip0. Bias (and clamp) by -host_mip0 so distance LOD matches guest intent on the trimmed
             // stack — without it close terrain stays soft and LOD steps look like pop-in. Default off
@@ -2747,9 +2889,9 @@ static int pipe_skip_mode(void) {
     if (mode < 0) {
         const char *e = cfg_value("TOTK_PIPE_SKIP");
         mode = !strcmp(e, "strict") || !strcmp(e, "0") ? 0 : !strcmp(e, "fullscreen") || !strcmp(e, "2") ? 2 : 1;
-        static const char *const what[3] = {"only draws into per-frame passes (TOTK_PIPE_SKIP=strict)",
+        static const char *const what[3] = {"only draws into per-frame passes (MKW_PIPE_SKIP=strict)",
                                             "draws into passes with a target the previous frame rendered",
-                                            "those and full-screen draws (TOTK_PIPE_SKIP=fullscreen)"};
+                                            "those and full-screen draws (MKW_PIPE_SKIP=fullscreen)"};
         rt_log("vk_exec: draws skipped while their pipeline builds: %s", what[mode]);
     }
     return mode;
@@ -2856,7 +2998,7 @@ static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const Gf
         for (int i = 0; i < n; i++) lights |= r[i].cbuf_slot == 0 && r[i].handle * 4 == 0x530;
     }
     if (lights) {
-        warn_once(W_FAULT_SKIP, "light-quad draws with ten instance streams are skipped (#9; TOTK_FIX_VS_FAULT=0 draws them)");
+        warn_once(W_FAULT_SKIP, "light-quad draws with ten instance streams are skipped (#9; MKW_FIX_VS_FAULT=0 draws them)");
         return 1;
     }
 
@@ -2877,7 +3019,7 @@ static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const Gf
             }
         }
         if (all_instanced && active_streams >= 8) {
-            warn_once(W_FAULT_SKIP, "instanced light-quad draw is skipped (#9/cutscene; TOTK_FIX_VS_FAULT=0 draws them)");
+            warn_once(W_FAULT_SKIP, "instanced light-quad draw is skipped (#9/cutscene; MKW_FIX_VS_FAULT=0 draws them)");
             return 1;
         }
     }
@@ -3219,7 +3361,10 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
                (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1, waited / 1e6, why,
                pending ? ", skipped after all" : "", count, ex->pass_w, ex->pass_h, tg);
     }
-    if (pending) return 0;   // a background worker is building it: the draw is skipped until it is ready
+    if (pending) {   // a background worker is building it: the draw is skipped until it is ready
+        vk_drawstats_pending(ex->prog ? ex->prog->serial : 0);
+        return 0;
+    }
     if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
@@ -3282,11 +3427,153 @@ static int indirect_reset_draw(VkExec *ex, const p_draw *d) {
     return 1;
 }
 
+
+
+// MKW_DUMP_INST=<NVN 2 vertex origin, hex> (default 1cdcc0fd9dee5df9, the Mario Circuit tree that turned into phantom
+// trunks): in the dump frame, every draw whose vertex stage has that origin is traced. At the end of its render pass
+// (inside the pass no copy is allowed; the draws do not change what they read) the GPU copies its indirect commands,
+// its draw count and the storage buffer of slot 5 (c0+0x160, the 80-byte per-instance records) into a readback buffer;
+// on completion the log gets "dinst" lines: the kind, the commands and the records the drawn instances read (the 3x4
+// transform's translation and row lengths, the phase word).
+enum { INST_CMDS = 8, INST_PENDING = 64, INST_REC = 80 };
+typedef struct {
+    int kind;                 // 0 direct, 1 indexed, 2 indirect, 3 indirect count
+    uint32_t base, count;     // direct draws: base instance, instances
+    uint32_t ncmd, stride, max;
+    VkMemSpan args, cnt, sb;  // spans to copy (buffer 0: none)
+    uint64_t sb_size;
+    uint32_t seq;
+    VkBuffer rb;
+    VmaAllocation ra;
+    uint64_t off_args, off_cnt, off_sb;
+} InstTrace;
+static InstTrace *inst_pending[INST_PENDING];
+static int inst_npending;
+
+static uint64_t inst_origin(void) {
+    static uint64_t o = 1;
+    if (o == 1) {
+        const char *e = cfg_get("MKW_DUMP_INST");
+        o = e && *e ? strtoull(e, NULL, 16) : 0x1cdcc0fd9dee5df9ull;
+    }
+    return o;
+}
+
+static void inst_print(const InstTrace *t, const uint8_t *m, uint32_t first, uint32_t n) {
+    if (!t->sb.buffer) return;
+    for (uint32_t k = 0; k < n && k < 6; k++) {
+        uint64_t o = (uint64_t)(first + k) * INST_REC;
+        if (o + INST_REC > t->sb_size) {
+            rt_log("dinst #%u inst %u: past the end of the %#llx-byte buffer", t->seq, first + k,
+                   (unsigned long long)t->sb_size);
+            break;
+        }
+        const float *r = (const float *)(m + t->off_sb + o);
+        float sx = sqrtf(r[0] * r[0] + r[4] * r[4] + r[8] * r[8]);
+        float sy = sqrtf(r[1] * r[1] + r[5] * r[5] + r[9] * r[9]);
+        float sz = sqrtf(r[2] * r[2] + r[6] * r[6] + r[10] * r[10]);
+        rt_log("dinst #%u inst %u: pos %.1f %.1f %.1f scale %.3f %.3f %.3f phase %.3f", t->seq, first + k, r[3], r[7],
+               r[11], sx, sy, sz, r[12]);
+    }
+}
+
+static void inst_cb(void *arg) {   // completion thread
+    InstTrace *t = arg;
+    static const char *const kn[] = {"draw", "draw-idx", "indirect", "indirect-count"};
+    VkCtx *c = vk_ctx();
+    void *map = NULL;
+    if (!c || vmaMapMemory(c->vma, t->ra, &map) != VK_SUCCESS) goto out;
+    vmaInvalidateAllocation(c->vma, t->ra, 0, VK_WHOLE_SIZE);
+    const uint8_t *m = map;
+    if (t->kind < 2) {
+        rt_log("dinst #%u %s base %u instances %u", t->seq, kn[t->kind], t->base, t->count);
+        inst_print(t, m, t->base, t->count);
+    } else {
+        uint32_t n = t->kind == 3 ? *(const uint32_t *)(m + t->off_cnt) : 1;
+        rt_log("dinst #%u %s draws %u (max %u)", t->seq, kn[t->kind], n, t->max);
+        for (uint32_t i = 0; i < n && i < t->ncmd; i++) {
+            const uint32_t *a = (const uint32_t *)(m + t->off_args + (uint64_t)i * t->stride);
+            rt_log("dinst #%u   cmd %u: indices %u instances %u first index %u vertex offset %d first instance %u", t->seq,
+                   i, a[0], a[1], a[2], (int32_t)a[3], a[4]);
+            inst_print(t, m, a[4], a[1]);
+        }
+    }
+    vmaUnmapMemory(c->vma, t->ra);
+out:
+    if (c) vmaDestroyBuffer(c->vma, t->rb, t->ra);
+    free(t);
+}
+
+int vk_dump_active(void);
+static void inst_trace(VkExec *ex, int kind, uint32_t base, uint32_t count, uint64_t ind, uint64_t cnt, uint32_t max,
+                       uint32_t stride) {
+    if (!vk_dump_armed || !inst_origin() || inst_npending == INST_PENDING || !ex->prog || !vk_dump_active()) return;
+    const uint8_t *ctl, *code = NULL;
+    uint32_t len;
+    if (!find_stage(ex->prog, NVN_STAGE_VS, &ctl, &code, &len) || nvn2_origin(code) != inst_origin()) return;
+    static uint32_t seq;
+    InstTrace *t = calloc(1, sizeof *t);
+    if (!t) return;
+    t->kind = kind, t->base = base, t->count = count, t->max = max, t->stride = stride, t->seq = ++seq;
+    t->ncmd = max < INST_CMDS ? max : INST_CMDS;
+    if (ind && !vk_mem_resolve(ind, (uint64_t)stride * t->ncmd, &t->args)) t->args.buffer = VK_NULL_HANDLE;
+    if (cnt && !vk_mem_resolve(cnt, 4, &t->cnt)) t->cnt.buffer = VK_NULL_HANDLE;
+    const p_bind_buf *b = &ex->ssbo[NVN_STAGE_VS][5];
+    t->sb_size = b->size;
+    if (!b->addr || !b->size || !vk_mem_resolve(b->addr, b->size, &t->sb)) t->sb.buffer = VK_NULL_HANDLE;
+    inst_pending[inst_npending++] = t;
+}
+
+// vk_exec_pass_end, after vkCmdEndRendering: the copies of the traced draws of this pass.
+void vk_exec_inst_pass_end(VkExec *ex) {
+    VkCtx *c = vk_ctx();
+    for (int i = 0; i < inst_npending; i++) {
+        InstTrace *t = inst_pending[i];
+        uint64_t sz = 0;
+        t->off_args = sz, sz += t->args.buffer ? (uint64_t)t->stride * t->ncmd : 0;
+        sz = (sz + 15) & ~15ull, t->off_cnt = sz, sz += 16;
+        t->off_sb = sz, sz += t->sb.buffer ? t->sb_size : 0;
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sz,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT};
+        if (!c || vmaCreateBuffer(c->vma, &bi, &ai, &t->rb, &t->ra, NULL) != VK_SUCCESS) {
+            free(t);
+            continue;
+        }
+        if (t->args.buffer) {
+            VkBufferCopy cp = {t->args.offset, t->off_args, (uint64_t)t->stride * t->ncmd};
+            vkCmdCopyBuffer(ex->cb, t->args.buffer, t->rb, 1, &cp);
+        }
+        if (t->cnt.buffer) {
+            VkBufferCopy cp = {t->cnt.offset, t->off_cnt, 4};
+            vkCmdCopyBuffer(ex->cb, t->cnt.buffer, t->rb, 1, &cp);
+        }
+        if (t->sb.buffer) {
+            VkBufferCopy cp = {t->sb.offset, t->off_sb, t->sb_size};
+            vkCmdCopyBuffer(ex->cb, t->sb.buffer, t->rb, 1, &cp);
+        }
+        ex->recorded += 3;
+        vk_completion_add(ex->fence, inst_cb, t);
+    }
+    if (inst_npending) {
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                               .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(ex->cb, &di);
+        ex->recorded++;
+    }
+    inst_npending = 0;
+}
+
 static void op_draw(VkExec *ex, const p_draw *d) {
     c0_binst = (uint32_t)d->base_instance;
     if (indirect_reset_draw(ex, d)) return;
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
     vk_exec_frame.draws++;
+    vk_drawstats_inst(d->instances > 0 ? (uint32_t)d->instances : 1);
+    inst_trace(ex, 0, (uint32_t)d->base_instance, d->instances > 0 ? (uint32_t)d->instances : 1, 0, 0, 0, 0);
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;
     if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && n >= 4) {   // quads become two triangles each
         uint32_t q = n / 4;
@@ -3356,6 +3643,8 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     int restart = restart_for(ex, d->prim, d->itype);
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, restart)) return;
     vk_exec_frame.draws++;
+    vk_drawstats_inst(d->instances > 0 ? (uint32_t)d->instances : 1);
+    inst_trace(ex, 1, (uint32_t)d->base_instance, d->instances > 0 ? (uint32_t)d->instances : 1, 0, 0, 0, 0);
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
@@ -3404,6 +3693,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     VK_MEM_USE(ib);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
+    inst_trace(ex, 2, 0, 0, d->ind, 0, 1, sizeof(VkDrawIndexedIndirectCommand));
     ex->recorded += 2;
     note_work(ex, 1, 0);
     // An imported pool's GPU address is its host address (bind_range reads it the same way); device memory is not.
@@ -3442,6 +3732,7 @@ static void op_draw_idx_ind_count(VkExec *ex, const p_draw_idx_ind_count *d) {
                          d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirectCount(ex->cb, ip.buffer, ip.offset, cp.buffer, cp.offset, (uint32_t)d->max_count, stride);
     vk_drawstats_count(ex, &cp);
+    inst_trace(ex, 3, 0, 0, d->ind, d->count, (uint32_t)d->max_count, stride);
     ex->recorded += 2;
     note_work(ex, 1, 0);
     vk_mem_count(ip.cls, VK_MUSE_IND, ind_bytes);
@@ -3504,8 +3795,8 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
-    if (!c0_lay && B.c0_valid[2]) {   // the NVN 1 shader binds c0
-        VkBufferCopy cp = {ip.offset, B.c0_off[2] + 0x200, sizeof(VkDispatchIndirectCommand)};
+    if (B.c0_valid[2]) {   // copy GPU-written group counts into c0 (+0x0 on NVN 2, +0x200 on NVN 1)
+        VkBufferCopy cp = {ip.offset, B.c0_off[2] + (c0_lay ? 0 : 0x200), sizeof(VkDispatchIndirectCommand)};
         vkCmdCopyBuffer(ex->cb, ip.buffer, B.c0_buf[2], 1, &cp);
         ex->recorded++;
         vk_exec_barrier(ex);

@@ -563,7 +563,7 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
 
 static void (*crash_fn)(const PlatCrash *c);
 
-static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
+static LONG crash_report(EXCEPTION_POINTERS *ep, int our_module_only) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     const char *what = code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
                      : code == EXCEPTION_ILLEGAL_INSTRUCTION ? "illegal instruction"
@@ -576,7 +576,10 @@ static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
     MODULEINFO mi = {0};
     GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(NULL), &mi, sizeof mi);
     uintptr_t base = (uintptr_t)mi.lpBaseOfDll;
-    PlatCrash c = {what, (uint32_t)code, rip, base ? rip - base : 0, -1, 0};
+    // First-chance VEH runs before SEH: leave faults outside this executable to the DLL's/driver's own __try/__except
+    // handler; truly unhandled external faults reach crash_uef (SetUnhandledExceptionFilter) instead.
+    if (our_module_only && (!mi.SizeOfImage || rip - base >= mi.SizeOfImage)) return EXCEPTION_CONTINUE_SEARCH;
+    PlatCrash c = {what, (uint32_t)code, rip, base && rip - base < mi.SizeOfImage ? rip - base : 0, -1, 0};
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
         c.access = (int)ep->ExceptionRecord->ExceptionInformation[0], c.addr = ep->ExceptionRecord->ExceptionInformation[1];
     c.frames[c.nframes++] = rip;
@@ -593,6 +596,9 @@ static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
     crash_fn(&c);
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) { return crash_report(ep, 1); }
+static LONG WINAPI crash_uef(EXCEPTION_POINTERS *ep) { return crash_report(ep, 0); }
 
 // abort() and an invalid parameter to a C runtime function raise no exception: the C runtime ends the process with
 // 0xc0000409 after calling the SIGABRT or invalid-parameter handler. The report names the host frames in this
@@ -623,6 +629,7 @@ static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wc
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
     AddVectoredExceptionHandler(0, crash_veh);
+    SetUnhandledExceptionFilter(crash_uef);
     signal(SIGABRT, abort_signal);
     _set_invalid_parameter_handler(invalid_parameter);
 }

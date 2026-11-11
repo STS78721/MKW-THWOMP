@@ -9,7 +9,9 @@
 // A blinking object shows as fp or a count that alternates between frames of a still scene (MKW_SEED fixes the scene).
 // Phase 1: in passes of at least DS_DIFF_DRAWS draws, the shader programs whose draw count changed since the same pass of
 // the previous frame, and the draws conditional rendering dropped there:
-//   ddiff f<frame> p<seq> prog <serial> <before> -> <now>        dskip f<frame> p<seq> prog <serial> <n>
+//   ddiff f<frame> p<seq> prog <serial> <before> -> <now> inst <before> -> <now>   dskip f<frame> p<seq> prog <serial> <n>
+// (inst: the program's instances over its direct draws), and the draws skipped while their pipeline builds:
+//   dpend f<frame> p<seq> prog <serial> <n>
 // and per frame the conditional rendering decisions (render / skip / render because the query was not done yet):
 //   dcond f<frame> render <n> skip <n> pending <n>
 #include <stdio.h>
@@ -25,21 +27,44 @@ enum { DS_MIN_DRAWS = 40, DS_MAX_COUNTS = 512, DS_DIFF_DRAWS = 200, DS_PROGS = 5
 
 static int ds_state = -1;   // -1 not read, 0 off, 1 on
 static uint64_t ds_from, ds_to;
+static uint64_t ds_key_n;   // MKW_DRAWSTATS=key:<n>
+static int ds_frame_on(uint64_t *frame);
+
+// F9 (gfx_window_win.c): with MKW_DRAWSTATS=key:<n>, record the n frames from two presents on. The range is written by
+// the window thread and read by the replay thread; a torn read only shifts the first recorded frame.
+void vk_drawstats_key(void) {
+    ds_frame_on(NULL);
+    if (!ds_key_n) return;
+    uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 2;
+    __atomic_store_n(&ds_to, f + ds_key_n, __ATOMIC_RELAXED);
+    __atomic_store_n(&ds_from, f, __ATOMIC_RELAXED);
+    rt_log("drawstats: F9 pressed: recording frames %llu..%llu", (unsigned long long)f,
+           (unsigned long long)(f + ds_key_n - 1));
+}
 
 static int ds_frame_on(uint64_t *frame) {
     if (ds_state < 0) {
         const char *e = cfg_get("MKW_DRAWSTATS");
         unsigned long long a = 0, n = 0;
-        ds_state = e && sscanf(e, "%llu:%llu", &a, &n) == 2 && n;
-        if (ds_state) {
-            ds_from = a, ds_to = a + n;
-            rt_log("drawstats: frames %llu..%llu (MKW_DRAWSTATS)", a, a + n - 1);
+        if (e && sscanf(e, "key:%llu", &n) == 1 && n) {
+            // MKW_DRAWSTATS=key:<frames>: armed with no range; F9 in the game window records the next <frames>
+            ds_key_n = n;
+            ds_from = ds_to = 0;
+            ds_state = 1;
+            rt_log("drawstats: armed, F9 records %llu frames (MKW_DRAWSTATS)", n);
+        } else {
+            ds_state = e && sscanf(e, "%llu:%llu", &a, &n) == 2 && n;
+            if (ds_state) {
+                ds_from = a, ds_to = a + n;
+                rt_log("drawstats: frames %llu..%llu (MKW_DRAWSTATS)", a, a + n - 1);
+            }
         }
     }
     if (!ds_state) return 0;
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     if (frame) *frame = f;
-    return f >= ds_from && f < ds_to;
+    uint64_t from = __atomic_load_n(&ds_from, __ATOMIC_RELAXED), to = __atomic_load_n(&ds_to, __ATOMIC_RELAXED);
+    return f >= from && f < to;
 }
 
 // The open pass (replay thread only).
@@ -50,18 +75,19 @@ static struct {
     VkMemSpan counts[DS_MAX_COUNTS];
     uint32_t nprog;
     uint64_t prog[DS_PROGS];
-    uint32_t pdraw[DS_PROGS], pskip[DS_PROGS];
+    uint32_t pdraw[DS_PROGS], pskip[DS_PROGS], pinst[DS_PROGS], ppend[DS_PROGS];
+    int last_k;
 } P;
 
 // The per-program counts of the big passes of the previous frame, by pass number.
-static struct { int valid; uint32_t n; uint64_t prog[DS_PROGS]; uint32_t draw[DS_PROGS]; } K[DS_KEEP];
+static struct { int valid; uint32_t n; uint64_t prog[DS_PROGS]; uint32_t draw[DS_PROGS], inst[DS_PROGS]; } K[DS_KEEP];
 static uint32_t C[3];   // this frame's conditional rendering decisions: skip, render, pending
 
 static int prog_slot(uint64_t prog) {
     for (uint32_t i = 0; i < P.nprog; i++)
         if (P.prog[i] == prog) return (int)i;
     if (P.nprog == DS_PROGS) return -1;
-    P.prog[P.nprog] = prog, P.pdraw[P.nprog] = P.pskip[P.nprog] = 0;
+    P.prog[P.nprog] = prog, P.pdraw[P.nprog] = P.pskip[P.nprog] = P.pinst[P.nprog] = P.ppend[P.nprog] = 0;
     return (int)P.nprog++;
 }
 
@@ -84,8 +110,21 @@ void vk_drawstats_draw(VkExec *ex, uint64_t pipe, uint64_t prog) {
     P.draws++;
     int k = prog_slot(prog);
     if (k >= 0) P.pdraw[k]++;
+    P.last_k = k;
     if (pipe != P.last_pipe) P.pipes++, P.last_pipe = pipe;
     mix(pipe);
+}
+
+// Called right after vk_drawstats_draw for direct draws (indirect ones count 0 instances here).
+void vk_drawstats_inst(uint32_t instances) {
+    if (!ds_frame_on(NULL) || P.last_k < 0) return;
+    P.pinst[P.last_k] += instances;
+}
+
+void vk_drawstats_pending(uint64_t prog) {
+    if (!ds_frame_on(NULL)) return;
+    int k = prog_slot(prog);
+    if (k >= 0) P.ppend[k]++;
 }
 
 void vk_drawstats_count(VkExec *ex, const VkMemSpan *count) {
@@ -145,31 +184,45 @@ void vk_drawstats_pass_end(VkExec *ex) {
         int lines = 0;
         if (K[seq].valid) {
             for (uint32_t i = 0; i < P.nprog && lines < DS_LINES; i++) {
-                uint32_t before = 0;
+                uint32_t before = 0, binst = 0;
                 for (uint32_t j = 0; j < K[seq].n; j++)
-                    if (K[seq].prog[j] == P.prog[i]) before = K[seq].draw[j];
-                if (before != P.pdraw[i])
-                    rt_log("ddiff f%llu p%u prog %llu %u -> %u", (unsigned long long)P.frame, seq,
-                           (unsigned long long)P.prog[i], before, P.pdraw[i]), lines++;
+                    if (K[seq].prog[j] == P.prog[i]) before = K[seq].draw[j], binst = K[seq].inst[j];
+                if (before != P.pdraw[i] || binst != P.pinst[i])
+                    rt_log("ddiff f%llu p%u prog %llu %u -> %u inst %u -> %u", (unsigned long long)P.frame, seq,
+                           (unsigned long long)P.prog[i], before, P.pdraw[i], binst, P.pinst[i]), lines++;
             }
             for (uint32_t j = 0; j < K[seq].n && lines < DS_LINES; j++) {   // programs that vanished entirely
                 int still = 0;
                 for (uint32_t i = 0; i < P.nprog; i++) still |= P.prog[i] == K[seq].prog[j];
                 if (!still && K[seq].draw[j])
-                    rt_log("ddiff f%llu p%u prog %llu %u -> 0", (unsigned long long)P.frame, seq,
-                           (unsigned long long)K[seq].prog[j], K[seq].draw[j]), lines++;
+                    rt_log("ddiff f%llu p%u prog %llu %u -> 0 inst %u -> 0", (unsigned long long)P.frame, seq,
+                           (unsigned long long)K[seq].prog[j], K[seq].draw[j], K[seq].inst[j]), lines++;
             }
         }
         for (uint32_t i = 0; i < P.nprog && lines < DS_LINES; i++)
             if (P.pskip[i]) rt_log("dskip f%llu p%u prog %llu %u", (unsigned long long)P.frame, seq,
                                   (unsigned long long)P.prog[i], P.pskip[i]), lines++;
+        for (uint32_t i = 0; i < P.nprog && lines < DS_LINES; i++)
+            if (P.ppend[i]) rt_log("dpend f%llu p%u prog %llu %u", (unsigned long long)P.frame, seq,
+                                  (unsigned long long)P.prog[i], P.ppend[i]), lines++;
         K[seq].valid = 1, K[seq].n = P.nprog;
         memcpy(K[seq].prog, P.prog, sizeof P.prog);
         memcpy(K[seq].draw, P.pdraw, sizeof P.pdraw);
+        memcpy(K[seq].inst, P.pinst, sizeof P.pinst);
     }
     if (P.draws >= DS_MIN_DRAWS || P.icd || P.mesh) {
-        rt_log("dstat f%llu p%u %ux%u draws %u pipes %u fp %016llx icd %u mesh %u/%u", (unsigned long long)P.frame, seq,
-               ex->pass_w, ex->pass_h, P.draws, P.pipes, (unsigned long long)P.fp, P.icd, P.mesh, P.groups);
+        char rt[160] = "";
+        if (ex->pass_w <= 512) {   // small passes (impostor / probe tiles): where they render, as guest storage
+            int o = 0;
+            for (int i = 0; i < 9 && o < (int)sizeof rt - 48; i++) {
+                const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+                if (!t->tex) continue;
+                o += snprintf(rt + o, sizeof rt - o, " %c%d %llx L%u/%u", i < 8 ? 'c' : 'd', i < 8 ? i : 0,
+                              (unsigned long long)(uintptr_t)t->tex->mem, t->base_layer, t->tex->L.layers);
+            }
+        }
+        rt_log("dstat f%llu p%u %ux%u draws %u pipes %u fp %016llx icd %u mesh %u/%u%s", (unsigned long long)P.frame, seq,
+               ex->pass_w, ex->pass_h, P.draws, P.pipes, (unsigned long long)P.fp, P.icd, P.mesh, P.groups, rt);
         VkCtx *c = vk_ctx();
         if (P.ncount && c) {
             CountJob *j = calloc(1, sizeof *j);

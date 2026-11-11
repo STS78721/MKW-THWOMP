@@ -810,7 +810,7 @@ def main():
     args = ap.parse_args()
 
     gen = (args.gen or (Path(r"C:\Games\MKW PC\generated\mkw180") if 'mkw' in args.version.lower() and Path(r"C:\Games\MKW PC\generated\mkw180").is_dir() else ROOT / 'generated' / args.version)).resolve()
-    out = (args.out or (Path(r"C:\Games\MKW PC\build\mkw180") if 'mkw' in args.version.lower() and Path(r"C:\Games\MKW PC\build\mkw180").is_dir() else ROOT / 'build' / args.version)).resolve()
+    out = (args.out or (Path(r"C:\Games\MKW PC\build\mkw") if 'mkw' in args.version.lower() and Path(r"C:\Games\MKW PC\build\mkw").is_dir() else ROOT / 'build' / args.version)).resolve()
     extracted = ROOT / 'build' / 'extracted' / args.version
     default_exefs = (Path(r"C:\Games\MKW PC\exefs") if 'mkw' in args.version.lower() and Path(r"C:\Games\MKW PC\exefs").is_dir()
                      else (ROOT / 'exefs' if (ROOT / 'exefs').is_dir() else extracted / 'exefs'))

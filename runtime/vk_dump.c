@@ -454,7 +454,8 @@ static void buf_snap(VkExec *ex, int pass) {
 
 static int active(void) {
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    return !finished && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
+    uint64_t df = __atomic_load_n(&dump_frame, __ATOMIC_ACQUIRE);
+    return !finished && passes_f && (f == df || (log_from && f >= log_from && f < df));
 }
 static uint64_t frame_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1; }
 
@@ -688,6 +689,133 @@ static uint64_t bindings_hash(const VkExec *ex, const VkPipeInfo *info) {
     return h;
 }
 
+
+// ---- MKW_DUMP_PICK=1: which draw wrote depth where (phantom geometry hunt, foliage plan)
+// In the dump frame, before each draw of a render pass at least PICK_MIN_W wide with a depth target, and once at its end,
+// the pass is ended, a PICK_GX x PICK_GY grid of depth texels is copied out and the pass restarted (targets stay in
+// GENERAL with LOAD). pick.txt then lists, per pass and grid point, each change of depth and the draw that made it:
+// "pass N pipe P draw K prog S at (x,y): a -> b"; pipe P is that pass's pipe line in passes.txt.
+enum { PICK_GX = 32, PICK_GY = 18, PICK_G = PICK_GX * PICK_GY, PICK_MAX = 6000, PICK_MIN_W = 1000 };
+typedef struct { int pass, pipe, draw; uint64_t prog; uint32_t w, h, d16; } PickEv;
+static int pick_on = -1;
+static VkBuffer pick_buf;
+static VmaAllocation pick_alloc;
+static PickEv pick_ev[PICK_MAX];
+static int pick_n, pick_pass_first = -1, pick_reported;
+static int seq_now(void);
+
+static int pick_enabled(void) {
+    if (pick_on < 0) {
+        const char *e = cfg_get("MKW_DUMP_PICK");
+        pick_on = e && *e == '1';
+        if (pick_on) {
+            VkCtx *c = vk_ctx();
+            VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                     .size = (VkDeviceSize)PICK_MAX * PICK_G * 4,
+                                     .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+            VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                          .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT};
+            if (!c || vmaCreateBuffer(c->vma, &bi, &ai, &pick_buf, &pick_alloc, NULL) != VK_SUCCESS) pick_on = 0;
+            rt_log("vk_dump: MKW_DUMP_PICK %s", pick_on ? "on: depth grid per draw" : "could not allocate its buffer");
+        }
+    }
+    return pick_on;
+}
+
+// Records the copy of the grid; the caller has ended the rendering.
+static void pick_copy(VkExec *ex, int pipe, int draw) {
+    const VkExecTarget *d = &ex->depth;
+    if (pick_n >= PICK_MAX) return;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    static VkBufferImageCopy r[PICK_G];
+    for (int g = 0; g < PICK_G; g++) {
+        int gx = g % PICK_GX, gy = g / PICK_GX;
+        r[g] = (VkBufferImageCopy){.bufferOffset = ((VkDeviceSize)pick_n * PICK_G + g) * 4,
+                                   .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, d->level, d->base_layer, 1},
+                                   .imageOffset = {(int32_t)((2 * gx + 1) * d->width / (2 * PICK_GX)),
+                                                   (int32_t)((2 * gy + 1) * d->height / (2 * PICK_GY)), 0},
+                                   .imageExtent = {1, 1, 1}};
+    }
+    vkCmdCopyImageToBuffer(ex->cb, d->image, VK_IMAGE_LAYOUT_GENERAL, pick_buf, PICK_G, r);
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded += 3;
+    pick_ev[pick_n++] = (PickEv){seq_now(), pipe, draw, ex->prog ? ex->prog->serial : 0, d->width, d->height,
+                                 d->format == VK_FORMAT_D16_UNORM || d->format == VK_FORMAT_D16_UNORM_S8_UINT};
+}
+
+static int pick_wanted(VkExec *ex) {
+    return pick_enabled() && ex->depth.image && ex->pass_w >= PICK_MIN_W &&
+           (ex->depth.aspect & VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
+// Before a draw (rec_lock held): sample, then reopen the pass.
+static void pick_before_draw(VkExec *ex, int pipe, int draw) {
+    if (!ex->in_pass || !pick_wanted(ex) || pick_n >= PICK_MAX) return;
+    if (pick_pass_first < 0) pick_pass_first = pick_n;
+    vkCmdEndRendering(ex->cb);
+    ex->in_pass = 0;
+    vk_exec_barrier(ex);   // feedback-layout targets back to GENERAL (the restart below sets them again)
+    pick_copy(ex, pipe, draw);
+    vk_exec_pass_begin(ex);
+}
+
+static float pick_val(const uint32_t *v, const PickEv *e, int g) {
+    uint32_t x = v[g];
+    if (e->d16) return (x & 0xffff) / 65535.0f;
+    float f;
+    memcpy(&f, &x, 4);
+    return f;
+}
+
+static void pick_report(void *arg) {   // completion thread, once
+    (void)arg;
+    VkCtx *c = vk_ctx();
+    void *map = NULL;
+    char path[460];
+    snprintf(path, sizeof path, "%s/pick.txt", dir);
+    FILE *f = fopen(path, "w");
+    if (!f || !c || vmaMapMemory(c->vma, pick_alloc, &map) != VK_SUCCESS) {
+        if (f) fclose(f);
+        return;
+    }
+    vmaInvalidateAllocation(c->vma, pick_alloc, 0, VK_WHOLE_SIZE);
+    const uint32_t *v = map;
+    fprintf(f, "# depth grid %dx%d; each line: the draw (pipe line of that pass in passes.txt, its draw number in the pass)\n"
+               "# that changed depth at a grid point\n", PICK_GX, PICK_GY);
+    for (int i = 1; i < pick_n; i++) {
+        const PickEv *a = &pick_ev[i - 1], *b = &pick_ev[i];
+        if (a->pass != b->pass || a->pipe < 0) continue;
+        for (int g = 0; g < PICK_G; g++) {
+            float x = pick_val(v + (size_t)(i - 1) * PICK_G, a, g), y = pick_val(v + (size_t)i * PICK_G, b, g);
+            if (x != y) {
+                int gx = g % PICK_GX, gy = g / PICK_GX;
+                fprintf(f, "pass %04d pipe %d draw %d prog %llu at (%u,%u): %.7g -> %.7g\n", a->pass, a->pipe, a->draw,
+                        (unsigned long long)a->prog, (2 * gx + 1) * a->w / (2 * PICK_GX),
+                        (2 * gy + 1) * a->h / (2 * PICK_GY), x, y);
+            }
+        }
+    }
+    vmaUnmapMemory(c->vma, pick_alloc);
+    fclose(f);
+    rt_log("vk_dump: wrote %s (%d depth samples)", path, pick_n);
+}
+
+static int seq_now(void) { return seq; }
+
+// Whether the replay is in the dump frame (vk_exec_draw.c MKW_DUMP_INST).
+int vk_dump_active(void) {
+    plat_mutex_lock(&rec_lock);
+    int a = active();
+    plat_mutex_unlock(&rec_lock);
+    return a;
+}
+
 void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info) {
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
@@ -696,6 +824,7 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
     for (int i = 0; i < nents; i++)
         if (ents[i].p == p && ents[i].th == th) {
             ents[i].draws++;
+            pick_before_draw(ex, i, pass_draws);
             goto out;
         }
     if (nents == MAX_ENTS) {
@@ -712,6 +841,7 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
     sp(&b, "\n");
     describe_bindings(&b, ex, info);
     ents[nents++] = (Ent){p, th, 1, b.s};
+    pick_before_draw(ex, nents - 1, pass_draws);
 out:
     plat_mutex_unlock(&rec_lock);
 }
@@ -761,6 +891,8 @@ static void pass_decide(int same_targets) {
 void vk_dump_pass_end(VkExec *ex) {
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
+    if (pick_pass_first >= 0 && pick_wanted(ex)) vk_exec_barrier(ex), pick_copy(ex, -1, pass_draws);
+    pick_pass_first = -1;
     int n = seq++;
     uint64_t sig = targets_sig(ex);
     pass_decide(skip_runs && sig == last_targets);
@@ -901,13 +1033,42 @@ out:
 
 static void make_dirs(char *path) { plat_file_mkdir_p(path); }
 
-// TOTK_DUMP=key: armed with no frame; F12 in the game window dumps the frame two presents later (once per run).
+// MKW_DUMP=key: armed with no frame; F12 in the game window dumps the frame two presents later (once per run).
+// Defer opening passes.txt / images.txt / bufs.txt until F12 is pressed so ordinary runs do not wipe an earlier capture.
 static int dump_on_key;
+
+static int open_dump_files(void) {
+    make_dirs(dir);
+    char path[600];
+    snprintf(path, sizeof path, "%s/passes.txt", dir);
+    passes_f = fopen(path, "w");
+    snprintf(path, sizeof path, "%s/images.txt", dir);
+    images_f = fopen(path, "w");
+    if (!passes_f || !images_f) {
+        if (passes_f) fclose(passes_f), passes_f = NULL;
+        if (images_f) fclose(images_f), images_f = NULL;
+        return 0;
+    }
+    if (bd_size) {
+        snprintf(path, sizeof path, "%s/bufs.txt", dir);
+        if (!(bufs_f = fopen(path, "w"))) bd_size = 0;
+    }
+    return 1;
+}
+
 void vk_dump_key(void) {
-    if (!dump_on_key || dump_frame != UINT64_MAX) return;
-    uint64_t f = frame_now() + 2;
-    __atomic_store_n(&dump_frame, f, __ATOMIC_RELEASE);
-    rt_log("vk_dump: F12 pressed: dumping frame %llu to %s", (unsigned long long)f, dir);
+    if (!dump_on_key) return;
+    plat_mutex_lock(&rec_lock);
+    if (dump_frame == UINT64_MAX) {
+        if (!passes_f && !open_dump_files()) {
+            rt_log("vk_dump: F12 pressed, cannot write to %s", dir);
+        } else {
+            uint64_t f = frame_now() + 2;
+            __atomic_store_n(&dump_frame, f, __ATOMIC_RELEASE);
+            rt_log("vk_dump: F12 pressed: dumping frame %llu to %s", (unsigned long long)f, dir);
+        }
+    }
+    plat_mutex_unlock(&rec_lock);
 }
 
 void vk_dump_init(void) {
@@ -930,13 +1091,6 @@ void vk_dump_init(void) {
     }
     const char *d = cfg_get("TOTK_DUMP_DIR");
     snprintf(dir, sizeof dir, "%s", d && *d ? d : "dump");
-    make_dirs(dir);
-    char path[600];
-    snprintf(path, sizeof path, "%s/passes.txt", dir);
-    passes_f = fopen(path, "w");
-    snprintf(path, sizeof path, "%s/images.txt", dir);
-    images_f = fopen(path, "w");
-    if (!passes_f || !images_f) rt_fatal("vk_dump: cannot write to %s", dir);
     const char *bf = cfg_get("TOTK_DUMP_BUF");
     if (bf && *bf) {
         char *q;
@@ -947,11 +1101,11 @@ void vk_dump_init(void) {
         if (*q == ':') bd_w = (uint32_t)strtoul(q + 1, &q, 0);
         if (*q == ':') bd_h = (uint32_t)strtoul(q + 1, &q, 0);
         if (!bd_w || !bd_h) bd_stride = 0;
-        snprintf(path, sizeof path, "%s/bufs.txt", dir);
-        if (bd_size && !(bufs_f = fopen(path, "w"))) bd_size = 0;
     }
+    if ((!dump_on_key || log_from) && !open_dump_files()) rt_fatal("vk_dump: cannot write to %s", dir);
     vk_dump_armed = 1;
-    rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+    if (dump_on_key) rt_log("vk_dump: armed on F12 -> %s", dir);
+    else rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
 }
 
 void vk_dump_present(uint64_t frame) {
@@ -960,6 +1114,7 @@ void vk_dump_present(uint64_t frame) {
     finished = 1;
     plat_mutex_unlock(&rec_lock);
     vk_sync_finish();   // the frame's copies are converted and written
+    if (pick_on > 0 && pick_n && !pick_reported) pick_reported = 1, pick_report(NULL);
     plat_mutex_lock(&img_lock);
     fclose(images_f);
     images_f = NULL;

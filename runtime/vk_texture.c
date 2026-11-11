@@ -173,7 +173,7 @@ static uint64_t compact_astc_budget_cap(void) {
         if (mb > 2048) mb = 2048;
         bytes = (int64_t)mb << 20;
         rt_log("vk: CompactLayers ASTC budget %d MiB (edge ≤ %u)%s", mb, COMPACT_ASTC_MAX_EDGE,
-               s && *s ? "" : ", TOTK_COMPACT_ASTC_MB= to raise when VRAM allows");
+               s && *s ? "" : ", MKW_COMPACT_ASTC_MB= to raise when VRAM allows");
     }
     return (uint64_t)bytes;
 }
@@ -369,8 +369,10 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
 }
 
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
+static int evict_vram_oom(int include_gpu_owned);
+
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
-    static volatile int32_t n_unmapped, n_unsupported, n_failed, n_unbound, n_thick;
+    static volatile int32_t n_unmapped, n_unsupported, n_failed, n_unbound, n_thick, n_oom_evict;
     VkCtx *c = vk_ctx();
     const nvn_texdesc *d = &t->d;
     if (!c || d->target == NVN_TEXTURE_TARGET_BUFFER) return NULL;
@@ -547,7 +549,34 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
             uint64_t need = est_tex_bytes(w, h, depth > 1 ? depth : 1, levels, layers, bpt);
             vk_texture_free_for_vram(need);
         }
+        uint64_t v_used = 0, v_budget = 0;
+        int v_exact = 0;
+        if (vk_mem_vram(&v_used, &v_budget, &v_exact) && v_budget && v_used > v_budget / 20 * 17) {
+            if (rel_head) evict_vram_oom(0);
+            int fold_src = layers <= 4 && umax(guest_w, guest_h) >= 4096;
+            if (!host_mip0 && !fold_src && f.astc_bw && !f.astc_bc && vk_astc_mode() == VK_ASTC_GPU &&
+                vk_mem_vram(&v_used, &v_budget, &v_exact) && v_used > v_budget / 20 * 17) {
+                f.vk = f.astc_srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+                f.astc_bc = 1;
+                ci.format = f.vk;
+                e->f = f;
+                log_limited(&n_oom_evict,
+                            "vk: VRAM usage %llu/%llu MiB (>85%%); compressing ASTC %ux%u to BC3",
+                            (unsigned long long)(v_used >> 20), (unsigned long long)(v_budget >> 20), w, h);
+            }
+        }
         VkResult r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
+        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            int n_evict = evict_vram_oom(0);
+            r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
+            if (r != VK_SUCCESS) {
+                n_evict += evict_vram_oom(1);
+                r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
+            }
+            if (r == VK_SUCCESS)
+                log_limited(&n_oom_evict, "vk: VRAM OOM for %ux%ux%u fmt %#x; evicted %d released textures and recovered",
+                            w, h, depth, d->format, n_evict);
+        }
         if (r != VK_SUCCESS && f.astc_bw && !f.astc_bc) {
             f.vk = f.astc_srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
             f.astc_bc = 1;
@@ -726,6 +755,22 @@ static void sweep_pressure(void) {   // tex_lock held
         destroy_tex(e);
         dropped++, n_pressure_drops++;
     }
+    if (dropped) vk_mem_collect();
+}
+
+static int evict_vram_oom(int include_gpu_owned) {
+    int dropped = 0;
+    for (Tex *e = rel_head, *next; e; e = next) {
+        next = e->rel_next;
+        if (!include_gpu_owned && (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty)) continue;
+        destroy_tex(e);
+        dropped++;
+    }
+    if (dropped || !include_gpu_owned) {
+        vk_upload_flush(1);
+        vk_mem_collect();
+    }
+    return dropped;
 }
 
 // ---------------------------------------------------------------- uploads
@@ -2135,6 +2180,7 @@ void vk_texture_free_for_vram(uint64_t need) {
     lock();
     uint64_t used, budget;
     int exact;
+    vk_mem_collect();
     for (int pass = 0; pass < 64 && rel_head; pass++) {
         if (!vk_mem_vram(&used, &budget, &exact) || used + need <= budget) break;
         int dropped = 0;
@@ -2145,6 +2191,8 @@ void vk_texture_free_for_vram(uint64_t need) {
             dropped++, n_pressure_drops++;
         }
         if (!dropped) break;
+        vk_upload_flush(1);
+        vk_mem_collect();
     }
     unlock();
 }

@@ -360,6 +360,8 @@ int vk_astc_mode(void) {
         // (Eglantine-MKW NX2_VRAM) — Switch 2 titles otherwise decode to RGBA8 and exhaust VRAM.
         int want_bc = 0;
         if (m == VK_ASTC_GPU && G.pipe) {
+            // Always build bc_pipe so high-VRAM / OOM per-texture BC3 fallback in create_tex works even when ASTC_BC=0.
+            int have_bc = G.bc_pipe != VK_NULL_HANDLE || create_bc_pipeline(c);
             const char *bc_env = cfg_get("TOTK_ASTC_BC");
             if (bc_env && *bc_env) {
                 want_bc = cfg_bool("TOTK_ASTC_BC");
@@ -371,7 +373,7 @@ int vk_astc_mode(void) {
                     if (vk_mem_vram(&used, &budget, &exact) && budget && budget < (12ull << 30)) want_bc = 1;
                 }
             }
-            if (want_bc && !create_bc_pipeline(c)) {
+            if (want_bc && !have_bc) {
                 rt_log("vk: ASTC BC3 encoder unavailable: keeping RGBA8");
                 want_bc = 0;
             }

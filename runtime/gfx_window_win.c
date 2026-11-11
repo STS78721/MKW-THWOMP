@@ -201,9 +201,11 @@ int gfx_window_monitor_size(int *w, int *h) {
 }
 
 void vk_dump_key(void);   // vk_dump.c: TOTK_DUMP=key
+void vk_drawstats_key(void);   // vk_drawstats.c: MKW_DRAWSTATS=key:<frames>
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     LRESULT input_res;
     if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) vk_dump_key();
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30))) vk_drawstats_key();
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {

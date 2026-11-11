@@ -392,7 +392,7 @@ static void test_pad_attach(void) {
     int v[4];
     if (!e || !*e) return;
     if (sscanf(e, "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]) != 4) {
-        rt_log("input: TOTK_TEST_PAD=%s is not <lx>,<ly>,<rx>,<ry>; no test gamepad", e);
+        rt_log("input: MKW_TEST_PAD=%s is not <lx>,<ly>,<rx>,<ry>; no test gamepad", e);
         return;
     }
     SDL_VirtualJoystickDesc d;
@@ -400,7 +400,7 @@ static void test_pad_attach(void) {
     d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
     d.naxes = SDL_GAMEPAD_AXIS_COUNT;
     d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
-    d.name = "TotK test gamepad";
+    d.name = "MKW test gamepad";
     SDL_JoystickID id = SDL_AttachVirtualJoystick(&d);
     joy = id ? SDL_OpenJoystick(id) : NULL;
     if (!joy) {

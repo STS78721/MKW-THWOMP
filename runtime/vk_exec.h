@@ -124,6 +124,7 @@ int vk_exec_reset_indirect(VkExec *ex, uint64_t list_addr, uint32_t descriptor_b
 // Begins dynamic rendering with the current targets unless a pass is open (a full memory barrier precedes it). Call
 // before a draw or an attachment clear.
 void vk_exec_pass_begin(VkExec *ex);
+void vk_exec_inst_pass_end(VkExec *ex);   // MKW_DUMP_INST copies after the pass (vk_exec_draw.c)
 // Ends the open pass (no-op without one) and marks its targets GPU-written. Call before copies and dispatches.
 void vk_exec_pass_end(VkExec *ex);
 // Full memory barrier (all commands, all memory); ends the open pass first. Copies and dispatches order themselves with
@@ -172,6 +173,8 @@ extern int vk_dump_armed;
 void vk_ctrace(uint64_t key, const char *fmt, ...);   // vk_exec_xfer.c: TOTK_COMPACT_TRACE=1, 48 lines per key
 // vk_drawstats.c, MKW_DRAWSTATS=<frame>:<frames>: per-pass draw fingerprints and GPU indirect counts in the log
 void vk_drawstats_draw(VkExec *ex, uint64_t pipe, uint64_t prog);
+void vk_drawstats_inst(uint32_t instances);   // the draw just counted: its instance count
+void vk_drawstats_pending(uint64_t prog);     // a draw skipped while its pipeline builds
 void vk_drawstats_skip(VkExec *ex, uint64_t prog);       // a draw conditional rendering dropped
 void vk_drawstats_cond(int result);
 void vk_drawstats_ts(uint64_t frame, uint64_t addr, uint64_t ticks);   // a timestamp report the game will read

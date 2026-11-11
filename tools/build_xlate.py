@@ -103,8 +103,8 @@ def verify_vendor() -> None:
 
 def selected_patches(*, defined_float_minmax: bool = False) -> list[Path]:
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 23:
-        sys.exit(f"expected 23 patches, found {len(patches)}")
+    if len(patches) != 26:
+        sys.exit(f"expected 26 patches, found {len(patches)}")
     optional = XLATE / "patches" / DEFINED_FLOAT_MINMAX_PATCH
     if optional not in patches:
         sys.exit(f"missing optional patch: {DEFINED_FLOAT_MINMAX_PATCH}")
@@ -122,10 +122,10 @@ def prepare_sources(*, defined_float_minmax: bool = False) -> Path:
         # git apply works outside a repository when given a directory; --check first so a failure names the patch.
         for extra in (["--check"], []):
             r = subprocess.run(
-                ["git", "apply", *extra, "--whitespace=nowarn", "--directory", str(src.relative_to(BUILD)), str(patch)],
+                ["git", "apply", "--verbose", *extra, "--whitespace=nowarn", "--directory", str(src.relative_to(BUILD)), str(patch)],
                 cwd=BUILD, capture_output=True, text=True,
             )
-            if r.returncode != 0:
+            if r.returncode != 0 or "Skipped patch" in r.stderr:
                 sys.exit(f"patch does not apply: {patch.name}\n{r.stdout}{r.stderr}")
         print(f"applied {patch.name}")
     return src

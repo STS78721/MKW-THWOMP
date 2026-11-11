@@ -96,3 +96,84 @@ Phase 2 fixes is needed; the mesh-shader rewrite is the largest piece if that is
 - Fix: `loader.c` resolve() uses the first definition in load order. Result on a boot run: 40 → 0 bad frees, 467 → 0
   fallback allocations, no failed allocations in 40 s. The workarounds are now opt-in (`MKW_HEAP_LEGACY=1`).
 - Still to check in a real race: whether pop-in, low-poly models and the old crashes improved.
+
+## Phantom / exploding trees & bushes turning into trees: partial root causes & open leads (2026-11-11)
+
+- Symptom (Mario Circuit): huge dark tree trunks where no tree stands, bushes/grass turning into giant trees, trees
+  growing/changing shape while driving, and distant bushes/trees staying half-dithered.
+- Decompiling the Mario Circuit F12 capture (`dump-f12.old`) exposed three bugs in the procedural foliage placement,
+  culling, and instanced vertex pipeline (fixed in this commit, though an in-game Mario Circuit test at 22:42 showed
+  giant trees/foliage and blurry world textures still occurring — see open leads at the bottom):
+
+1. **Indirect compute dispatch group counts `c0+0x0..0xb` were 0 on NVN 2 (`vk_exec_draw.c:op_dispatch_ind`)**:
+   - Mario Circuit `pass 0018` (`cs b5252fdd788a115f`, NVN 2 `e590d50a45b1c299`) and `pass 0019` (`cs 0cd68c4c50a54509`,
+     NVN 2 `1df9dc86787a4b3b`) are **indirect** compute dispatches (`vkCmdDispatchIndirect`) that generate procedural
+     foliage world positions and write the 80-byte per-instance records in slot-5 buffer `0x2a7061000` (`+0x493e00`).
+   - Both shaders normalize dispatch coordinates by `1.0 / float(uint(cp_c0[0].y << 3))` (`c0+0x4`, `numWorkGroups.y`).
+   - `op_dispatch_ind` guarded the GPU `vkCmdCopyBuffer` of `VkDispatchIndirectCommand` (`12` bytes) with `if (!c0_lay ...)`,
+     skipping NVN 2 compute shaders completely (and copying to NVN 1's `+0x200` instead of NVN 2's `+0x0`). Every indirect
+     NVN 2 compute dispatch therefore read `cp_c0[0].xyz = (0, 0, 0)`, dividing by zero (`+inf`) and writing corrupted
+     transforms/scales into the foliage instance buffer.
+   - **Fix**: `op_dispatch_ind` now copies the 12-byte indirect dispatch dimensions into `B.c0_off[2] + (c0_lay ? 0 : 0x200)`.
+
+2. **`R8_UINT` foliage species density maps sampled as float `sampler2D` (`0025-integer-sampled-textures.patch`, `vk_exec_draw.c`, `gfx_shader.c`)**:
+   - `pass 0018`, `pass 0019`, and `pass 0029` bind `tex 32113` / `tex 32129` (`VK_FORMAT_R8_UINT`, `2048×2048` species ID map)
+     and execute `int id = floatBitsToInt(textureGather(...).x); uint species = min(uint(id), max_species);`.
+   - Without integer-sampled texture specialization, `mkw_xlate` emitted float `sampler2D` and Vulkan sampled the view with
+     float/UNORM semantics: every non-zero texel returned `1.0f` (`0x3f800000` = `1,065,353,216` as `uint`), clamping every
+     grass tuft, flower, and crossfading bush to `max_species` (the largest tree mesh in the biome).
+   - **Fix**: Ported `0025-integer-sampled-textures.patch` (plus `0024-guarded-subword-global-loads.patch` and
+     `0026-more-storage-buffers-per-stage.patch`) into `tools/xlate`, rebuilt `mkw_xlate.exe` (`6c54957fc5737b20`), and wired
+     `GFX_TEX_UINT` / `GFX_TEX_SINT` + point-sampled integer `VkImageView`s through `gfx_shader.c` and `vk_exec_draw.c`.
+
+3. **Vertex `BaseInstance` (`c0+0x644`) vs zero-based `SR_InstanceId` (`0x2F8`) (`vk_pipeline.c:spirv_base_instance`)**:
+   - On NVN 2, `SR_InstanceId` (`0x2F8`) is **zero-based** (`gl_InstanceIndex - gl_BaseInstance`), which `mkw_xlate` already
+     emits accurately: e.g. `sh_bc07a00ae13ddd1b.spv` computes `(gl_InstanceIndex - gl_BaseInstance) + vp_c3[1].x` without
+     reading `c0+0x644`. Rewriting `OpISub(InstanceIndex, BaseInstance)` to `InstanceIndex` corrupted those draws whenever
+     `firstInstance != 0`.
+   - Meanwhile, 4 of the 28 `vp_c0[0][100].y` (`c0+0x644`) loads in the Mario Circuit capture (e.g. `sh_3c3c126eec55bc40.spv`)
+     did not reference `SR_InstanceId` at all (`base_var == 0`), so the earlier `spirv_base_instance` bailed out and left
+     indirect draws reading `0` instead of `firstInstance`.
+   - **Fix**: `spirv_base_instance` now leaves `InstanceIndex - BaseInstance` untouched and rewrites every vertex-stage load
+     of `vp_c0[0][100].y` to load `BuiltIn BaseInstance`, synthesising the `Input` variable (`OpEntryPoint`, `OpDecorate`,
+     `OpVariable`) when not already declared. Validated across all 367 captured shaders (26 rewritten) with `spirv-val`.
+
+## Additional runtime & release fixes (2026-11-11)
+
+- **Guarded SSBO speculative candidates (`vk_exec_draw.c:guarded_is_declared_ssbo`)**: prevented speculative pointer
+  candidates scanned from `c1`/`c3`/`c6`/root banks from scheduling bogus GPU→CPU writebacks (`vk_mem_gpu_wrote`), fixing
+  the `MEMORY=mirror` vtable corruption noted earlier.
+- **Attachment feedback loop learning (`vk_exec_draw.c:feedback_prepare`)**: read-only attachment sampling inside an open
+  render pass now learns `fb_learned = 1` and restarts in `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT`.
+- **Promoted depth-stencil copies/clears (`vk_exec_xfer.c`)**: `copy_t2t` splits dual-aspect depth+stencil blits cleanly;
+  `clear_tex` handles promoted depth formats and partial 3D Z-slice clears.
+- **F12 frame dump (`vk_dump.c`)**: `dump = key` now defers opening/truncating `passes.txt`, `images.txt`, and `bufs.txt`
+  until F12 is pressed.
+- **Crash handler VEH (`platform/win32.c`)**: first-chance `crash_veh` now ignores faults outside `mkw.exe` so driver/OS DLL
+  `__try/__except` probes pass through normally, while `SetUnhandledExceptionFilter(crash_uef)` still logs unhandled external
+  crashes.
+- **VRAM pressure & ASTC BC3 OOM fallback (`vk_texture.c`, `vk_astc.c`)**: `vk_astc_mode` always builds `bc_pipe` so per-texture
+  BC3 fallback works even when `ASTC_BC=0`, and `evict_vram_oom` / `vk_texture_free_for_vram` flush deferred uploads/frees
+  (`vk_upload_flush(1)` + `vk_mem_collect()`) so VMA actually reclaims device-local memory before OOM.
+- **Checked & ruled out from outside review**: `indirect_reset_draw` (`e78abde51f2d6bfa`) is absent from all 3,190 MKW NVN 2
+  stages; `IABS` lowers to valid `GLSL.std.450 SMax(x, -x)` with 0 shader/pipeline failures across all 239 compute pipelines.
+
+## Open leads for next session (from 2026-11-11 22:42 Mario Circuit test)
+
+1. **Foliage / giant trees still occurring in Mario Circuit & open world**:
+   - **Bindless compute texture handles in user UBOs**: `answers_for` (`vk_exec_draw.c`) only inspects `ex->tex[st][slot]`
+     (up to 32 bound slots), whereas NVN 2 compute shaders like `pass 0018` / `pass 0019` can read bindless texture handles
+     from UBO banks (`cbuf_slot >= 3`) or packed `c0` slots where `slot < 0`, so `a->tex_type` stayed `0` instead of
+     `GFX_TEX_2D | GFX_TEX_UINT` and the float variant from `shader-answers.bin` / cache kept running.
+   - **False-positive `ptr-scan` hit inside slot-5 foliage instance buffer**: at frame 929 (`mkw.log` lines 3206–3253),
+     `ptr-scan` scanned `slot 5 addr=2a7061000 size=493e00` and matched float matrix data (`w0=3f800000`, `off=0x30 ->
+     0x23f5bfeac`) as a guest pointer.
+   - Capture one fresh F12 frame on Mario Circuit with the new build (`dinst` + `passes.txt` + `sh_*.spv`) to verify
+     both whether `2d_uint` actually compiled for `e590d50a45b1c299` / `1df9dc86787a4b3b` and what `dinst` logs for
+     `1cdcc0fd9dee5df9`.
+2. **Blurry / low-resolution world textures**:
+   - `CompactLayers` (`vk_texture.c`) clamped all four `8192×8192×68` ASTC terrain/world arrays down to `1024×1024`
+     (skipping the top 3 guest mips: `8192`, `4096`, `2048`) under the default 512 MiB `MKW_COMPACT_ASTC_MB` budget,
+     combined with `BC3 recompress` (`ASTC_BC` default on), even on a 16 GB RTX 5070 Ti.
+   - `getMaxAllocatableSize` on streaming heap `0x283cb0440` returned `0` 20 times during boot/course load (`mkw.log`
+     lines 2124–2149).
