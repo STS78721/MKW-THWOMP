@@ -179,6 +179,9 @@ typedef enum {
     UI_MENU_COPY_INFO, UI_MENU_COPY_INFO_DESC, UI_MENU_COPY_INFO_DONE,
     UI_MENU_ACTION_FAILED,    // beside a button whose action did not work (no clipboard, no folder)
     UI_MENU_RESET, UI_MENU_RESET_DESC, UI_MENU_RESET_CONFIRM, UI_MENU_RESET_YES, UI_MENU_RESET_NO,
+    // Graphics tab: the game's frame resolution and the texture filtering floor
+    UI_MENU_TAB_GRAPHICS, UI_MENU_RESOLUTION, UI_MENU_RESOLUTION_DESC, UI_MENU_RESOLUTION_ORIGINAL,
+    UI_MENU_ANISO, UI_MENU_ANISO_DESC, UI_MENU_ANISO_GAME,
 
     // Performance overlay
     UI_MENU_OV_FPS, UI_MENU_OV_FRAME_MS, UI_MENU_OV_GAME_PCT, UI_MENU_OV_MAX_MS,

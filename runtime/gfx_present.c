@@ -290,8 +290,28 @@ static int create_swapchain(void) {
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(c->phys, g_surface, &caps) != VK_SUCCESS) return 0;
     int cw = 0, ch = 0;
     wsys_client_size(&cw, &ch);
-    VkExtent2D ext = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent
-                                                            : (VkExtent2D){(uint32_t)cw, (uint32_t)ch};
+    VkExtent2D surf_ext = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent
+                                                                 : (VkExtent2D){(uint32_t)cw, (uint32_t)ch};
+    VkExtent2D ext = surf_ext;
+    int client_override = 0;
+    // After a resize/fullscreen the HWND can already report the final client size while the surface
+    // still advertises the previous extent. Prefer the client when it is a valid image size so the
+    // first present after startup fullscreen is not stuck letterboxed in a corner.
+    if (cw > 0 && ch > 0 && caps.currentExtent.width != UINT32_MAX &&
+        (ext.width != (uint32_t)cw || ext.height != (uint32_t)ch)) {
+        uint32_t want_w = (uint32_t)cw, want_h = (uint32_t)ch;
+        if (want_w < caps.minImageExtent.width) want_w = caps.minImageExtent.width;
+        if (want_h < caps.minImageExtent.height) want_h = caps.minImageExtent.height;
+        if (caps.maxImageExtent.width && want_w > caps.maxImageExtent.width) want_w = caps.maxImageExtent.width;
+        if (caps.maxImageExtent.height && want_h > caps.maxImageExtent.height) want_h = caps.maxImageExtent.height;
+        if (want_w != ext.width || want_h != ext.height) {
+            static int lag_log;
+            if (lag_log++ < 8)
+                rt_log("gfx: surface extent %ux%u lags client %dx%d; creating %ux%u", ext.width, ext.height, cw, ch,
+                       want_w, want_h);
+            ext.width = want_w, ext.height = want_h, client_override = 1;
+        }
+    }
     if (!ext.width || !ext.height) return 0;
     uint32_t nf = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(c->phys, g_surface, &nf, NULL);
@@ -321,7 +341,18 @@ static int create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = pick_present_mode(c->phys), .clipped = VK_TRUE,
         .oldSwapchain = old};
+    int extent_stale = 0;
     VkResult r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
+    if (r != VK_SUCCESS && client_override) {
+        // Some drivers reject an extent other than currentExtent; fall back and keep dirty so a later
+        // present retries once the surface catches the HWND.
+        rt_log("gfx: vkCreateSwapchainKHR %ux%u failed (%d); falling back to surface %ux%u", ext.width, ext.height,
+               (int)r, surf_ext.width, surf_ext.height);
+        ci.imageExtent = surf_ext;
+        ext = surf_ext;
+        r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
+        if (r == VK_SUCCESS) extent_stale = 1;
+    }
     if (r != VK_SUCCESS) {
         rt_log("gfx: vkCreateSwapchainKHR failed (%d)", (int)r);
         g_sc = old;
@@ -348,7 +379,8 @@ static int create_swapchain(void) {
     }
     free_capture();
     vk_queue_unlock();
-    plat_xchg32(&g_dirty, 0);
+    if (extent_stale) plat_xchg32(&g_dirty, 1);
+    else plat_xchg32(&g_dirty, 0);
     return 1;
 }
 

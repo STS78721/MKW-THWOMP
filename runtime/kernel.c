@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "gfx.h"
 #include "host.h"
 #include "kernel.h"
 #include "platform/platform.h"
@@ -60,6 +61,7 @@ struct RtThread {
     uint64_t entry, arg, stack_top;
     int prio, core;
     uint64_t mask;
+    uint64_t host_site;        // return site of the host call while its virtual core is released (holding G)
     int started, exited, closed, cancel, is_main;
     PlatCond cv;
     // current wait
@@ -1010,6 +1012,7 @@ int kern_core_away(void) {
     lock();
     core_put(t);
     acct(t, S_HOST);
+    t->host_site = (uintptr_t)__builtin_return_address(0) - plat_exe_base();
     if (rt_trace & RT_TRACE_SCHED)   // the caller as an exe RVA (totk.map)
         t->wobj = (uintptr_t)__builtin_return_address(0) - plat_exe_base();
     unlock();
@@ -1021,6 +1024,7 @@ void kern_core_back(int *away) {
     if (!*away || !t) return;
     lock();
     core_take(t);
+    t->host_site = 0;
     unlock();
     *away = 0;
 }
@@ -1578,6 +1582,127 @@ int kern_thread_state(uint32_t h) {
     return r;
 }
 
+// Only blocked contexts are inspected: holding G prevents them from resuming or being freed. Running threads'
+// guest registers/stack are deliberately not sampled. Copy under G, then do all formatting and file I/O unlocked.
+int kern_debug_snapshot(FILE *out) {
+    enum { ROWS = 512, FRAMES = 16, HANDLES = 64 };
+    typedef struct {
+        uint32_t handle, tid, hs[HANDLES];
+        uint8_t kind[HANDLES], signaled[HANDLES];
+        int prio, core, wait, started, exited, main, host, nframe, nh, have_word;
+        uint64_t mask, entry, addr, key, seq, host_site, word, expected, lr[FRAMES];
+    } Row;
+    Row *rows = calloc(ROWS, sizeof *rows);
+    if (!rows || !out) { free(rows); return -1; }
+    if (!plat_mutex_trylock(&G)) {
+        fprintf(out, "kernel lock busy; snapshot skipped\n");
+        free(rows);
+        return -1;
+    }
+    int n = 0, total = 0;
+    for (RtThread *t = g_all; t; t = t->all) {
+        total++;
+        if (n == ROWS) continue;
+        Row *r = &rows[n++];
+        r->handle = t->handle, r->tid = t->tid, r->prio = t->prio, r->core = t->cur_core;
+        r->wait = t->wkind, r->started = t->started, r->exited = t->exited, r->main = t->is_main;
+        r->host = __atomic_load_n(&t->host_depth, __ATOMIC_RELAXED);
+        r->mask = t->mask, r->entry = t->entry, r->addr = t->waddr, r->key = t->wkey, r->seq = t->wseq;
+        r->host_site = t->host_site;
+        const Cpu *c = t->cur;
+        if (!r->wait || !c) continue;
+        int width = r->wait == W_ADDRESS && c->x[1] == 3 ? 8 : 4;
+        r->expected = c->x[2];
+        if ((r->wait == W_LOCK || r->wait == W_ADDRESS || r->wait == W_CONDVAR) &&
+            plat_mem_readable(r->addr, (uint64_t)width)) {
+            memcpy(&r->word, (const void *)(uintptr_t)r->addr, (size_t)width);
+            r->have_word = width;
+        }
+        r->lr[r->nframe++] = c->x[30];
+        uint64_t fp = c->x[29];
+        while (r->nframe < FRAMES && fp && !(fp & 7) && plat_mem_readable(fp, 16)) {
+            uint64_t pair[2];
+            memcpy(pair, (const void *)(uintptr_t)fp, sizeof pair);
+            r->lr[r->nframe++] = pair[1];
+            if (pair[0] <= fp || pair[0] - fp > (64u << 20)) break;
+            fp = pair[0];
+        }
+        if (r->wait == W_SYNC && c->x[2] <= HANDLES &&
+            plat_mem_readable(c->x[1], c->x[2] * sizeof(uint32_t))) {
+            r->nh = (int)c->x[2];
+            memcpy(r->hs, (const void *)(uintptr_t)c->x[1], (size_t)r->nh * sizeof *r->hs);
+            for (int j = 0; j < r->nh; j++) {
+                unsigned k = r->hs[j] - 0x1000;
+                int bad = 0;
+                r->kind[j] = k && k < MAX_H ? (uint8_t)g_h[k].type : 0xff;
+                r->signaled[j] = sig_obj(r->hs[j], &bad) ? 1 : bad ? 2 : 0;
+            }
+        }
+    }
+    unlock();
+    static const char *const wait_name[] = {"none", "mutex", "condition", "address", "sync"};
+    fprintf(out, "threads=%d captured=%d; frame=%llu; running contexts are not sampled\n", total, n,
+            (unsigned long long)gfx_stats().frames);
+    for (int i = 0; i < n; i++) {
+        const Row *r = &rows[i];
+        char desc[160];
+        fprintf(out, "thread %#x tid=%u p%d mask=%#llx core=%d main=%d started=%d exited=%d host-depth=%d entry=%s\n",
+                r->handle, r->tid, r->prio, (unsigned long long)r->mask, r->core, r->main, r->started, r->exited,
+                r->host, ldr_describe(r->entry, desc, sizeof desc));
+        fprintf(out, "  wait=%s seq=%llu address=%#llx key=%#llx host-call=exe+%#llx",
+                r->wait >= W_NONE && r->wait <= W_SYNC ? wait_name[r->wait] : "unknown",
+                (unsigned long long)r->seq, (unsigned long long)r->addr, (unsigned long long)r->key,
+                (unsigned long long)r->host_site);
+        if (r->have_word) fprintf(out, " word%u=%#llx", r->have_word * 8, (unsigned long long)r->word);
+        if (r->wait == W_ADDRESS) fprintf(out, " expected=%#llx", (unsigned long long)r->expected);
+        else if (r->have_word) fprintf(out, " owner=%#x", (uint32_t)r->word & ~WAITERS_BIT);
+        fputc('\n', out);
+        for (int j = 0; j < r->nh; j++)
+            fprintf(out, "  handle[%d]=%#x kind=%u signaled=%s\n", j, r->hs[j], r->kind[j],
+                    r->signaled[j] == 2 ? "invalid" : r->signaled[j] ? "yes" : "no");
+        for (int j = 0; j < r->nframe; j++)
+            fprintf(out, "  frame[%d]=%s\n", j, ldr_describe(r->lr[j], desc, sizeof desc));
+    }
+    free(rows);
+    return n;
+}
+
+static int32_t debug_dump_pending;
+
+static void debug_dump_main(void *unused) {
+    (void)unused;
+    char path[4096];
+    const char *log = rt_log_path();
+    size_t dir = log ? strlen(log) : 0;
+    if (log) {
+        const char *p = log + dir;
+        while (p > log && p[-1] != '/' && p[-1] != '\\') p--;
+        dir = (size_t)(p - log);
+    }
+    snprintf(path, sizeof path, "%.*sloading-waits-%llu.log", (int)dir, log ? log : "",
+             (unsigned long long)kern_now_ns());
+    FILE *f = fopen(path, "w");
+    if (f) {
+        for (int i = 0; i < 3; i++) {
+            if (i) plat_sleep_ms(2000);
+            fprintf(f, "\n=== sample %d at %llu ns ===\n", i + 1, (unsigned long long)kern_now_ns());
+            kern_debug_snapshot(f);
+            fflush(f);
+        }
+        fclose(f);
+        rt_log("loading-diag: captured three thread/wait snapshots in %s", path);
+    } else rt_log("loading-diag: cannot write %s", path);
+    __atomic_store_n(&debug_dump_pending, 0, __ATOMIC_RELEASE);
+}
+
+void kern_debug_dump(void) {
+    if (__atomic_exchange_n(&debug_dump_pending, 1, __ATOMIC_ACQ_REL)) return;
+    if (!plat_thread_spawn(debug_dump_main, NULL, "loading diagnostics", 0)) {
+        __atomic_store_n(&debug_dump_pending, 0, __ATOMIC_RELEASE);
+        rt_log("loading-diag: cannot start capture thread");
+    } else rt_log("loading-diag: Ctrl+F9 capture requested (three snapshots over four seconds)");
+}
+
 // CloseHandle: an event goes with its last end; a thread object once it has also exited.
 static uint32_t handle_close(uint32_t h) {
     unsigned i = h - 0x1000;
@@ -1845,7 +1970,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
         return 1;
     }
 
-    case 0x34: {   // WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 if less, 1 decrement if less, 2/3 if equal
+    case 0x34: {   // WaitForAddress(x0 address, w1 type, x2 value, x3 timeout): 0 less32, 1 decrement-less32, 2 equal32, 3 equal64
         RtThread *t = cur(imm);
         uint64_t addr = x[0];
         int type = (int)x[1];
@@ -1854,9 +1979,20 @@ int kern_svc(Cpu *c, uint32_t imm) {
             x[0] = R_INVALID_ENUM;
             return 1;
         }
+        if (addr & (type == 3 ? 7u : 3u)) {
+            x[0] = KERN_R_INVALID_ADDRESS;
+            return 1;
+        }
         lock();
-        uint32_t r, v = ld32(addr);
-        int ok = (type == 2 || type == 3) ? (int32_t)v == val : (int32_t)v < val;
+        // ArbitrationType_WaitIfEqual64 is not an alias for equal32 (libnx svc.h). The SDK's sdk+0x16eda0
+        // passes the full expected x2. Truncating both operands can sleep after an upper-word update and its signal.
+        uint32_t r, v = 0;
+        int ok;
+        if (type == 3) ok = __atomic_load_n((uint64_t *)(uintptr_t)addr, __ATOMIC_SEQ_CST) == x[2];
+        else {
+            v = ld32(addr);
+            ok = type == 2 ? (int32_t)v == val : (int32_t)v < val;
+        }
         if (ok && type == 1)
             while (!cas32(addr, &v, v - 1))
                 if (!((int32_t)v < val)) {

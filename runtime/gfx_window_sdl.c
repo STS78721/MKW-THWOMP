@@ -23,6 +23,7 @@
 #include "gfx_wsys.h"
 #include "input.h"
 #include "input_sdl.h"
+#include "kernel.h"
 #include "ui/menu.h"
 #include "vk.h"
 #include "platform/platform.h"
@@ -156,6 +157,11 @@ static void handle(const SDL_Event *e) {
     }
     if (e->type == g_ev_base + EV_CLOSE) gfx_window_closed();
     if (!g_win) return;
+    if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 &&
+        (e->key.mod & SDL_KMOD_CTRL) && !e->key.repeat) {
+        kern_debug_dump();
+        return;
+    }
     input_sdl_event(e);
     menu_sdl_event(e);
     switch (e->type) {

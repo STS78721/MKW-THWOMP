@@ -14,6 +14,7 @@
 //   TOTK_SHARED_FONTS=<dir>            nn::pl shared fonts (tools/extract_fonts.py output), default
 //                                      <romfs>/../../firmware/shared-fonts
 #include <ctype.h>
+#include <math.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2136,4 +2137,421 @@ void ov_system_on_inits_done(void) {
         *(uint32_t *)(uintptr_t)0x70052db828ull = 1;
         rt_log("gs: set 0x70052db828 = 1 in ov_system_on_inits_done");
     }
+}
+
+// ---- MKW_SKIN_WATCH=1 (diagnostic, Crown City): where the broken bone matrices of the skinned objects come from.
+// vk_exec_draw.c skin_check reports each skinned draw's bone buffer (rt_skin_watch_seen). The buffers of one kind (same
+// size and bones per object) rotate through a ring; once a kind has shown a broken matrix and SKW_RING of its buffers
+// have been seen, they are made read-only. Each guest write there faults; the handler notes the lifted function, the
+// host store site and the object slot, lets that one instruction run with the page writable (trap flag), checks the
+// value it wrote, and protects the page again.
+// Stage 1 (SKW_FRAMES frames): writers of the bone buffers. The writer is f_70001673c0's copy loop, which copies each
+// dirty bone's 48-byte matrix from the model's bone array (0xa0-byte entries, matrix at +0x30) into the buffer; at its
+// first store (f_70001673c0 + SKW_COPY_OFF) the source entry is rax + rbp. Bone entries that were copied broken are
+// remembered (up to SKW_ENT).
+// Stage 2 (SKW_FRAMES2 frames): the bone buffers stay watched, and the pages of those entries are watched too. Per
+// entry: who wrote it (function, host site, broken or not), and each copy out of it: broken or not, and whether it was
+// written since the previous copy (a broken copy with no write before it = the entry was never computed).
+#ifdef _WIN32
+enum { SKW_FRAMES = 8, SKW_FRAMES2 = 16, SKW_WRITERS = 64, SKW_BUFS = 8, SKW_RING = 4, SKW_SLOTS = 256, SKW_SITES = 64,
+       SKW_ENT = 16, SKW_ENT_SIZE = 0xa0, SKW_ENT_W = 8 };
+#define SKW_COPY_OFF 0x19ea1ull   // f_70001673c0's first store into the bone buffer (main_0020.o as built 2026-11-12)
+uint64_t rt_lifted_function(uintptr_t rip);   // main.c
+void f_70001673c0(void *c);
+typedef struct {
+    uint64_t addr, size;
+    uint32_t bones;
+    uint8_t written[SKW_SLOTS], bad[SKW_SLOTS];
+} SkwBuf;
+typedef struct {
+    uint64_t addr;
+    uint64_t writes, bad_writes, copies, bad_copies, bad_copies_unwritten, good_copies;
+    int dirty;   // written since the last copy
+    struct { uint64_t fn, site, n, bad; } w[SKW_ENT_W];
+    int nw;
+    uint32_t first[SKW_ENT_SIZE / 4];   // contents when first seen broken
+} SkwEnt;
+static SkwBuf skw_b[SKW_BUFS];
+static int skw_nb;
+static SkwEnt skw_e[SKW_ENT];
+static int skw_ne;
+static uint64_t skw_kind_size;   // the kind being watched (buffer size); 0 until a broken one is seen
+static uint32_t skw_kind_bones;
+static volatile LONG skw_armed, skw_done, skw_stage;
+static uint64_t skw_until;
+static struct { uint64_t fn, writes, bad; } skw_w[SKW_WRITERS];
+static volatile LONG skw_nw;
+static struct { uint64_t rip, writes, bad; } skw_s[SKW_SITES];   // host store sites (offset from the image base)
+static int skw_ns;
+static SRWLOCK skw_lock = SRWLOCK_INIT;
+static _Thread_local uint64_t skw_page, skw_addr, skw_fn, skw_rip, skw_src;
+static PVOID skw_veh;
+
+static int skw_badf(uint64_t a) {
+    float f;
+    memcpy(&f, (const void *)(uintptr_t)(a & ~3ull), 4);
+    return !(f == f) || f > 1e6f || f < -1e6f;
+}
+
+static int skw_bad_mat(uint64_t a) {   // a 48-byte matrix (3 rows of 4): huge/NaN values, or a zero row
+    const float *m = (const float *)(uintptr_t)a;
+    for (int i = 0; i < 12; i++)
+        if (!(m[i] == m[i]) || m[i] > 1e6f || m[i] < -1e6f) return 1;
+    for (int r = 0; r < 3; r++)
+        if (m[r * 4] == 0 && m[r * 4 + 1] == 0 && m[r * 4 + 2] == 0) return 1;
+    return 0;
+}
+
+static SkwBuf *skw_find(uint64_t a) {
+    for (int i = 0; i < skw_nb; i++)
+        if (a >= skw_b[i].addr && a < skw_b[i].addr + skw_b[i].size) return &skw_b[i];
+    return NULL;
+}
+
+static SkwEnt *skw_find_ent(uint64_t a) {
+    for (int i = 0; i < skw_ne; i++)
+        if (a >= skw_e[i].addr && a < skw_e[i].addr + SKW_ENT_SIZE) return &skw_e[i];
+    return NULL;
+}
+
+static int skw_in_pages(uint64_t a) {
+    uint64_t p = a & ~0xfffull;
+    for (int i = 0; i < skw_nb; i++)
+        if (p >= (skw_b[i].addr & ~0xfffull) && p < ((skw_b[i].addr + skw_b[i].size + 0xfff) & ~0xfffull)) return 1;
+    if (skw_stage == 2)
+        for (int i = 0; i < skw_ne; i++)
+            if (p >= (skw_e[i].addr & ~0xfffull) && p <= ((skw_e[i].addr + SKW_ENT_SIZE - 1) & ~0xfffull)) return 1;
+    return 0;
+}
+
+static void skw_note(uint64_t fn, uint64_t a, int bad, uint64_t src) {
+    AcquireSRWLockExclusive(&skw_lock);
+    uint64_t r = skw_rip - (uint64_t)(uintptr_t)GetModuleHandleW(NULL);
+    SkwBuf *b = skw_find(a);
+    if (b) {
+        int k;
+        for (k = 0; k < skw_ns && skw_s[k].rip != r; k++) {}
+        if (k == skw_ns && skw_ns < SKW_SITES) skw_s[skw_ns++] = (typeof(skw_s[0])){r, 0, 0};
+        if (k < skw_ns) skw_s[k].writes++, skw_s[k].bad += bad;
+        int i;
+        for (i = 0; i < skw_nw && skw_w[i].fn != fn; i++) {}
+        if (i == skw_nw && skw_nw < SKW_WRITERS) skw_w[skw_nw++] = (typeof(skw_w[0])){fn, 0, 0};
+        if (i < skw_nw) skw_w[i].writes++, skw_w[i].bad += bad;
+        if (a >= b->addr + 16 && b->bones) {
+            uint64_t s = (a - b->addr - 16) / (48ull * b->bones);
+            if (s < SKW_SLOTS) b->written[s] = 1;
+        }
+        if (src) {   // the copy loop's first store: one bone matrix copied out of entry src
+            int badm = plat_mem_readable(src + 0x30, 48) && skw_bad_mat(src + 0x30);
+            SkwEnt *e = skw_find_ent(src);
+            if (!e && badm && skw_stage == 1 && skw_ne < SKW_ENT && plat_mem_readable(src, SKW_ENT_SIZE)) {
+                e = &skw_e[skw_ne++];
+                memset(e, 0, sizeof *e);
+                e->addr = src;
+                memcpy(e->first, (const void *)(uintptr_t)src, SKW_ENT_SIZE);
+            }
+            if (e && skw_stage == 2) {
+                e->copies++;
+                if (badm) e->bad_copies++, e->bad_copies_unwritten += !e->dirty;
+                else e->good_copies++;
+                e->dirty = 0;
+            }
+        }
+    } else if (skw_stage == 2) {
+        SkwEnt *e = skw_find_ent(a);
+        if (e) {
+            e->writes++, e->bad_writes += bad, e->dirty = 1;
+            int k;
+            for (k = 0; k < e->nw && (e->w[k].fn != fn || e->w[k].site != r); k++) {}
+            if (k == e->nw && e->nw < SKW_ENT_W) e->w[e->nw++] = (typeof(e->w[0])){fn, r, 0, 0};
+            if (k < e->nw) e->w[k].n++, e->w[k].bad += bad;
+        }
+    }
+    ReleaseSRWLockExclusive(&skw_lock);
+}
+
+static void skw_protect(DWORD prot) {
+    DWORD old;
+    for (int i = 0; i < skw_nb; i++) {
+        uint64_t lo = skw_b[i].addr & ~0xfffull, hi = (skw_b[i].addr + skw_b[i].size + 0xfff) & ~0xfffull;
+        VirtualProtect((void *)(uintptr_t)lo, hi - lo, prot, &old);
+    }
+    if (skw_stage == 2)
+        for (int i = 0; i < skw_ne; i++) {
+            uint64_t lo = skw_e[i].addr & ~0xfffull, hi = (skw_e[i].addr + SKW_ENT_SIZE + 0xfff) & ~0xfffull;
+            VirtualProtect((void *)(uintptr_t)lo, hi - lo, prot, &old);
+        }
+}
+
+static LONG CALLBACK skw_veh_fn(PEXCEPTION_POINTERS ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION && skw_armed && ep->ExceptionRecord->NumberParameters >= 2 &&
+        ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uint64_t a = ep->ExceptionRecord->ExceptionInformation[1];
+        if (skw_in_pages(a)) {
+            DWORD old;
+            PCONTEXT x = ep->ContextRecord;
+            skw_page = a & ~0xfffull, skw_addr = a;
+            skw_fn = rt_lifted_function((uintptr_t)x->Rip);
+            skw_rip = x->Rip;
+            skw_src = x->Rip == (uint64_t)(uintptr_t)f_70001673c0 + SKW_COPY_OFF ? x->Rax + x->Rbp : 0;
+            VirtualProtect((void *)(uintptr_t)skw_page, 0x1000, PAGE_READWRITE, &old);
+            x->EFlags |= 0x100;   // trap after this one instruction
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    if (code == EXCEPTION_SINGLE_STEP && skw_page) {
+        DWORD old;
+        skw_note(skw_fn, skw_addr, skw_badf(skw_addr), skw_src);
+        if (skw_armed) VirtualProtect((void *)(uintptr_t)skw_page, 0x1000, PAGE_READONLY, &old);
+        skw_page = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Each skinned draw: its bone buffer, the object's slot, and whether that object's matrices are broken.
+void rt_skin_watch_seen(uint64_t addr, uint64_t size, uint32_t bones, uint32_t slot, int bad, uint64_t frame) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("MKW_SKIN_WATCH");
+    if (!on || skw_done || skw_armed || !bones) return;
+    if (!skw_kind_size) {
+        if (!bad) return;
+        skw_kind_size = size, skw_kind_bones = bones;
+        rt_log("dskinw: broken matrices in a %u-bone buffer of %#llx bytes; collecting its ring", bones,
+               (unsigned long long)size);
+    }
+    if (size != skw_kind_size || bones != skw_kind_bones) return;
+    AcquireSRWLockExclusive(&skw_lock);
+    SkwBuf *b = skw_find(addr);
+    if (!b && skw_nb < SKW_BUFS) b = &skw_b[skw_nb++], memset(b, 0, sizeof *b), b->addr = addr, b->size = size, b->bones = bones;
+    if (b && bad && slot < SKW_SLOTS) b->bad[slot] = 1;
+    int ready = skw_nb >= SKW_RING;
+    ReleaseSRWLockExclusive(&skw_lock);
+    if (!ready || InterlockedCompareExchange(&skw_armed, 1, 0)) return;
+    if (!skw_veh) skw_veh = AddVectoredExceptionHandler(1, skw_veh_fn);
+    skw_stage = 1;
+    skw_until = frame + SKW_FRAMES;
+    skw_protect(PAGE_READONLY);
+    rt_log("dskinw: watching %d buffers for %d frames", skw_nb, SKW_FRAMES);
+}
+
+static void skw_report_stage1(void) {
+    for (int i = 0; i < skw_nw; i++)
+        rt_log("dskinw: writer f_%llx: %llu writes, %llu left a broken float", (unsigned long long)skw_w[i].fn,
+               (unsigned long long)skw_w[i].writes, (unsigned long long)skw_w[i].bad);
+    for (int i = 0; i < skw_ns; i++)
+        rt_log("dskinw: store site image+%#llx: %llu writes, %llu broken", (unsigned long long)skw_s[i].rip,
+               (unsigned long long)skw_s[i].writes, (unsigned long long)skw_s[i].bad);
+    for (int i = 0; i < skw_nb; i++) {
+        char w[600], bd[600];
+        int ow = 0, ob = 0;
+        uint64_t nslot = (skw_b[i].size - 16) / (48ull * skw_b[i].bones);
+        for (uint64_t s = 0; s < nslot && s < SKW_SLOTS; s++) {
+            if (skw_b[i].written[s] && ow < (int)sizeof w - 8) ow += snprintf(w + ow, sizeof w - ow, " %llu", (unsigned long long)s);
+            if (skw_b[i].bad[s] && ob < (int)sizeof bd - 8) ob += snprintf(bd + ob, sizeof bd - ob, " %llu", (unsigned long long)s);
+        }
+        rt_log("dskinw: buffer %#llx (%llu slots): written slots:%s | broken slots seen:%s", (unsigned long long)skw_b[i].addr,
+               (unsigned long long)nslot, ow ? w : " none", ob ? bd : " none");
+    }
+    for (int i = 0; i < skw_ne; i++) {
+        char t[1400];
+        int o = 0;
+        for (int k = 0; k < SKW_ENT_SIZE / 4; k++) {
+            float f;
+            memcpy(&f, &skw_e[i].first[k], 4);
+            o += snprintf(t + o, sizeof t - o, "%s%g", k % 4 ? " " : k ? " | " : "", f);
+        }
+        rt_log("dskinw: broken bone entry %#llx (copied broken): %s", (unsigned long long)skw_e[i].addr, t);
+    }
+}
+
+static void skw_report_stage2(void) {
+    for (int i = 0; i < skw_ne; i++) {
+        SkwEnt *e = &skw_e[i];
+        rt_log("dskinw2: entry %#llx: %llu writes (%llu broken), %llu copies out: %llu good, %llu broken "
+               "(%llu of those with no write since the previous copy); now %s",
+               (unsigned long long)e->addr, (unsigned long long)e->writes, (unsigned long long)e->bad_writes,
+               (unsigned long long)e->copies, (unsigned long long)e->good_copies, (unsigned long long)e->bad_copies,
+               (unsigned long long)e->bad_copies_unwritten, skw_bad_mat(e->addr + 0x30) ? "broken" : "good");
+        for (int k = 0; k < e->nw; k++)
+            rt_log("dskinw2:   writer f_%llx at image+%#llx: %llu writes, %llu broken", (unsigned long long)e->w[k].fn,
+                   (unsigned long long)e->w[k].site, (unsigned long long)e->w[k].n, (unsigned long long)e->w[k].bad);
+    }
+}
+
+// Each skinned draw: move to stage 2, or disarm and report.
+void rt_skin_watch_poll(uint64_t frame) {
+    if (!skw_armed || skw_done || frame < skw_until) return;
+    if (skw_stage == 1) {
+        AcquireSRWLockExclusive(&skw_lock);
+        skw_report_stage1();
+        ReleaseSRWLockExclusive(&skw_lock);
+        if (skw_ne) {
+            skw_stage = 2;   // the bone buffers stay protected; add the entries' pages
+            skw_protect(PAGE_READONLY);
+            skw_until = frame + SKW_FRAMES2;
+            rt_log("dskinw: stage 2: watching %d broken bone entries for %d frames", skw_ne, SKW_FRAMES2);
+            return;
+        }
+        rt_log("dskinw: no broken bone entry was caught at the copy; no stage 2");
+    }
+    skw_armed = 0, skw_done = 1;
+    skw_protect(PAGE_READWRITE);
+    AcquireSRWLockExclusive(&skw_lock);
+    if (skw_stage == 2) skw_report_stage2();
+    rt_log("dskinw: done");
+    ReleaseSRWLockExclusive(&skw_lock);
+}
+void rt_skin_watch_arm(uint64_t addr, uint64_t size, uint64_t frame) { (void)addr, (void)size, (void)frame; }
+#else
+void rt_skin_watch_seen(uint64_t addr, uint64_t size, uint32_t bones, uint32_t slot, int bad, uint64_t frame) {
+    (void)addr, (void)size, (void)bones, (void)slot, (void)bad, (void)frame;
+}
+void rt_skin_watch_poll(uint64_t frame) { (void)frame; }
+void rt_skin_watch_arm(uint64_t addr, uint64_t size, uint64_t frame) { (void)addr, (void)size, (void)frame; }
+#endif
+
+// ---- MKW_TRIG_CHECK=1 (diagnostic, Crown City bone matrices): every guest call of sinf/cosf through a PLT runs the
+// SDK's lifted routine, then compares its result with the host's (double precision). Logs the first mismatches
+// ("dtrig": input, guest and host results, caller) and a count every 2^20 calls.
+static void trig_check(Cpu *c, int cosine) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("MKW_TRIG_CHECK");
+    uint32_t in_bits = (uint32_t)c->v[0];
+    uint64_t lr = c->x[30];
+    rt_original(c);
+    if (!on) return;
+    float x, got;
+    uint32_t got_bits = (uint32_t)c->v[0];
+    memcpy(&x, &in_bits, 4), memcpy(&got, &got_bits, 4);
+    double want = cosine ? cos((double)x) : sin((double)x);
+    static long calls, bad;
+    long n = __atomic_add_fetch(&calls, 1, __ATOMIC_RELAXED);
+    int wrong = (x == x && fabs(x) < 1e30f) ? !(fabs((double)got - want) <= 1e-5) : 0;
+    if (wrong) {
+        long b = __atomic_add_fetch(&bad, 1, __ATOMIC_RELAXED);
+        if (b <= 40)
+            rt_log("dtrig %s(%.9g [%08x]) = %.9g [%08x], host %.9g, caller %#llx", cosine ? "cosf" : "sinf", x, in_bits,
+                   got, got_bits, want, (unsigned long long)lr);
+    }
+    if (!(n & 0xfffff)) rt_log("dtrig: %ld calls, %ld wrong", n, __atomic_load_n(&bad, __ATOMIC_RELAXED));
+}
+static void obs_sinf(Cpu *c) { trig_check(c, 0); }
+static void obs_cosf(Cpu *c) { trig_check(c, 1); }
+HOST_OBSERVER("sinf", obs_sinf);
+HOST_OBSERVER("cosf", obs_cosf);
+
+// ---- MKW_ANIM_CHECK=1 (diagnostic, Crown City bone matrices): probes inserted by hand into the generated
+// f_700042bea0 (main_0049.c; original at the scratchpad copy main_0049.c.orig). rt_anim_t sees each curve sample time
+// (base + offset, the two floats summed before the frame index is taken) and the curve header. rt_anim_q checks
+// the quaternion matrix store join, not the separate Euler paths. Blends reach that join without rt_anim_t:
+// their TLS time/header and scratch quaternion can be stale, so report only the matrix for those paths.
+static _Thread_local float anim_base, anim_off;
+static _Thread_local uint64_t anim_hdr;
+static _Thread_local uint64_t anim_entry;
+static _Thread_local int anim_path;
+static struct { uint64_t hdr; float good_max, good_min; uint64_t good, bad; int dumped; } anim_h[128];
+static SRWLOCK anim_lock = SRWLOCK_INIT;
+static int anim_on(void) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("MKW_ANIM_CHECK");
+    return on;
+}
+void rt_anim_t(Cpu *c, float base, float off, uint64_t hdr, int path) {
+    if (!anim_on()) return;
+    anim_base = base, anim_off = off, anim_hdr = hdr, anim_path = path;
+    anim_entry = c->x[24];
+}
+void rt_anim_q(Cpu *c, uint64_t fp, uint64_t entry) {
+    if (!anim_on()) return;
+    // The source-list header is saved at sp+56 by f_700042bea0. A count other than one takes the blend path
+    // before the time hook. Matching the entry as well prevents attribution to another bone's last sample.
+    uint64_t list = 0;
+    uint32_t sources = 0;
+    if (plat_mem_readable(c->sp + 56, 8)) memcpy(&list, (const void *)(uintptr_t)(c->sp + 56), 8);
+    if (plat_mem_readable(list, 4)) memcpy(&sources, (const void *)(uintptr_t)list, 4);
+    int source_valid = sources == 1 && anim_path == 1 && anim_entry == entry;
+    float q[4] = {0}, r[12];
+    if (source_valid) {
+        memcpy(&q[0], (const void *)(uintptr_t)(fp - 0x58), 4);
+        memcpy(&q[1], (const void *)(uintptr_t)(fp - 0x5c), 4);
+        memcpy(&q[2], (const void *)(uintptr_t)(fp - 0x60), 4);
+        memcpy(&q[3], (const void *)(uintptr_t)(fp - 0x64), 4);
+    }
+    memcpy(r, (const void *)(uintptr_t)(entry + 0x60), 48);   // the rotation just written (rows of 4)
+    float n = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    int bad = 0;
+    for (int i = 0; i < 3; i++) {
+        float rn = r[i * 4] * r[i * 4] + r[i * 4 + 1] * r[i * 4 + 1] + r[i * 4 + 2] * r[i * 4 + 2];
+        bad |= !(rn > 0.8f && rn < 1.2f);
+    }
+    uint32_t raw[4] = {0};
+    if (source_valid) {
+        memcpy(&raw[0], (const void *)(uintptr_t)(fp - 0x70), 4);
+        memcpy(&raw[1], (const void *)(uintptr_t)(fp - 0x54), 4);
+        memcpy(&raw[2], (const void *)(uintptr_t)(fp - 0x50), 4);
+        memcpy(&raw[3], (const void *)(uintptr_t)(fp - 0x4c), 4);
+    }
+    float t = anim_base + anim_off;
+    static long checks, bads;
+    long k = __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED);
+    AcquireSRWLockExclusive(&anim_lock);
+    int h = 128;
+    if (source_valid)
+        for (h = 0; h < 128 && anim_h[h].hdr && anim_h[h].hdr != anim_hdr; h++) {}
+    if (h < 128 && !anim_h[h].hdr) anim_h[h].hdr = anim_hdr, anim_h[h].good_max = -1e30f, anim_h[h].good_min = 1e30f;
+    if (h < 128) {
+        if (!bad) {
+            anim_h[h].good++;
+            if (t > anim_h[h].good_max) anim_h[h].good_max = t;
+            if (t < anim_h[h].good_min) anim_h[h].good_min = t;
+        } else anim_h[h].bad++;
+    }
+    if (bad) {
+        __atomic_add_fetch(&bads, 1, __ATOMIC_RELAXED);
+        static long reports[2];   // keep blended samples from exhausting the single-source report budget
+        long b = ++reports[source_valid];
+        if (b <= 40 && !source_valid) {
+            rt_log("danim bad rotation rows (%g %g %g | %g %g %g | %g %g %g) entry %#llx sources %u: "
+                   "matrix only; blend/source context not captured (time/header/quaternion omitted)",
+                   r[0], r[1], r[2], r[4], r[5], r[6], r[8], r[9], r[10], (unsigned long long)entry, sources);
+        }
+        if (b <= 40 && source_valid) {
+            uint32_t stride = 0;
+            uint64_t data = 0, resource = 0, backing = 0, source_base = 0;
+            if (plat_mem_readable(anim_hdr, 0x130)) {
+                memcpy(&stride, (const void *)(uintptr_t)(anim_hdr + 0x10c), 4);
+                memcpy(&data, (const void *)(uintptr_t)(anim_hdr + 0x28), 8);
+                // hdr+0x28 is added to this external base by the guest; zero is a valid offset.
+                memcpy(&resource, (const void *)(uintptr_t)(anim_hdr + 0x40), 8);
+                if (resource && plat_mem_readable(resource + 0x10, 8))
+                    memcpy(&backing, (const void *)(uintptr_t)(resource + 0x10), 8);
+                if (backing && plat_mem_readable(backing + 0x100, 8))
+                    memcpy(&source_base, (const void *)(uintptr_t)(backing + 0x100), 8);
+            }
+            rt_log("danim bad rotation rows (%g %g %g | %g %g %g | %g %g %g) raw %08x %08x %08x %08x quat (%g %g %g %g |q|^2=%g) path %d t=%.6g (base %.6g + off %.6g) hdr %#llx stride %u data_offset "
+                   "%#llx source_base %#llx entry %#llx | this hdr: %llu good (observed t %g..%g; not clip bounds), %llu bad",
+                   r[0], r[1], r[2], r[4], r[5], r[6], r[8], r[9], r[10], raw[0], raw[1], raw[2], raw[3],
+                   q[0], q[1], q[2], q[3], n, anim_path, t, anim_base, anim_off, (unsigned long long)anim_hdr, stride,
+                   (unsigned long long)data, (unsigned long long)source_base, (unsigned long long)entry,
+                   h < 128 ? (unsigned long long)anim_h[h].good : 0ull,
+                   h < 128 ? anim_h[h].good_min : 0.f, h < 128 ? anim_h[h].good_max : 0.f,
+                   h < 128 ? (unsigned long long)anim_h[h].bad : 0ull);
+            if (h < 128 && !anim_h[h].dumped && plat_mem_readable(anim_hdr, 0x130)) {
+                anim_h[h].dumped = 1;
+                char s[2400];
+                int o = 0;
+                for (int i = 0; i < 0x130; i += 4) {
+                    uint32_t w;
+                    memcpy(&w, (const void *)(uintptr_t)(anim_hdr + i), 4);
+                    o += snprintf(s + o, sizeof s - o, "%s%08x", i % 32 ? " " : i ? " | " : "", w);
+                }
+                rt_log("danim hdr %#llx: %s", (unsigned long long)anim_hdr, s);
+            }
+        }
+    }
+    if (!(k & 0xfffff)) rt_log("danim: %ld quaternion-path rotations, %ld with non-unit rows (Euler paths not sampled)",
+                             k, __atomic_load_n(&bads, __ATOMIC_RELAXED));
+    ReleaseSRWLockExclusive(&anim_lock);
 }

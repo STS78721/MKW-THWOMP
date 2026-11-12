@@ -772,7 +772,11 @@ NVN_API(nvnWindowSetPresentInterval) {
 NVN_API(nvnWindowSetCrop) {
     win_t *o = WN(c);
     int v[4] = {(int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), (int)arg_x(c, 4)};
-    if (memcmp(o->crop, v, sizeof v)) NVN_LOG("WindowCrop %d,%d %dx%d", v[0], v[1], v[2], v[3]);
+    if (memcmp(o->crop, v, sizeof v)) {
+        static int logs;   // the picture size the game shows (MKW: its frame inside the 3840x2160 window texture)
+        if (logs++ < 12) rt_log("nvn: window crop %d,%d %dx%d (lr %#llx, frame %llu)", v[0], v[1], v[2], v[3],
+                                (unsigned long long)c->x[30], (unsigned long long)o->presents);
+    }
     memcpy(o->crop, v, sizeof v);
 }
 
@@ -848,24 +852,12 @@ NVN_API(nvnQueuePresentTexture) {
     const tex_t *t = (const tex_t *)o->tex[idx];
     uint64_t period = present_period(o), now = kern_now_ns();
     uint64_t slot = now + pace(&o->pace, now, period);
-    // MKW (Switch 2) often presents a 3840×2160 window texture while the 3D pass only filled the
-    // top-left ~1704×960 (dynamic res). With crop left at {0,0,0,0} the blit scaled the whole
-    // mostly-black buffer and --shot had to hard-crop. Prefer the window crop when set; else, for
-    // a 4K present texture, crop to the largest recent colour RT under 1920×1080 when known, else
-    // 1704×960 (observed title DRS).
+    // The game sets the active picture rectangle through nvnWindowSetCrop. An empty crop means
+    // the whole texture, matching nvnWindowGetCrop and the NVN default.
     int crop[4] = {o->crop[0], o->crop[1], o->crop[2], o->crop[3]};
-    if ((!crop[2] || !crop[3]) && t && t->d.width == 3840 && t->d.height == 2160) {
-        crop[0] = 0;
-        crop[1] = 0;
-        crop[2] = 1704;
-        crop[3] = 960;
-        static int crop_log;
-        if (crop_log++ < 4)
-            rt_log("nvn: present 3840x2160 with empty crop → default %dx%d (MKW DRS)", crop[2], crop[3]);
-    }
     gfx_backend()->present(t, crop, slot);
     o->ticket[idx] = o->presents;
     o->avail[idx] = slot + period;
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
-    rt_frame_presented(t, o->presents);
+    rt_frame_presented(t, crop, o->presents);
 }

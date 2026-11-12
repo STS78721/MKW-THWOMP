@@ -12,6 +12,12 @@
 // - A GPU write within the submission (UpdateUniformBuffer, a storage buffer a shader writes, a buffer copy or fill,
 //   an image-to-buffer copy: vk_usnap_drop) drops the copies it touches from then on, so later draws read the result.
 // - The arena goes back to a free list once the submission's fence is done (completion thread).
+// MKW_SSBO_SNAPSHOT (default off; it turned out not to be the cause of the Crown City sheets, 2026-11-12): small storage buffers bound to the vertex stage are taken too, so a read-only one
+// uses the copy (vk_usnap_find_ssbo). Crown City's skinned pedestrians read their bone matrices from a 78 KiB storage
+// buffer the game rewrites for the next frame while the GPU still draws this one; a draw that met half-written
+// matrices stretched its mesh into a screen-filling sheet for one frame (2026-11-12). The range runs SSBO_TAIL past
+// the bound size, clamped to the pool, because NVN shaders read records past the nominal size; a storage buffer the
+// shader writes keeps the live binding (and a GPU write drops the copy, as for uniforms).
 // The design follows MacNativeGames' TOTK_UBO_SNAPSHOT (games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m usnap_take,
 // usnap_drop; MIT, Copyright (c) 2026 jhaizhou); the code is ours.
 // The copy is taken where vk_exec_record starts: at the submit call when the replay runs on the submitting thread, later
@@ -28,6 +34,8 @@
 #define MAX_RANGE (64u << 10)
 #define ARENA_MIN (4u << 20)
 #define CALL_DEPTH 16
+#define SSBO_MAX (256u << 10)    // storage bindings up to this size are snapshotted (vertex stage)
+#define SSBO_TAIL (64u << 10)    // and this much past their nominal size, within the pool
 
 typedef struct Arena {
     struct Arena *next;
@@ -43,6 +51,7 @@ typedef struct { uint64_t lo, hi, fence; } Wrote;
 
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
+    int ssbo;                   // MKW_SSBO_SNAPSHOT: 1 on, 0 off (+1 stored: 0 is "not read yet")
     int on;                     // this submission has a snapshot
     uint64_t fence, gen;
     Arena *arena;
@@ -58,6 +67,29 @@ static struct {
 
 static Arena *free_arenas;
 static PlatMutex free_lock = PLAT_MUTEX_INIT;
+
+// A writable buffer is commonly bound by hundreds of draws in one submission. Its first drop already records the
+// in-flight write and invalidates every overlapping snapshot region. Exact repeats can skip both operations. This
+// epoch is separate from U.gen (which changes on each drop) and advances even when snapshots are disabled.
+typedef struct { uint64_t addr, size, epoch; } DropHit;
+#define DROP_SLOTS 512
+static DropHit drop_hits[DROP_SLOTS];
+static uint64_t drop_epoch;
+
+static void drop_begin(void) {
+    if (!++drop_epoch) {
+        memset(drop_hits, 0, sizeof drop_hits);
+        drop_epoch = 1;
+    }
+}
+
+static int drop_repeat(uint64_t addr, uint64_t size) {
+    uint64_t hash = (addr >> 4) ^ (addr >> 13) ^ (addr >> 21) ^ size * UINT64_C(0x9e3779b97f4a7c15);
+    DropHit *h = &drop_hits[hash & (DROP_SLOTS - 1)];
+    if (h->epoch == drop_epoch && h->addr == addr && h->size == size) return 1;
+    *h = (DropHit){addr, size, drop_epoch};
+    return 0;
+}
 
 static void *grow(void *p, int *cap, size_t elem) {
     int n = *cap ? *cap * 2 : 1024;
@@ -124,6 +156,16 @@ static void collect(const op_hdr *h, int depth) {
                 uint64_t n = b->size < MAX_RANGE ? b->size : MAX_RANGE;
                 U.col[U.ncol++] = (Rng){b->addr & ~(uint64_t)(ALIGN - 1), b->addr + n};
             }
+        } else if (h->op == OP_BIND_SSBO && U.ssbo == 2) {
+            const p_bind_buf *b = a;
+            VkMemSpan sp;
+            if (b->stage == 0 && b->addr && b->size && b->size <= SSBO_MAX && vk_mem_resolve(b->addr, 1, &sp) &&
+                !sp.alloc && sp.pool) {
+                uint64_t n = b->size + SSBO_TAIL;
+                if (n > sp.avail) n = sp.avail;   // stay inside the pool, or the merged range would be refused
+                if (U.ncol == U.ccol) U.col = grow(U.col, &U.ccol, sizeof *U.col);
+                U.col[U.ncol++] = (Rng){b->addr & ~(uint64_t)(ALIGN - 1), b->addr + n};
+            }
         }
         h = nvn_op_next(h);
     }
@@ -139,8 +181,8 @@ static int wr_by_lo(const void *a, const void *b) {
 }
 
 // Sorts the collected ranges by lo. A town frame binds about 10,000 uniform ranges and qsort took half a millisecond
-// of the copy's 0.96 ms on the game thread, so they go through an LSD radix sort on (lo - lowest) / ALIGN, three
-// passes of 11 bits; qsort is left for a span that does not fit in 33 bits (2 TiB).
+// of the copy's 0.96 ms on the game thread, so they go through an LSD radix sort on (lo - lowest) / ALIGN, up to three
+// passes of 11 bits (only as many as the span needs); qsort is left for a span that does not fit in 33 bits (2 TiB).
 #define RADIX_BITS 11
 static void sort_col(void) {
     static Rng *tmp;
@@ -152,7 +194,9 @@ static void sort_col(void) {
         if (U.col[i].lo < lo) lo = U.col[i].lo;
         if (U.col[i].lo > hi) hi = U.col[i].lo;
     }
-    if ((hi - lo) / ALIGN >> (3 * RADIX_BITS)) {
+    uint64_t span = (hi - lo) / ALIGN;
+    if (!span) return;   // all keys equal, already sorted
+    if (span >> (3 * RADIX_BITS)) {
         qsort(U.col, (size_t)n, sizeof *U.col, by_lo);
         return;
     }
@@ -162,7 +206,8 @@ static void sort_col(void) {
         if (!(tmp = malloc((size_t)ctmp * sizeof *tmp))) rt_fatal("vk_usnap: out of memory");
     }
     Rng *src = U.col, *dst = tmp;
-    for (int pass = 0; pass < 3; pass++) {
+    int passes = span >> (2 * RADIX_BITS) ? 3 : span >> RADIX_BITS ? 2 : 1;
+    for (int pass = 0; pass < passes; pass++) {
         int shift = pass * RADIX_BITS, count[1 << RADIX_BITS] = {0};
         for (int i = 0; i < n; i++) count[(src[i].lo - lo) / ALIGN >> shift & ((1 << RADIX_BITS) - 1)]++;
         for (int k = 0, sum = 0; k < 1 << RADIX_BITS; k++) {
@@ -173,7 +218,7 @@ static void sort_col(void) {
         Rng *t = src;
         src = dst, dst = t;
     }
-    if (src != U.col) memcpy(U.col, src, (size_t)n * sizeof *src);   // three passes end in tmp
+    if (src != U.col) memcpy(U.col, src, (size_t)n * sizeof *src);   // an odd number of passes ends in tmp
 }
 
 // Keeps the GPU writes of submissions that are not done, merged into disjoint ranges sorted by lo (the terrain rewrites
@@ -218,7 +263,9 @@ static void summary(void) {
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
+    if (!U.ssbo) U.ssbo = (rt_knob("SSBO_SNAPSHOT", "0") ? 1 : 0) + 1;   // off by default: it did not fix the Crown City sheets
     U.on = 0, U.fence = fence, U.gen++;
+    drop_begin();
     summary();
     if (!RT_KNOB_ON(U.mode - 1)) {
         U.off_subs++;
@@ -289,6 +336,20 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     return 1;
 }
 
+// A storage binding of at least n bytes at addr (MKW_SSBO_SNAPSHOT): the copy, as far as its region reaches.
+int vk_usnap_find_ssbo(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
+    if (!U.on || U.ssbo != 2 || !n) return 0;
+    int i = first_above(addr);
+    if (i >= U.nreg) return 0;
+    const Reg *r = &U.reg[i];
+    if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
+    uint64_t off = r->off + (addr - r->lo);
+    if (off % align) return 0;
+    *out = (VkDescriptorBufferInfo){U.arena->buf, off, r->hi - addr};
+    U.hits++;
+    return 1;
+}
+
 const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n) {
     if (!U.on || !n || !U.arena) return NULL;
     int i = first_above(addr);
@@ -300,6 +361,8 @@ const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n) {
 
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
+    // Keep malformed wrapping ranges on the existing path; the overlap/prune code sees their original unsigned end.
+    if (addr <= UINT64_MAX - n && drop_repeat(addr, n)) return;
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
     if (!U.on) return;

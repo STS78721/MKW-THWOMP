@@ -82,6 +82,32 @@ static int wait_state(Cpu *c, uint32_t h, int want) {
 
 static double ms_since(uint64_t t0) { return (double)(kern_now_ns() - t0) / 1e6; }
 
+static void check_wait_snapshot(uint32_t h, const char *kind) {
+    int before = kern_thread_state(h);
+    FILE *f = tmpfile();
+    CHECK(f != NULL, "create thread snapshot probe file");
+    if (!f) return;
+    int n = kern_debug_snapshot(f);
+    CHECK(n > 0, "capture thread snapshot (%d)", n);
+    rewind(f);
+    char text[65536], want[80];
+    size_t size = fread(text, 1, sizeof text - 1, f);
+    text[size] = 0;
+    fclose(f);
+    snprintf(want, sizeof want, "thread %#x tid=", h);
+    char *row = strstr(text, want);
+    CHECK(row != NULL, "snapshot contains waiting thread %#x", h);
+    if (row) {
+        char *next = strstr(row + 1, "\nthread ");
+        if (next) *next = 0;
+        snprintf(want, sizeof want, "wait=%s ", kind);
+        CHECK(strstr(row, want) != NULL, "snapshot contains %s", want);
+        CHECK(strstr(row, "frame[0]=") != NULL, "snapshot includes blocked guest return address");
+        if (before == KERN_WAIT_SYNC) CHECK(strstr(row, "handle[0]=") != NULL, "snapshot includes sync handles");
+    }
+    CHECK(kern_thread_state(h) == before, "snapshot preserves the guest wait");
+}
+
 // ---- user-mode lock of the SDK: tag word = owner handle | waiters bit
 static uint32_t ld(volatile uint32_t *a) { return __atomic_load_n(a, __ATOMIC_SEQ_CST); }
 static int cas(volatile uint32_t *a, uint32_t *e, uint32_t v) {
@@ -147,6 +173,7 @@ static void test_lock(Cpu *c, uint32_t me) {
         wait_state(c, h[i], KERN_WAIT_LOCK);
     }
     CHECK(ld(&g_lockw) == (me | KERN_WAITERS_BIT), "lock word %#x with 5 waiters", ld(&g_lockw));
+    check_wait_snapshot(h[0], "mutex");
     user_unlock(c, &g_lockw, me);
     for (int i = 0; i < 5; i++) join(c, h[i]);
     char got[64];
@@ -183,6 +210,7 @@ static void test_cv_wake_order(Cpu *c) {
         wait_state(c, h[i], KERN_WAIT_CONDVAR);
     }
     CHECK(ld(&g_keyw) == 1, "condvar key %u with 3 waiters", ld(&g_keyw));
+    check_wait_snapshot(h[0], "condition");
     for (int i = 0; i < 3; i++) CHECK(sv(c, 0x1D, ga(&g_keyw), 1, 0, 0) == 0, "SignalProcessWideKey");
     for (int i = 0; i < 3; i++) join(c, h[i]);
     char got[64];
@@ -248,12 +276,13 @@ static void test_cv_key_order(Cpu *c) {
 }
 
 // ---- address arbiter
-typedef struct { int type, value, idx; int64_t timeout; uint32_t r; } ArbJob;
+typedef struct { int type, idx; int64_t value, timeout; uint64_t addr; uint32_t r; } ArbJob;
 static volatile uint32_t g_arb __attribute__((aligned(8)));
+static volatile uint64_t g_arb64 __attribute__((aligned(8)));
 
 static void arb_waiter(Cpu *c) {
     ArbJob *j = arg_p(c, 0);
-    j->r = sv(c, 0x34, ga(&g_arb), (uint64_t)j->type, (uint64_t)(int64_t)j->value, (uint64_t)j->timeout);
+    j->r = sv(c, 0x34, j->addr ? j->addr : ga(&g_arb), (uint64_t)j->type, (uint64_t)j->value, (uint64_t)j->timeout);
     exit_thread(c);
 }
 
@@ -314,8 +343,28 @@ static void test_arbiter(Cpu *c) {
     uint32_t r = sv(c, 0x34, arb, 2, 5, 5000000);
     double ms = ms_since(t0);
     CHECK(r == KERN_R_TIMEOUT && ms >= 5.0, "wait type 2 with a 5 ms timeout: %#x after %.2f ms", r, ms);
-    CHECK(sv(c, 0x34, arb, 3, 0, 0) == KERN_R_INVALID_ENUM && sig(c, 3, 0, 0) == KERN_R_INVALID_ENUM, "type 3");
-    printf("address arbiter: wait types 0-2 (less, decrement-less, equal), signal types 0-2 (wake, increment, modify by "
+    // Type 3 is the newer 64-bit equality wait, used by this game's SDK at sdk+0x16eda0.
+    // A producer can update the upper word and signal before the consumer enters the kernel: the consumer must
+    // observe the changed whole value and return, rather than sleep forever after the only signal has passed.
+    uint64_t arb64 = ga(&g_arb64);
+    g_arb64 = UINT64_C(0x200000005);
+    CHECK(sv(c, 0x34, arb64, 3, UINT64_C(0x100000005), 0) == KERN_R_BAD_STATE,
+          "64-bit wait must observe an upper-word-only change");
+    CHECK(sv(c, 0x34, arb64, 3, UINT64_C(0x200000005), 0) == KERN_R_TIMEOUT,
+          "64-bit equal value with zero timeout");
+    CHECK(sv(c, 0x34, arb64 + 4, 3, 0, 0) == KERN_R_INVALID_ADDRESS, "64-bit wait alignment");
+    CHECK(sv(c, 0x34, arb64 + 4, 2, 2, 0) == KERN_R_TIMEOUT, "32-bit wait keeps four-byte alignment");
+    g_arb64 = UINT64_C(0xffffffff00000005);
+    CHECK(sv(c, 0x34, arb64, 3, UINT64_C(0x100000005), 0) == KERN_R_BAD_STATE,
+          "64-bit wait compares all high bits");
+    ArbJob j64 = {.type = 3, .value = (int64_t)g_arb64, .timeout = -1, .addr = arb64};
+    h = arb_spawn(c, &j64);
+    check_wait_snapshot(h, "address");
+    CHECK(sv(c, 0x35, arb64, 0, 0, 1) == 0, "signal a 64-bit address waiter");
+    join(c, h);
+    CHECK(j64.r == 0, "64-bit address waiter woke: %#x", j64.r);
+    CHECK(sv(c, 0x34, arb, 4, 0, 0) == KERN_R_INVALID_ENUM && sig(c, 3, 0, 0) == KERN_R_INVALID_ENUM, "invalid arbiter types");
+    printf("address arbiter: wait types 0-3 (less, decrement-less, equal32, equal64), signal types 0-2 (wake, increment, modify by "
            "waiters), 5 ms timeout after %.2f ms: %s\n", ms, failures == before ? "ok" : "FAIL");
 }
 
@@ -345,6 +394,7 @@ static void test_events(Cpu *c) {
     uint32_t h = create(c, a_event_waiter, &e, 44, -2);
     start(c, h);
     wait_state(c, h, KERN_WAIT_SYNC);
+    check_wait_snapshot(h, "sync");
     CHECK(sv(c, 0x11, hw, 0, 0, 0) == 0, "SignalEvent");
     join(c, h);
     CHECK(e.r == 0 && e.idx == 0, "waiter woken by SignalEvent: %#x index %u", e.r, e.idx);

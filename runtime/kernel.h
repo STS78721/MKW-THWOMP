@@ -4,6 +4,7 @@
 
 // Horizon kernel results (module 1).
 #define KERN_R_OUT_OF_RESOURCE 0xCE01u
+#define KERN_R_INVALID_ADDRESS 0xCC01u
 #define KERN_R_INVALID_STATE_MEM 0xD401u
 #define KERN_R_BAD_HANDLE 0xE401u
 #define KERN_R_TIMEOUT 0xEA01u
@@ -27,6 +28,10 @@ uint64_t kern_threads_created(void);
 
 // The guest frame-pointer chain from c->x[29] to stderr.
 void kern_backtrace(const Cpu *c);
+
+// On-demand loading-stall diagnostics. Snapshot never changes wait objects or wakes a guest thread.
+int kern_debug_snapshot(FILE *out);             // thread/wait metadata and stacks of kernel-blocked threads
+void kern_debug_dump(void);                     // Ctrl+F9: three snapshots on a background thread
 
 // ---- probe support
 enum { KERN_WAIT_NONE, KERN_WAIT_LOCK, KERN_WAIT_CONDVAR, KERN_WAIT_ADDRESS, KERN_WAIT_SYNC };

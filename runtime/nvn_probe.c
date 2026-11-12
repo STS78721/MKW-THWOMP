@@ -29,6 +29,12 @@
 #undef NVN_PROC
 void nvnp_nvnCommandBufferPushGraphicsConstants(Cpu *c);   // NVN 2 procs the command checks record
 void nvnp_nvnCommandBufferPushComputeConstants(Cpu *c);
+void nvnp_nvnCommandBufferPushGraphicsConstantsDeferred(Cpu *c);
+void nvnp_nvnCommandBufferPushComputeConstantsDeferred(Cpu *c);
+void nvnp_nvnCommandBufferDrawMeshTasks(Cpu *c);
+void nvnp_nvnCommandBufferSetGeometryProcessingMode(Cpu *c);
+void nvnp_nvnCommandBufferMultiDrawElementsIndirectCount(Cpu *c);
+void nvn_probe_prepare_async(const uint64_t *handles, uint64_t *out, int n, uint64_t replayed);
 
 typedef struct { const char *name; void (*fn)(Cpu *); } ProcRow;
 static const ProcRow procs[] = {
@@ -462,6 +468,10 @@ static uint64_t record_all(void) {
     static const uint32_t pushed[4] = {0x39b60b61, 0x3a21d13a, 0x45340000, 0x44ca8000};   // 1/2880, 1/1620, 2880, 1620
     REC(OP_PUSH_CONST, CALL(nvnCommandBufferPushGraphicsConstants, U(c), 0, 0x10, sizeof pushed, U(pushed)));
     REC(OP_WAIT_SYNC, CALL(nvnCommandBufferWaitSync, U(c), U(&syncs)));
+    REC(OP_DRAW_IDX_IND_COUNT, CALL(nvnCommandBufferMultiDrawElementsIndirectCount, U(c), NVN_DRAW_PRIMITIVE_TRIANGLES,
+                                  NVN_INDEX_TYPE_UNSIGNED_INT, 0x8000, 0xc000, 0xc100, 4, 20));
+    REC(OP_GEO_MODE, CALL(nvnCommandBufferSetGeometryProcessingMode, U(c), 1));
+    REC(OP_DRAW_MESH, CALL(nvnCommandBufferDrawMeshTasks, U(c), 3, 5));
     CALL(nvnCommandBufferPushComputeConstants, U(c), 0, 0, 2, U(pushed));   // under 4 bytes: dropped, as the driver does
     static const int thresholds[4] = {1, 2, 3, 4};
     CALL(nvnCommandBufferSetColorReductionEnable, U(c), 1);   // hints: nothing recorded
@@ -686,6 +696,19 @@ static void parse_all(uint64_t h) {
                   "DRAW_IDX_IND payload");
             break;
         }
+        case OP_DRAW_IDX_IND_COUNT: {
+            const p_draw_idx_ind_count *p = a;
+            CHECK(p->prim == NVN_DRAW_PRIMITIVE_TRIANGLES && p->itype == NVN_INDEX_TYPE_UNSIGNED_INT &&
+                      p->ibuf == 0x8000 && p->ind == 0xc000 && p->count == 0xc100 && p->max_count == 4 && p->stride == 20,
+                  "DRAW_IDX_IND_COUNT payload");
+            break;
+        }
+        case OP_GEO_MODE: CHECK(((const p_geo_mode *)a)->mode == 1, "GEO_MODE payload"); break;
+        case OP_DRAW_MESH: {
+            const p_draw_mesh *p = a;
+            CHECK(p->kind == 0 && p->first == 3 && p->count == 5 && !p->indirect, "DRAW_MESH payload");
+            break;
+        }
         case OP_DISPATCH_IND: CHECK(((const p_dispatch_ind *)a)->ind == 0xc100, "DISPATCH_IND payload"); break;
         case OP_CLEAR_BUF: {
             const p_clear_buf *p = a;
@@ -819,6 +842,86 @@ static void probe_null_effects(void) {
     n_objects += 2;
 }
 
+// Submit preparation must reread deferred sources on every submit, including sources copied into another
+// recording, while immediate bindings and already prepared recordings retain their captured data.
+static void check_prepared(uint64_t h, const uint64_t handles[3], const uint32_t words[2], uint64_t immediate) {
+    int binds = 0, pushes = 0;
+    for (const op_hdr *o = nvn_op_first(h); o->op != OP_END; o = nvn_op_next(o)) {
+        const void *payload = nvn_op_payload(o);
+        if (o->op == OP_BIND_TEX || o->op == OP_BIND_IMG || o->op == OP_BIND_SAMP) {
+            const p_bind_handles *b = payload;
+            CHECK(b->n == 1 && b->h[0] == (b->src ? handles[binds] : immediate), "prepared handle kind %u", o->op);
+            if (b->src) binds++;
+        } else if (o->op == OP_PUSH_CONST) {
+            const p_push_const *b = payload;
+            CHECK(b->bytes == sizeof(uint32_t) * 2 && !memcmp(b->w, words, sizeof(uint32_t) * 2), "prepared push %d", pushes);
+            pushes++;
+        }
+    }
+    CHECK(binds == 3 && pushes == 2, "prepared %d deferred bindings and %d pushes", binds, pushes);
+}
+
+static void probe_submit_preparation(void) {
+    uint64_t handles[3] = {0x100001, 0x200002, 0x300003}, immediate = 0x400004;
+    const uint64_t first_handles[3] = {0x100001, 0x200002, 0x300003};
+    uint32_t words[2] = {1, 2};
+    const uint32_t first_words[2] = {1, 2};
+    begin(&cmd, ctlmem1, 0x32000);
+    CALL(nvnCommandBufferBindTexturesDeferred, U(&cmd), NVN_SHADER_STAGE_FRAGMENT, 0, 1, U(&handles[0]));
+    CALL(nvnCommandBufferBindImagesDeferred, U(&cmd), NVN_SHADER_STAGE_COMPUTE, 0, 1, U(&handles[1]));
+    CALL(nvnCommandBufferBindSeparateSamplersDeferred, U(&cmd), NVN_SHADER_STAGE_FRAGMENT, 0, 1, U(&handles[2]));
+    CALL(nvnCommandBufferBindTextures, U(&cmd), NVN_SHADER_STAGE_FRAGMENT, 1, 1, U(&immediate));
+    CALL(nvnCommandBufferPushGraphicsConstantsDeferred, U(&cmd), 0, 0, sizeof words, U(words));
+    CALL(nvnCommandBufferPushComputeConstantsDeferred, U(&cmd), 0, 0, sizeof words, U(words));
+    uint64_t leaf = CALL(nvnCommandBufferEndRecording, U(&cmd));
+    // Prepare the leaf once, then inline its deferred sources twice to exercise nested Copy/CallCommands.
+    nvn_submit_prepare(&leaf, 1);
+    check_prepared(leaf, first_handles, first_words, immediate);
+    begin(&cmd2, ctlmem2, 0x34000);
+    CALL(nvnCommandBufferCopyCommands, U(&cmd2), 1, U(&leaf));
+    uint64_t middle = CALL(nvnCommandBufferEndRecording, U(&cmd2));
+    CALL(nvnCommandBufferBeginRecording, U(&cmd2));
+    CALL(nvnCommandBufferCallCommands, U(&cmd2), 1, U(&middle));
+    uint64_t outer = CALL(nvnCommandBufferEndRecording, U(&cmd2));
+    handles[0] += 10; handles[1] += 10; handles[2] += 10;
+    words[0] = 10; words[1] = 20; immediate = 0xdeadbeef;
+    nvn_submit_prepare(&outer, 1);
+    check_prepared(outer, handles, words, 0x400004);
+    check_prepared(leaf, first_handles, first_words, 0x400004);
+    const uint64_t queued_handles[3] = {handles[0], handles[1], handles[2]};
+    const uint32_t queued_words[2] = {words[0], words[1]};
+    uint64_t queued = 0;
+    nvn_probe_prepare_async(&outer, &queued, 1, nvn_submit_count());
+    CHECK(queued == outer, "a completed recording is reused for the first queued submit");
+    handles[0] += 10; handles[1] += 10; handles[2] += 10;
+    words[0] = 30; words[1] = 40;
+    uint64_t prepared = 0;
+    nvn_probe_prepare_async(&outer, &prepared, 1, 0);
+    CHECK(prepared != queued, "overlapping submits with deferred sources use distinct snapshots");
+    check_prepared(prepared, handles, words, 0x400004);
+    check_prepared(queued, queued_handles, queued_words, 0x400004);
+    check_prepared(leaf, first_handles, first_words, 0x400004);
+    CALL(nvnCommandBufferFinalize, U(&cmd2));
+    CALL(nvnCommandBufferFinalize, U(&cmd));
+
+    // Reused static streams require neither a wait search nor a deferred search. Record a long stream so the
+    // optional timing is sensitive to accidentally restoring those whole-stream scans; timings are never assertions.
+    begin(&cmd, ctlmem3, 0x36000);
+    enum { BARRIERS = 4096, SUBMITS = 20000 };
+    for (int i = 0; i < BARRIERS; i++) CALL(nvnCommandBufferBarrier, U(&cmd), 1);
+    uint64_t fixed = CALL(nvnCommandBufferEndRecording, U(&cmd));
+    uint64_t bytes = nvn_handle_bytes(fixed), t0 = kern_now_ns();
+    for (int i = 0; i < SUBMITS; i++) nvn_submit_prepare(&fixed, 1);
+    uint64_t elapsed = kern_now_ns() - t0;
+    CHECK(nvn_handle_live(fixed) && nvn_handle_bytes(fixed) == bytes, "static recording survives repeated preparation");
+    nvn_probe_prepare_async(&fixed, &prepared, 1, 0);
+    nvn_probe_prepare_async(&fixed, &prepared, 1, 0);
+    CHECK(prepared == fixed, "overlapping static submissions need no asynchronous clone");
+    printf("probe-nvn: prepared %d static %d-op submissions in %.3f ms (%.1f ns/submit; no Vulkan)\n",
+           SUBMITS, BARRIERS, elapsed / 1e6, (double)elapsed / SUBMITS);
+    CALL(nvnCommandBufferFinalize, U(&cmd));
+}
+
 static void probe_main(Cpu *unused) {
     (void)unused;
     probe_device_and_pools();
@@ -828,6 +931,7 @@ static void probe_main(Cpu *unused) {
     probe_sync_events();
     probe_commands();
     probe_null_effects();
+    probe_submit_preparation();
     CALL(nvnQueueFinalize, U(&queue));
     CALL(nvnDeviceFinalize, U(&dev));
 }
@@ -862,6 +966,26 @@ static uint32_t run_child(const char *mode, char *out, size_t cap) {
 }
 
 static int run_as_child(const char *name) {
+    if (!strncmp(name, "prepare-wait-", 13)) {
+        ((RtConfig *)rt_config())->gpu = "null";
+        sync_t source = {.magic = MAGIC('S', 'Y', 'N', 'C')};
+        CALL(nvnCommandBufferInitialize, U(&cmd), U(&dev));
+        CALL(nvnCommandBufferBeginRecording, U(&cmd));
+        CALL(nvnCommandBufferWaitSync, U(&cmd), U(&source));
+        uint64_t leaf = CALL(nvnCommandBufferEndRecording, U(&cmd));
+        CALL(nvnCommandBufferInitialize, U(&cmd2), U(&dev));
+        CALL(nvnCommandBufferBeginRecording, U(&cmd2));
+        CALL(nvnCommandBufferCallCommands, U(&cmd2), 1, U(&leaf));
+        uint64_t outer = CALL(nvnCommandBufferEndRecording, U(&cmd2));
+        // EndRecording/inlining must keep the source pointer. Validation and the fence value are read at submit.
+        if (strstr(name, "invalid")) source.magic = 0;
+        else source.fenced = 1, source.fence = UINT64_MAX;
+        uint64_t out;
+        if (strstr(name, "async")) nvn_probe_prepare_async(&outer, &out, 1, 0);
+        else nvn_submit_prepare(&outer, 1);
+        printf("child %s: preparation returned\n", name);
+        return 0;
+    }
     for (int i = 0; i < NPROCS; i++)
         if (!strcmp(procs[i].name, name)) {
             procs[i].fn(&cpu);
@@ -881,6 +1005,15 @@ static void probe_children(void) {
         const char *line = strstr(out, "FATAL: ");
         int len = line ? (int)strcspn(line, "\r\n") : 0;
         printf("fatal stub %-30s child exit %u: %.*s\n", fatal_procs[i], code, len, line ? line : "(no FATAL line)");
+    }
+    static const char *const wait_modes[] = {"prepare-wait-invalid", "prepare-wait-async-invalid",
+                                             "prepare-wait-unreached", "prepare-wait-async-unreached"};
+    for (unsigned i = 0; i < sizeof wait_modes / sizeof *wait_modes; i++) {
+        uint32_t code = run_child(wait_modes[i], out, sizeof out);
+        const char *want = strstr(wait_modes[i], "invalid") ? "CommandBufferWaitSync with an invalid sync state"
+                                                              : "CommandBufferWaitSync could not reach producer fence";
+        CHECK(code == 70 && strstr(out, want), "child %s: exit %u, output: %s", wait_modes[i], code, out);
+        printf("submit wait %-31s child exit %u\n", wait_modes[i], code);
     }
 }
 

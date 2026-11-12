@@ -3782,7 +3782,8 @@ static void warm_builder(void *arg) {
     return;
 }
 
-static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]);
+static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4], int blocking);
+static void lb_warm_prepared(const char *dir);
 
 void vk_pipeline_prewarm(void) {
     const char *gpu = rt_config()->gpu;
@@ -3792,8 +3793,8 @@ void vk_pipeline_prewarm(void) {
     // briefly so keys_open reads pipeline-keys.bin; restore the prior flag when done.
     int async_was = A.on;
     if (!A.on) A.on = 1;
-    if (!cfg_bool("TOTK_PIPE_PREBUILD")) {   // prebuild_start logs the off case
-        if (ensure_init()) lb_start(pr_hist, fs_hist);
+    if (!cfg_bool("MKW_PIPE_PREBUILD")) {   // prebuild_start logs the off case
+        if (ensure_init()) lb_start(pr_hist, fs_hist, 0);
         A.on = async_was;
         return;
     }
@@ -3801,7 +3802,7 @@ void vk_pipeline_prewarm(void) {
     K.warm = 1;
     if (!ensure_init() || !K.file_n) {
         rt_log("vk_pipeline: prewarm: no pipeline keys (%s)", K.path[0] ? K.path : "<none>");
-        if (P.ready) lb_start(pr_hist, fs_hist);
+        if (P.ready) lb_start(pr_hist, fs_hist, 0);
         A.on = async_was;
         return;
     }
@@ -3885,7 +3886,10 @@ void vk_pipeline_prewarm(void) {
     free(K.file);
     K.file = NULL;
     plat_mutex_unlock(&P.lock);
-    lb_start(pr_hist, fs_hist);
+    // Stage libraries continue in the background at idle priority. A blocking "warm everything" before the
+    // guest froze the window for minutes and is not worth it at boot; pipeline-keys prewarm above already
+    // covers the hot recorded set.
+    lb_start(pr_hist, fs_hist, 0);
     A.on = async_was;
 }
 
@@ -3895,7 +3899,7 @@ static void prebuild_start(void) {
     plat_mutex_lock(&P.lock);
     if (K.file && !K.warm) {
         rt_log("vk_pipeline: prebuild off%s; %zu records not built",
-               !cfg_bool("TOTK_PIPE_PREBUILD") ? " (TOTK_PIPE_PREBUILD=0)" : " (no boot prewarm)", K.file_n);
+               !cfg_bool("MKW_PIPE_PREBUILD") ? " (MKW_PIPE_PREBUILD=0)" : " (no boot prewarm)", K.file_n);
         free(K.file);
         K.file = NULL;
     }
@@ -4401,13 +4405,13 @@ static void lb_report(const char *how) {
 // Boot: compute pipelines and kept libraries, all entered for the process.
 static void lb_worker(void *arg) {
     (void)arg;
-    plat_thread_priority(PLAT_PRIO_IDLE);
+    if (LB.idle) plat_thread_priority(PLAT_PRIO_IDLE);
     for (;;) {
         size_t i = (size_t)plat_inc64(&LB.next) - 1;
         if (i >= LB.n || LB.stop) break;
-        plat_thread_priority(PLAT_PRIO_NORMAL);   // gfx_shader's cache lock, disk reads
+        if (LB.idle) plat_thread_priority(PLAT_PRIO_NORMAL);   // gfx_shader's cache lock, disk reads
         const GfxShader *sh = gfx_shader_load_input(LB.e[i].iid, 0);
-        plat_thread_priority(PLAT_PRIO_IDLE);
+        if (LB.idle) plat_thread_priority(PLAT_PRIO_IDLE);
         if (!sh) {
             plat_mutex_lock(&LB.stat);
             LB.noshader++;
@@ -4432,18 +4436,26 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     uint32_t best = 0, bf = 0;
     for (uint32_t i = 1; i < 16; i++) best = pr_hist[i] > pr_hist[best] ? i : best;
     for (uint32_t i = 1; i < 4; i++) bf = fs_hist[i] > fs_hist[bf] ? i : bf;
-    if (!pr_hist[best]) best = 8;   // no key file: TotK clips -w..w (all 2706 records of a recorded key file)
+    if (!pr_hist[best]) best = 8;   // no key file: clip -w..w (Mario Kart World recorded pipelines)
     LB.clamp = (uint8_t)(best & 1), LB.poly = (uint8_t)(best >> 1 & 3), LB.minus_w = (uint8_t)(best >> 3 & 1);
     LB.samples = (uint8_t)(1u << bf);
 }
 
+static void lb_join(void) {
+    for (int i = 0; i < LB.threads; i++)
+        if (LB.th[i]) plat_thread_join(LB.th[i]), LB.th[i] = NULL;
+    LB.threads = 0;
+}
+
 // Boot: compute shaders of the warm list (recorded and prepared), then the first KEEP recorded graphics variants.
-static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
-    const char *e = cfg_value("TOTK_LIB_PREBUILD"), *ke = cfg_get("TOTK_LIB_PREBUILD_KEEP");
-    const char *te = cfg_get("TOTK_LIB_PREBUILD_THREADS");   // no fixed default: a quarter of the CPUs when unset
-    if (!A.on || !cfg_bool("TOTK_LIB_PREBUILD")) return;
+// keep unset / empty: every recorded graphics variant (full pre-game warm). blocking: join workers before return.
+static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4], int blocking) {
+    const char *e = cfg_value("MKW_LIB_PREBUILD"), *ke = cfg_get("MKW_LIB_PREBUILD_KEEP");
+    const char *te = cfg_get("MKW_LIB_PREBUILD_THREADS");   // no fixed default: a quarter of the CPUs when unset
+    if (!A.on || !cfg_bool("MKW_LIB_PREBUILD")) return;
     GfxWarmEnt *all = NULL;
     size_t total = gfx_shader_warm_list(&all), n = 0, n_cs = 0;
+    // KEEP unset: compute only (graphics libs are large; set MKW_LIB_PREBUILD_KEEP to also keep VS/FS libs).
     LB.keep_n = ke && *ke ? atoi(ke) : 0;
     LB.e = malloc((total + 1) * sizeof *LB.e);
     for (size_t i = 0; LB.e && i < total; i++)
@@ -4458,10 +4470,16 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
         return;
     }
     LB.n = n;
+    LB.next = 0, LB.done = 0, LB.stop = 0;
+    memset((void *)LB.built, 0, sizeof LB.built);
+    memset((void *)LB.have, 0, sizeof LB.have);
+    memset((void *)LB.fail, 0, sizeof LB.fail);
+    memset((void *)LB.warmed, 0, sizeof LB.warmed);
+    LB.noshader = LB.nolib = 0;
     lb_state(pr_hist, fs_hist);
-    LB.idle = 1;
+    LB.idle = blocking ? 0 : 1;   // boot joins at normal priority; background stays idle
     int cpus = (int)plat_cpu_usable();
-    int t = te && *te ? atoi(te) : cpus / 4;
+    int t = te && *te ? atoi(te) : (blocking ? cpus / 2 : cpus / 4);
     t = t < 1 ? 1 : t > LB_MAX_THREADS ? LB_MAX_THREADS : t;
     if ((size_t)t > n) t = (int)n;
     LB.t0 = now_ms();
@@ -4472,16 +4490,15 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     plat_add32(&LB.running, started - t);
     LB.threads = started;
     rt_log("vk_pipeline: stage library prebuild: %zu compute pipelines and %zu recorded variants' libraries "
-           "(TOTK_LIB_PREBUILD_KEEP %d) on %d idle-priority threads; library state clamp %u, polygon mode %u, depth "
-           "-w..w %u, samples %u", n_cs < n ? n_cs : n, n > n_cs ? n - n_cs : 0, LB.keep_n, started, LB.clamp, LB.poly,
-           LB.minus_w, LB.samples);
+           "(MKW_LIB_PREBUILD_KEEP %d) on %d %s-priority threads; library state clamp %u, polygon mode %u, depth "
+           "-w..w %u, samples %u", n_cs < n ? n_cs : n, n > n_cs ? n - n_cs : 0, LB.keep_n, started,
+           blocking ? "normal" : "idle", LB.clamp, LB.poly, LB.minus_w, LB.samples);
+    if (blocking) lb_join();
 }
 
 static void lb_stop(void) {
     plat_xchg32(&LB.stop, 1);
-    for (int i = 0; i < LB.threads; i++)
-        if (LB.th[i]) plat_thread_join(LB.th[i]), LB.th[i] = NULL;
-    LB.threads = 0;
+    lb_join();
 }
 
 // Preparation: one prepared variant at a time into the driver's disk cache (private shader copy, nothing kept).
@@ -4597,48 +4614,75 @@ int vk_pipeline_warm_shaders(void) {
 
 // ---- dynamic state
 
+static void set_dynamic(VkCommandBuffer cb, const VkPipeState *s, const VkPipeState *previous, int mesh);
+
 void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
-    vk_pipeline_set_dynamic_ex(cb, s, 0);
+    set_dynamic(cb, s, NULL, 0);
+}
+
+void vk_pipeline_set_dynamic_changed(VkCommandBuffer cb, const VkPipeState *s, const VkPipeState *previous) {
+    set_dynamic(cb, s, previous, 0);
 }
 
 // mesh=1: omit topology, restart and vertex-input dynamics (mesh pipelines drop those from pDynamicState;
 // NVIDIA has AVed inside the driver when those cmds were recorded against a bound mesh pipeline).
 void vk_pipeline_set_dynamic_ex(VkCommandBuffer cb, const VkPipeState *s, int mesh) {
+    set_dynamic(cb, s, NULL, mesh);
+}
+
+// The caller discards previous on pipeline binds, command-buffer changes and mesh transitions. Between those,
+// Vulkan retains each independently set value, so a change to one state need not re-record the other states.
+static void set_dynamic(VkCommandBuffer cb, const VkPipeState *s, const VkPipeState *previous, int mesh) {
     if (!ensure_init()) return;
     const poly_st *pl = &s->poly;
     const ds_st *d = &s->ds;
+    const poly_st *pp = previous ? &previous->poly : NULL;
+    const ds_st *pd = previous ? &previous->ds : NULL;
     // The front face maps unchanged: TOTK sets the upper-left window origin, and the y-flipped viewport (y_flip) puts
     // NDC +y at row 0 as NVN does, so the framebuffer winding Vulkan tests is the one NVN tests (MacNativeGames passes
     // it to Metal unchanged; LAS Recomp exec.c mirrors it only for the lower-left origin).
     int front_cw = pl->front == NVN_FRONT_FACE_CW;
-    vkCmdSetCullMode(cb, (VkCullModeFlags)(pl->cull & 3));   // NVN_FACE_* has VkCullModeFlagBits' values
-    vkCmdSetFrontFace(cb, front_cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    if (!pp || pl->cull != pp->cull)
+        vkCmdSetCullMode(cb, (VkCullModeFlags)(pl->cull & 3));   // NVN_FACE_* has VkCullModeFlagBits' values
+    if (!pp || pl->front != pp->front)
+        vkCmdSetFrontFace(cb, front_cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     if (!mesh) {
-        vkCmdSetPrimitiveTopology(cb, vk_pipeline_topology(s->prim));
-        vkCmdSetPrimitiveRestartEnable(cb, s->prim_restart != 0);
+        if (!previous || s->prim != previous->prim) vkCmdSetPrimitiveTopology(cb, vk_pipeline_topology(s->prim));
+        if (!previous || s->prim_restart != previous->prim_restart) vkCmdSetPrimitiveRestartEnable(cb, s->prim_restart != 0);
     }
-    vkCmdSetDepthTestEnable(cb, d->dt);
-    vkCmdSetDepthWriteEnable(cb, d->dw);
-    vkCmdSetDepthCompareOp(cb, compare_op(d->df));
-    vkCmdSetStencilTestEnable(cb, d->st);
-    vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, stencil_op(d->fail_f), stencil_op(d->zpass_f), stencil_op(d->zfail_f),
+    if (!pd || d->dt != pd->dt) vkCmdSetDepthTestEnable(cb, d->dt);
+    if (!pd || d->dw != pd->dw) vkCmdSetDepthWriteEnable(cb, d->dw);
+    if (!pd || d->df != pd->df) vkCmdSetDepthCompareOp(cb, compare_op(d->df));
+    if (!pd || d->st != pd->st) vkCmdSetStencilTestEnable(cb, d->st);
+    if (!pd || d->fail_f != pd->fail_f || d->zpass_f != pd->zpass_f || d->zfail_f != pd->zfail_f || d->sf_f != pd->sf_f)
+        vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, stencil_op(d->fail_f), stencil_op(d->zpass_f), stencil_op(d->zfail_f),
                       compare_op(d->sf_f));
-    vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, stencil_op(d->fail_b), stencil_op(d->zpass_b), stencil_op(d->zfail_b),
+    if (!pd || d->fail_b != pd->fail_b || d->zpass_b != pd->zpass_b || d->zfail_b != pd->zfail_b || d->sf_b != pd->sf_b)
+        vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, stencil_op(d->fail_b), stencil_op(d->zpass_b), stencil_op(d->zfail_b),
                       compare_op(d->sf_b));
     // NVN_POLYGON_OFFSET_ENABLE_* bit of the polygon mode in use: point 1, line 2, fill 4
     unsigned mode = pl->mode <= NVN_POLYGON_MODE_FILL ? pl->mode : NVN_POLYGON_MODE_FILL;
-    vkCmdSetDepthBiasEnable(cb, (pl->offset_en >> mode & 1) != 0);
-    vkCmdSetRasterizerDiscardEnable(cb, s->raster_discard != 0);
-    if (!mesh && P.dyn_vi && s->vs) {
+    if (!pp || pl->offset_en != pp->offset_en || pl->mode != pp->mode)
+        vkCmdSetDepthBiasEnable(cb, (pl->offset_en >> mode & 1) != 0);
+    if (!previous || s->raster_discard != previous->raster_discard)
+        vkCmdSetRasterizerDiscardEnable(cb, s->raster_discard != 0);
+    if (!mesh && P.dyn_vi && s->vs && (!previous || s->vs != previous->vs ||
+        memcmp(s->vattr, previous->vattr, sizeof s->vattr) || memcmp(s->vstream, previous->vstream, sizeof s->vstream))) {
         VtxInput v;
         vertex_input(s, &v);
         rec_vertex_input(P.set_vi, cb, v.n_bind, v.b, v.n_attr, v.a);
     }
-    if (P.dyn_clamp) rec_bool(P.set_clamp, cb, s->depth_clamp != 0);
-    if (P.dyn_poly) rec_polygon_mode(P.set_poly, cb, polygon_mode(pl->mode));
-    if (P.dyn_a2c) rec_bool((PFN_vkCmdSetDepthClampEnableEXT)P.set_a2c, cb, s->ms.a2c != 0);   // the same signature
+    if (P.dyn_clamp && (!previous || s->depth_clamp != previous->depth_clamp)) rec_bool(P.set_clamp, cb, s->depth_clamp != 0);
+    if (P.dyn_poly && (!pp || pl->mode != pp->mode)) rec_polygon_mode(P.set_poly, cb, polygon_mode(pl->mode));
+    if (P.dyn_a2c && (!previous || s->ms.a2c != previous->ms.a2c))
+        rec_bool((PFN_vkCmdSetDepthClampEnableEXT)P.set_a2c, cb, s->ms.a2c != 0);   // the same signature
     int n = target_count(s);
     if (!n) return;
+    // Write masks also depend on fragment outputs and dual-source blend use. Keep these dependencies together;
+    // otherwise a shader/format change could retain an earlier target's write mask.
+    if (previous && s->fs == previous->fs && s->chmask.mask == previous->chmask.mask &&
+        s->color.blend_en == previous->color.blend_en && !memcmp(s->color_fmt, previous->color_fmt, sizeof s->color_fmt) &&
+        !memcmp(s->blend, previous->blend, sizeof s->blend)) return;
     VkBool32 en[8];
     VkColorBlendEquationEXT eq[8];
     VkColorComponentFlags wm[8];

@@ -76,6 +76,29 @@ static uint64_t mesh_stage_key(const uint8_t *ctl, const uint8_t *code) {
     return (h ? h : (uint64_t)(uintptr_t)code) ^ 0x4ull;
 }
 
+// ProgramSetShaders gives every successful stage replacement a new serial and owns the task/mesh controls. Shader
+// code remains valid and immutable for that program lifetime, as for vk_exec_draw.c's serial-keyed shader table.
+// Keep only the raw content keys here: the primitive SPH is a separate translation input and is hashed every draw.
+// A collision simply hashes again; zero-serial programs retain the full-content lookup on every call.
+#define MESH_KEY_MEMOS 512
+static struct {
+    uint64_t serial, key[2];
+    const uint8_t *ctl[2], *code[2];
+    uint8_t valid;
+} mesh_key_memos[MESH_KEY_MEMOS];
+
+static uint64_t mesh_program_stage_key(const prog_t *p, unsigned stage, const uint8_t *ctl, const uint8_t *code) {
+    if (!p || !p->serial || stage >= 2) return mesh_stage_key(ctl, code);
+    uint32_t index = (uint32_t)(p->serial * 0x9E3779B97F4A7C15ull >> 55);
+    typeof(mesh_key_memos[0]) *m = &mesh_key_memos[index];
+    if (m->serial != p->serial) m->serial = p->serial, m->valid = 0;
+    if ((m->valid & (1u << stage)) && m->ctl[stage] == ctl && m->code[stage] == code) return m->key[stage];
+    uint64_t key = mesh_stage_key(ctl, code);
+    m->ctl[stage] = ctl, m->code[stage] = code, m->key[stage] = key;
+    m->valid |= (uint8_t)(1u << stage);
+    return key;
+}
+
 static void mesh_dump_spirv(uint64_t key, int is_task, const uint32_t *spirv, uint32_t words) {
     static int dumped;
     if (dumped >= 4 || !spirv || !words) return;
@@ -365,12 +388,10 @@ static void mesh_issue_draw(VkExec *ex, const p_draw_mesh *d, const VkPipeState 
         rec_draw_mesh_tasks(ex->cb, count, 1, 1);
         ex->recorded++;
         vk_drawstats_mesh(ex, count);
-        // Log more counts overnight: title foliage often shows count=1 in the first few, then larger
-        // indirect batches; the old 4-line cap hid whether those ever ran.
-        if (mesh_log_ok < 32) {
-            rt_log("vk_mesh: DrawMeshTasks count=%u program %llu", count, (unsigned long long)ex->prog->serial);
-            mesh_log_ok++;
-        }
+        // Cap hard: a console-attached boot was scrolling these for seconds and looked frozen.
+        if (mesh_log_ok < 4)
+            rt_log("vk_mesh: DrawMeshTasks count=%u program %llu", count, (unsigned long long)ex->prog->serial),
+                mesh_log_ok++;
         vk_exec_frame.draws++;
     } else if (d->kind == 1) {
         VkMemSpan sp;
@@ -398,7 +419,7 @@ static void mesh_issue_draw(VkExec *ex, const p_draw_mesh *d, const VkPipeState 
             rec_draw_mesh_tasks(ex->cb, count, 1, 1);
             ex->recorded++;
             vk_exec_frame.draws++;
-            if (mesh_log_ok < 48)
+            if (mesh_log_ok < 4)
                 rt_log("vk_mesh: DrawMeshTasksIndirect → direct count=%u program %llu", count,
                        (unsigned long long)ex->prog->serial),
                     mesh_log_ok++;
@@ -539,9 +560,10 @@ void vk_mesh_op_draw(VkExec *ex, const void *payload) {
         if (prim_sph) prim_synth = 1;
     }
 
-    uint64_t task_o = tcode ? mesh_stage_key(tctl, tcode) : 0;
+    uint64_t task_o = tcode ? mesh_program_stage_key(ex->prog, 0, tctl, tcode) : 0;
     // Fold prim SPH into the cache key — otherwise a prior no-prim translate sticks for the process.
-    uint64_t mesh_o = mesh_stage_key(mctl, mcode) ^ prim_sph_key(prim_sph) ^ (prim_synth ? 0x5052494dull : 0);
+    uint64_t mesh_o = mesh_program_stage_key(ex->prog, 1, mctl, mcode) ^ prim_sph_key(prim_sph) ^
+                      (prim_synth ? 0x5052494dull : 0);
     MeshShaders *sh = mesh_shaders_get(task_o, mesh_o);
     if (sh && sh->failed) return;
 

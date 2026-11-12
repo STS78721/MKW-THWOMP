@@ -70,6 +70,7 @@ static uint8_t geometry_input;                              // normalized actual
 #define ONESHOT_WAIT_MS 1500u   // prepare_draw: capped to 1.5s to prevent Windows TDR (2s watchdog timeout) crashes
 
 int vk_dump_active(void);   // vk_dump.c: the replay is in the dump frame
+const char *vk_dump_dir(void);
 static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_lay = gfx_shader_c0_layout(cs);
     c0_push = ex->push[1];
@@ -235,7 +236,14 @@ static void cb_done(void *arg) {   // completion thread
     free(r->written), free(r->written_slot), free(r->pools), free(r->chunks), free(r);
 }
 
-void vk_exec_draw_new_cb(void) { memset(&B, 0, sizeof B); }
+// Pointer-table result cache lifetime. Bumped on a new command buffer so soft guest writes that do not
+// move pool/usnap gens cannot reuse a prior CB's regions across menu/submit boundaries.
+static uint64_t ptr_cb_epoch = 1;
+
+void vk_exec_draw_new_cb(void) {
+    memset(&B, 0, sizeof B);
+    ptr_cb_epoch++;
+}
 
 static CbRes *cb_res(VkExec *ex) {
     if (cur && cur_fence == ex->fence) return cur;
@@ -1186,9 +1194,43 @@ static int ptr_bound(const p_bind_buf ssbo[16], uint64_t v) {
 // blocks empty at bind (GPU-filled later) while the large SSBOs hold instance bases deeper than
 // the first 512 bytes — a head-only scan left found=0 and GlobalToStorage only covered the
 // fallback SSBO windows, so tree/grass pointers outside those windows read as 0.
-static int ptr_exclude(uint64_t v, const p_bind_buf *bound[], int nbound) {
+static int ptr_exclude_sources(uint64_t v, const p_bind_buf *const bound[], int nbound) {
     for (int b = 0; b < nbound; b++)
         if (bound[b] && ptr_bound(bound[b], v)) return 1;
+    return 0;
+}
+
+enum { PTR_BOUND_RANGES = 4 * 16 };
+typedef struct {
+    struct { uint64_t lo, hi; } r[PTR_BOUND_RANGES];
+    unsigned n;
+    const p_bind_buf *const *sources;
+    int nsources;
+} PtrBoundSet;
+
+// Only active, non-wrapping intervals can exclude a candidate. Build their endpoints once for this table scan,
+// rather than revisiting every empty slot (up to four 16-slot stage tables) for each sampled pointer. Preserve the
+// original uint64 membership rule: an overflowing addr+size cannot match v>=addr && v<addr+size.
+static void ptr_bounds_init(PtrBoundSet *out, const p_bind_buf *const sources[], int nsources) {
+    out->n = 0, out->sources = sources, out->nsources = nsources;
+    for (int s = 0; s < nsources; s++) {
+        if (!sources[s]) continue;
+        for (int i = 0; i < 16; i++) {
+            uint64_t lo = sources[s][i].addr, hi = lo + sources[s][i].size;
+            if (!lo || hi <= lo) continue;
+            // All current callers supply at most four sources. Keep exact semantics for future callers with more
+            // active intervals instead of silently dropping exclusions when the fixed local list is full.
+            if (out->n == PTR_BOUND_RANGES) { out->n = PTR_BOUND_RANGES + 1; return; }
+            out->r[out->n].lo = lo, out->r[out->n].hi = hi;
+            out->n++;
+        }
+    }
+}
+
+static int ptr_exclude(uint64_t v, const PtrBoundSet *bound) {
+    if (bound->n > PTR_BOUND_RANGES) return ptr_exclude_sources(v, bound->sources, bound->nsources);
+    for (unsigned i = 0; i < bound->n; i++)
+        if (v >= bound->r[i].lo && v < bound->r[i].hi) return 1;
     return 0;
 }
 
@@ -1200,85 +1242,191 @@ static int ptr_candidate_ok(uint64_t v) {
     return 1;
 }
 
-static void pointer_table_try_add(uint64_t v, int slot, uint64_t off, uint64_t *found, uint32_t *n_io,
-                                  const p_bind_buf *bound[], int nbound, int *scan_log) {
+// Finished pointer-table regions are reused across draws that bind the same storage ranges. Lifetime follows
+// pool/usnap generations and command-buffer epoch. A cheap fingerprint (a handful of words per buffer) catches
+// soft guest writes inside a CB — without the old full-sample content walk that dominated race CPU. UPDATE_UB
+// overlays are read by ubo_ptr, not these guest-RAM scans (so UPD does not wipe the whole cache).
+// 4-way set-associative: race draws thrash a direct-mapped 1K table; 512×4 keeps hot bindings without
+// growing the fingerprint work on the hit path.
+enum { PTR_RESULT_SETS = 512, PTR_RESULT_WAYS = 4 };
+typedef struct {
+    uint64_t src_key, life, finger;
+    PtrEntry e[PTR_ENTRIES];
+} PtrResultSlot;
+typedef struct {
+    PtrResultSlot way[PTR_RESULT_WAYS];
+    uint8_t clock;
+} PtrResultSet;
+static PtrResultSet ptr_result_cache[PTR_RESULT_SETS];
+
+static uint64_t ptr_mix(uint64_t h, uint64_t v) {
+    return h ^ (v + UINT64_C(0x9e3779b97f4a7c15) + (h << 6) + (h >> 2));
+}
+
+static uint64_t ptr_result_life(void) {
+    return vk_mem_gen() + vk_usnap_gen() + ptr_cb_epoch * UINT64_C(0x100000001b3);
+}
+
+static uint64_t ptr_bufs_src_key(const p_bind_buf bufs[16], int first_slot, uint64_t min_sz, uint64_t max_sz,
+                                 uint64_t h) {
+    if (!bufs) return ptr_mix(h, 0);
+    for (int i = first_slot; i < 16; i++) {
+        if (!bufs[i].addr) continue;
+        uint64_t sz = bufs[i].size ? bufs[i].size : 0x200ull;
+        if (sz < min_sz || sz > max_sz) continue;
+        h = ptr_mix(h, bufs[i].addr);
+        h = ptr_mix(h, bufs[i].size);
+        h = ptr_mix(h, (uint64_t)(unsigned)(i + 1));
+    }
+    return h;
+}
+
+// A few fixed samples of the stable head (not the churning SSBO tail). Resolve once to clamp length; skip
+// device-local unreadables. Computed only after an address-key hit.
+static uint64_t ptr_bufs_quick_key(const p_bind_buf bufs[16], int first_slot, uint64_t min_sz, uint64_t max_sz,
+                                   uint64_t h) {
+    if (!bufs) return ptr_mix(h, 0);
+    for (int i = first_slot; i < 16; i++) {
+        if (!bufs[i].addr) continue;
+        uint64_t sz = bufs[i].size ? bufs[i].size : 0x200ull;
+        if (sz < min_sz || sz > max_sz) continue;
+        VkMemSpan sp;
+        if (!vk_mem_resolve(bufs[i].addr, 1, &sp)) {
+            h = ptr_mix(h, UINT64_C(0x1111));
+            continue;
+        }
+        if (sp.alloc && !plat_mem_readable(bufs[i].addr, 8)) {
+            h = ptr_mix(h, UINT64_C(0x2222));
+            continue;
+        }
+        uint64_t buf_sz = sz;
+        if (buf_sz > sp.avail) buf_sz = sp.avail;
+        if (buf_sz < 8) continue;
+        const uint64_t *base = (const uint64_t *)(uintptr_t)bufs[i].addr;
+        uint64_t words = buf_sz / 8;
+        h = ptr_mix(h, base[0]);
+        if (words > 1) h = ptr_mix(h, base[1]);
+        if (words > 8) h = ptr_mix(h, base[8]);
+        if (words > 32) h = ptr_mix(h, base[32]);
+        if (words > 128) h = ptr_mix(h, base[128]);
+        h = ptr_mix(h, (uint64_t)(unsigned)(i + 1) << 32 | words);
+    }
+    return h;
+}
+
+static PtrResultSlot *ptr_result_lookup(uint64_t src_key) {
+    uint64_t life = ptr_result_life();
+    PtrResultSet *s = &ptr_result_cache[src_key & (PTR_RESULT_SETS - 1)];
+    for (int w = 0; w < PTR_RESULT_WAYS; w++)
+        if (s->way[w].src_key == src_key && s->way[w].life == life) return &s->way[w];
+    return NULL;
+}
+
+static void ptr_result_take(PtrResultSlot *s, PtrEntry out[PTR_ENTRIES]) {
+    memcpy(out, s->e, sizeof(PtrEntry) * PTR_ENTRIES);
+}
+
+static void ptr_result_put(uint64_t src_key, uint64_t finger, const PtrEntry e[PTR_ENTRIES]) {
+    uint64_t life = ptr_result_life();
+    PtrResultSet *s = &ptr_result_cache[src_key & (PTR_RESULT_SETS - 1)];
+    int slot = -1;
+    for (int w = 0; w < PTR_RESULT_WAYS; w++) {
+        if (s->way[w].src_key == src_key) {
+            slot = w;
+            break;
+        }
+        if (slot < 0 && (!s->way[w].src_key || s->way[w].life != life)) slot = w;
+    }
+    if (slot < 0) {
+        slot = s->clock & (PTR_RESULT_WAYS - 1);
+        s->clock++;
+    }
+    PtrResultSlot *dst = &s->way[slot];
+    dst->src_key = src_key, dst->life = life, dst->finger = finger;
+    memcpy(dst->e, e, sizeof(PtrEntry) * PTR_ENTRIES);
+}
+
+// Open-addressed set of collected pointer values (max 48). Avoids a linear found[] walk on every probe —
+// bone/instance lists repeat the same bases thousands of times per scan.
+typedef struct { uint64_t slot[64]; } PtrFoundSet;
+
+static int ptr_found_has(const PtrFoundSet *s, uint64_t v) {
+    uint32_t i = (uint32_t)((v * UINT64_C(0x9e3779b97f4a7c15)) >> 58);
+    for (uint32_t n = 0; n < 64; n++, i = (i + 1) & 63) {
+        uint64_t x = s->slot[i];
+        if (!x) return 0;
+        if (x == v) return 1;
+    }
+    return 1;
+}
+
+static void ptr_found_put(PtrFoundSet *s, uint64_t v) {
+    uint32_t i = (uint32_t)((v * UINT64_C(0x9e3779b97f4a7c15)) >> 58);
+    for (uint32_t n = 0; n < 64; n++, i = (i + 1) & 63) {
+        if (!s->slot[i]) { s->slot[i] = v; return; }
+        if (s->slot[i] == v) return;
+    }
+}
+
+static inline void pointer_table_try_add(uint64_t v, uint64_t *found, uint32_t *n_io, PtrFoundSet *seen,
+                                         PtrFoundSet *miss, const PtrBoundSet *bound) {
     uint32_t n = *n_io;
-    if (n >= 48 || !ptr_candidate_ok(v) || ptr_exclude(v, bound, nbound)) return;
+    if (n >= 48 || !ptr_candidate_ok(v)) return;
+    // A pointer already collected cannot add another region. Test it before resolving: repeated bone/instance
+    // pointers are common, and their final backing is checked again by pointer_table_finish.
+    if (ptr_found_has(seen, v) || ptr_found_has(miss, v)) return;
+    if (ptr_exclude(v, bound)) return;
     VkMemSpan hit;
-    if (!vk_mem_resolve(v, 1, &hit)) return;
-    for (uint32_t j = 0; j < n; j++)
-        if (found[j] == v) return;
-    if (scan_log && *scan_log < 64)
-        rt_log("vk: ptr-hit slot %d off=%llx -> %llx avail=%llx", slot, (unsigned long long)off,
-               (unsigned long long)v, (unsigned long long)hit.avail),
-            (*scan_log)++;
+    if (!vk_mem_resolve(v, 1, &hit)) {
+        ptr_found_put(miss, v);   // same bad candidate appears thousands of times across bone lists
+        return;
+    }
+    (void)hit;
+    ptr_found_put(seen, v);
     found[n] = v;
     *n_io = n + 1;
 }
 
 static void pointer_table_scan_range(const p_bind_buf bufs[16], int first_slot, uint64_t min_sz, uint64_t max_sz,
-                                     uint64_t *found, uint32_t *n_io, const p_bind_buf *bound[], int nbound) {
+                                     uint64_t *found, uint32_t *n_io, PtrFoundSet *seen, PtrFoundSet *miss,
+                                     const PtrBoundSet *bound) {
     if (!bufs) return;
-    static int scan_log;
     for (int i = first_slot; i < 16 && *n_io < 48; i++) {
         if (!bufs[i].addr) continue;
         VkMemSpan sp;
-        if (!vk_mem_resolve(bufs[i].addr, 1, &sp)) {
-            if (scan_log < 16)
-                rt_log("vk: ptr-scan slot %d addr=%llx size=%llx unresolved", i,
-                       (unsigned long long)bufs[i].addr, (unsigned long long)bufs[i].size),
-                    scan_log++;
-            continue;
-        }
-        if (sp.alloc && !plat_mem_readable(bufs[i].addr, 8)) {
-            if (scan_log < 16)
-                rt_log("vk: ptr-scan slot %d addr=%llx size=%llx device-local unreadable", i,
-                       (unsigned long long)bufs[i].addr, (unsigned long long)bufs[i].size),
-                    scan_log++;
-            continue;
-        }
+        if (!vk_mem_resolve(bufs[i].addr, 1, &sp)) continue;
+        if (sp.alloc && !plat_mem_readable(bufs[i].addr, 8)) continue;
         uint64_t buf_sz = bufs[i].size ? bufs[i].size : 0x200ull;
         if (buf_sz > sp.avail) buf_sz = sp.avail;
         if (buf_sz < 8 || buf_sz < min_sz || buf_sz > max_sz) continue;
         const uint64_t *base = (const uint64_t *)(uintptr_t)bufs[i].addr;
-        uint32_t before = *n_io;
-        uint32_t probed = 0;
         // Dense head: full buffer when ≤4 KiB (UBO constants / pointer / cull lists); else first 1 KiB.
         uint64_t dense = buf_sz <= 0x1000ull ? buf_sz : 0x400ull;
         uint64_t stride_end = buf_sz;
         if (stride_end > (256ull << 10)) stride_end = 256ull << 10;
-        uint64_t offs[2048];
+        // Visit the same ordered samples directly. Building their 16 KiB offset array first wrote and read it on
+        // every scanned buffer, even when the first few samples filled found[] and the rest would not be read.
         uint32_t no = 0;
-        for (uint64_t off = 0; off + 8 <= dense && no < 512; off += 8) offs[no++] = off;
+#define PTR_PROBE(offset_) do { \
+            uint64_t v = base[(offset_) / 8]; \
+            no++; \
+            pointer_table_try_add(v, found, n_io, seen, miss, bound); \
+        } while (0)
+        for (uint64_t off = 0; off + 8 <= dense && no < 512 && *n_io < 48; off += 8) PTR_PROBE(off);
         uint64_t mid = stride_end < (64ull << 10) ? stride_end : (64ull << 10);
-        for (uint64_t off = dense; off + 8 <= mid && no < 1600; off += 0x20) offs[no++] = off;
-        for (uint64_t off = mid; off + 8 <= stride_end && no < 2000; off += 0x80) offs[no++] = off;
-        if (buf_sz > stride_end) {
-            for (int q = 1; q <= 3 && no < 2048; q++) {
+        for (uint64_t off = dense; off + 8 <= mid && no < 1600 && *n_io < 48; off += 0x20) PTR_PROBE(off);
+        for (uint64_t off = mid; off + 8 <= stride_end && no < 2000 && *n_io < 48; off += 0x80) PTR_PROBE(off);
+        if (buf_sz > stride_end && *n_io < 48) {
+            for (int q = 1; q <= 3 && no < 2048 && *n_io < 48; q++) {
                 uint64_t t = (buf_sz / 4) * (uint64_t)q;
                 t &= ~7ull;
-                if (t + 8 <= buf_sz && t >= stride_end) offs[no++] = t;
+                if (t + 8 <= buf_sz && t >= stride_end) PTR_PROBE(t);
             }
             uint64_t tail = buf_sz > 8 ? (buf_sz - 8) & ~7ull : 0;
-            if (tail >= stride_end && no < 2048) offs[no++] = tail;
+            if (tail >= stride_end && no < 2048 && *n_io < 48) PTR_PROBE(tail);
         }
-        for (uint32_t oi = 0; oi < no && *n_io < 48; oi++) {
-            uint64_t off = offs[oi];
-            uint64_t v = base[off / 8];
-            probed++;
-            pointer_table_try_add(v, i, off, found, n_io, bound, nbound, &scan_log);
-        }
-        if ((*n_io > before && scan_log < 64) || (*n_io == before && scan_log < 16))
-            rt_log("vk: ptr-scan slot %d addr=%llx size=%llx probed=%u hit=%u w0=%llx w1=%llx", i,
-                   (unsigned long long)bufs[i].addr, (unsigned long long)bufs[i].size, probed, *n_io - before,
-                   (unsigned long long)base[0], buf_sz >= 16 ? (unsigned long long)base[1] : 0ull),
-                scan_log++;
+#undef PTR_PROBE
     }
-}
-
-static void pointer_table_scan(const p_bind_buf ssbo[16], uint64_t *found, uint32_t *n_io,
-                               const p_bind_buf *bound[], int nbound) {
-    pointer_table_scan_range(ssbo, 0, 8, ~0ull, found, n_io, bound, nbound);
 }
 
 static void pointer_table_finish(uint64_t *found, uint32_t n, const p_bind_buf *src[], int nsrc,
@@ -1291,23 +1439,54 @@ static void pointer_table2(const p_bind_buf a[16], const p_bind_buf b[16], PtrEn
     // reads returned 0 (collapsed props, terrain holes, black strips).
     // Task and mesh stages each hold their own small SSBOs; scanning only the stage being bound left
     // the other stage's bone / instance pointers out of c0+0x880 (title foliage → green shards).
+    uint64_t src_key = ptr_mix(UINT64_C(0x2a2a2a2a), 2);
+    src_key = ptr_bufs_src_key(a, 0, 8, ~0ull, src_key);
+    src_key = ptr_bufs_src_key(b, 0, 8, ~0ull, src_key);
+    PtrResultSlot *hit = ptr_result_lookup(src_key);
+    if (hit) {
+        uint64_t finger = ptr_bufs_quick_key(a, 0, 8, ~0ull, 0);
+        finger = ptr_bufs_quick_key(b, 0, 8, ~0ull, finger);
+        if (hit->finger == finger) { ptr_result_take(hit, out); return; }
+    }
     memset(out, 0, sizeof(PtrEntry) * PTR_ENTRIES);
     uint64_t found[48];
     uint32_t n = 0;
+    PtrFoundSet seen = {0}, miss = {0};
     const p_bind_buf *bound[2] = {a, b};
-    pointer_table_scan(a, found, &n, bound, 2);
-    pointer_table_scan(b, found, &n, bound, 2);
+    PtrBoundSet excluded;
+    ptr_bounds_init(&excluded, bound, 2);
+    // Visit order matches the pre-opt path (all sizes per source). Reordering small-then-large changed
+    // which of >48 candidates survived and corrupted menu guest state via wrong write-back windows.
+    pointer_table_scan_range(a, 0, 8, ~0ull, found, &n, &seen, &miss, &excluded);
+    pointer_table_scan_range(b, 0, 8, ~0ull, found, &n, &seen, &miss, &excluded);
     pointer_table_finish(found, n, bound, 2, out);
+    uint64_t finger = ptr_bufs_quick_key(a, 0, 8, ~0ull, 0);
+    finger = ptr_bufs_quick_key(b, 0, 8, ~0ull, finger);
+    ptr_result_put(src_key, finger, out);
 }
 
 static void pointer_table4(const p_bind_buf a[16], const p_bind_buf b[16], const p_bind_buf c[16],
                            const p_bind_buf d[16], PtrEntry out[PTR_ENTRIES]) {
+    const p_bind_buf *src[4] = {a, b, c, d};
+    uint64_t src_key = ptr_mix(UINT64_C(0x4a4a4a4a), 4);
+    for (int i = 0; i < 4; i++) src_key = ptr_bufs_src_key(src[i], 0, 8, ~0ull, src_key);
+    PtrResultSlot *hit = ptr_result_lookup(src_key);
+    if (hit) {
+        uint64_t finger = 0;
+        for (int i = 0; i < 4; i++) finger = ptr_bufs_quick_key(src[i], 0, 8, ~0ull, finger);
+        if (hit->finger == finger) { ptr_result_take(hit, out); return; }
+    }
     memset(out, 0, sizeof(PtrEntry) * PTR_ENTRIES);
     uint64_t found[48];
     uint32_t n = 0;
-    const p_bind_buf *src[4] = {a, b, c, d};
-    for (int i = 0; i < 4; i++) pointer_table_scan(src[i], found, &n, src, 4);
+    PtrFoundSet seen = {0}, miss = {0};
+    PtrBoundSet excluded;
+    ptr_bounds_init(&excluded, src, 4);
+    for (int i = 0; i < 4; i++) pointer_table_scan_range(src[i], 0, 8, ~0ull, found, &n, &seen, &miss, &excluded);
     pointer_table_finish(found, n, src, 4, out);
+    uint64_t finger = 0;
+    for (int i = 0; i < 4; i++) finger = ptr_bufs_quick_key(src[i], 0, 8, ~0ull, finger);
+    ptr_result_put(src_key, finger, out);
 }
 
 static void pointer_table_finish(uint64_t *found, uint32_t n, const p_bind_buf *src[], int nsrc,
@@ -1391,20 +1570,7 @@ static void pointer_table_finish(uint64_t *found, uint32_t n, const p_bind_buf *
                 if (out[r].addr == cand[i].addr) dup = 1;
             if (!dup) out[regions++] = (PtrEntry){cand[i].addr, cand[i].size};
         }
-        static int fb_log;
-        if (regions && fb_log++ < 16)
-            rt_log("vk: pointer_table fallback pools regions=%u [%llx+%llx, %llx+%llx, %llx+%llx]", regions,
-                   (unsigned long long)out[0].addr, (unsigned long long)out[0].size,
-                   (unsigned long long)out[1].addr, (unsigned long long)out[1].size,
-                   (unsigned long long)out[2].addr, (unsigned long long)out[2].size);
-    }
-    static int logged;
-    if (logged < 24) {
-        rt_log("vk: pointer_table found=%u regions=%u [%llx+%llx, %llx+%llx, %llx+%llx]", n, regions,
-               (unsigned long long)out[0].addr, (unsigned long long)out[0].size,
-               (unsigned long long)out[1].addr, (unsigned long long)out[1].size,
-               (unsigned long long)out[2].addr, (unsigned long long)out[2].size);
-        logged++;
+        (void)regions;
     }
 }
 
@@ -1427,22 +1593,52 @@ static void c0_pointer_table_cs(uint8_t bank[VK_C0_BYTES], const p_bind_buf ssbo
                                 const Nvn2C0Layout *lay, const uint32_t push[NVN2_ROOT_TABLES][NVN2_ROOT_WORDS]) {
     if (VK_C0_BYTES < PTR_TABLE + 16u * PTR_ENTRIES) return;
     PtrEntry e[PTR_ENTRIES];
-    memset(e, 0, sizeof e);
-    uint64_t found[48];
-    uint32_t n = 0;
-    const p_bind_buf *bound[1] = {ssbo};
+    uint64_t src_key = ptr_mix(UINT64_C(0xc500c500), lay ? 1 : 0);
+    src_key = ptr_bufs_src_key(ssbo, 0, 8, 0x10000ull, src_key);
+    src_key = ptr_bufs_src_key(ssbo, 0, 0x10001ull, ~0ull, src_key);
+    src_key = ptr_bufs_src_key(ubo, 2, 8, ~0ull, src_key);
     if (lay && push) {
         for (unsigned r = 0; r < NVN2_ROOT_TABLES; r++) {
-            for (unsigned w = 0; w + 1 < lay->roots[r] && n < 48; w += 2) {
+            src_key = ptr_mix(src_key, lay->roots[r]);
+            for (unsigned w = 0; w + 1 < lay->roots[r]; w += 2) {
                 uint64_t v = (uint64_t)push[r][w] | ((uint64_t)push[r][w + 1] << 32);
-                pointer_table_try_add(v, 100 + (int)r, w * 4u, found, &n, bound, 1, NULL);
+                src_key = ptr_mix(src_key, v);
             }
         }
     }
-    pointer_table_scan_range(ubo, 2, 8, ~0ull, found, &n, bound, 1);
-    pointer_table_scan_range(ssbo, 0, 8, 0x10000ull, found, &n, bound, 1);
-    pointer_table_scan_range(ssbo, 0, 0x10001ull, ~0ull, found, &n, bound, 1);
-    pointer_table_finish(found, n, bound, 1, e);
+    PtrResultSlot *hit = ptr_result_lookup(src_key);
+    if (hit) {
+        uint64_t finger = ptr_bufs_quick_key(ssbo, 0, 8, 0x10000ull, 0);
+        finger = ptr_bufs_quick_key(ssbo, 0, 0x10001ull, ~0ull, finger);
+        finger = ptr_bufs_quick_key(ubo, 2, 8, ~0ull, finger);
+        if (hit->finger == finger) ptr_result_take(hit, e);
+        else hit = NULL;
+    }
+    if (!hit) {
+        memset(e, 0, sizeof e);
+        uint64_t found[48];
+        uint32_t n = 0;
+        PtrFoundSet seen = {0}, miss = {0};
+        const p_bind_buf *bound[1] = {ssbo};
+        PtrBoundSet excluded;
+        ptr_bounds_init(&excluded, bound, 1);
+        if (lay && push) {
+            for (unsigned r = 0; r < NVN2_ROOT_TABLES; r++) {
+                for (unsigned w = 0; w + 1 < lay->roots[r] && n < 48; w += 2) {
+                    uint64_t v = (uint64_t)push[r][w] | ((uint64_t)push[r][w + 1] << 32);
+                    pointer_table_try_add(v, found, &n, &seen, &miss, &excluded);
+                }
+            }
+        }
+        pointer_table_scan_range(ubo, 2, 8, ~0ull, found, &n, &seen, &miss, &excluded);
+        pointer_table_scan_range(ssbo, 0, 8, 0x10000ull, found, &n, &seen, &miss, &excluded);
+        pointer_table_scan_range(ssbo, 0, 0x10001ull, ~0ull, found, &n, &seen, &miss, &excluded);
+        pointer_table_finish(found, n, bound, 1, e);
+        uint64_t finger = ptr_bufs_quick_key(ssbo, 0, 8, 0x10000ull, 0);
+        finger = ptr_bufs_quick_key(ssbo, 0, 0x10001ull, ~0ull, finger);
+        finger = ptr_bufs_quick_key(ubo, 2, 8, ~0ull, finger);
+        ptr_result_put(src_key, finger, e);
+    }
     for (uint32_t i = 0; i < PTR_ENTRIES; i++) {
         uint32_t off = PTR_TABLE + 16u * i, bytes = (uint32_t)e[i].size;
         memcpy(bank + off, &e[i].addr, 8);
@@ -1455,17 +1651,48 @@ static void c0_pointer_table_mesh(uint8_t bank[VK_C0_BYTES], const p_bind_buf ts
                                   const p_bind_buf d[16]) {
     if (VK_C0_BYTES < PTR_TABLE + 16u * PTR_ENTRIES) return;
     PtrEntry e[PTR_ENTRIES];
-    memset(e, 0, sizeof e);
-    uint64_t found[48];
-    uint32_t n = 0;
     const p_bind_buf *src[4] = {a, b, c, d};
-    // Scan user constant buffers (c2..c15, e.g. c3/c4 meshlet & bone descriptors) and small SSBOs first so
-    // real pointer tables populate found[] ahead of multi-megabyte vertex/material SSBOs.
-    pointer_table_scan_range(ts_ubo, 2, 8, ~0ull, found, &n, src, 4);
-    pointer_table_scan_range(ms_ubo, 2, 8, ~0ull, found, &n, src, 4);
-    for (int i = 0; i < 4; i++) pointer_table_scan_range(src[i], 0, 8, 0x10000ull, found, &n, src, 4);
-    for (int i = 0; i < 4; i++) pointer_table_scan_range(src[i], 0, 0x10001ull, ~0ull, found, &n, src, 4);
-    pointer_table_finish(found, n, src, 4, e);
+    uint64_t src_key = ptr_mix(UINT64_C(0x6e556e55), 6);
+    src_key = ptr_bufs_src_key(ts_ubo, 2, 8, ~0ull, src_key);
+    src_key = ptr_bufs_src_key(ms_ubo, 2, 8, ~0ull, src_key);
+    for (int i = 0; i < 4; i++) {
+        src_key = ptr_bufs_src_key(src[i], 0, 8, 0x10000ull, src_key);
+        src_key = ptr_bufs_src_key(src[i], 0, 0x10001ull, ~0ull, src_key);
+    }
+    PtrResultSlot *hit = ptr_result_lookup(src_key);
+    if (hit) {
+        uint64_t finger = ptr_bufs_quick_key(ts_ubo, 2, 8, ~0ull, 0);
+        finger = ptr_bufs_quick_key(ms_ubo, 2, 8, ~0ull, finger);
+        for (int i = 0; i < 4; i++) {
+            finger = ptr_bufs_quick_key(src[i], 0, 8, 0x10000ull, finger);
+            finger = ptr_bufs_quick_key(src[i], 0, 0x10001ull, ~0ull, finger);
+        }
+        if (hit->finger == finger) ptr_result_take(hit, e);
+        else hit = NULL;
+    }
+    if (!hit) {
+        memset(e, 0, sizeof e);
+        uint64_t found[48];
+        uint32_t n = 0;
+        PtrFoundSet seen = {0}, miss = {0};
+        PtrBoundSet excluded;
+        ptr_bounds_init(&excluded, src, 4);
+        // Scan user constant buffers (c2..c15, e.g. c3/c4 meshlet & bone descriptors) and small SSBOs first so
+        // real pointer tables populate found[] ahead of multi-megabyte vertex/material SSBOs.
+        pointer_table_scan_range(ts_ubo, 2, 8, ~0ull, found, &n, &seen, &miss, &excluded);
+        pointer_table_scan_range(ms_ubo, 2, 8, ~0ull, found, &n, &seen, &miss, &excluded);
+        for (int i = 0; i < 4; i++) pointer_table_scan_range(src[i], 0, 8, 0x10000ull, found, &n, &seen, &miss, &excluded);
+        for (int i = 0; i < 4; i++)
+            pointer_table_scan_range(src[i], 0, 0x10001ull, ~0ull, found, &n, &seen, &miss, &excluded);
+        pointer_table_finish(found, n, src, 4, e);
+        uint64_t finger = ptr_bufs_quick_key(ts_ubo, 2, 8, ~0ull, 0);
+        finger = ptr_bufs_quick_key(ms_ubo, 2, 8, ~0ull, finger);
+        for (int i = 0; i < 4; i++) {
+            finger = ptr_bufs_quick_key(src[i], 0, 8, 0x10000ull, finger);
+            finger = ptr_bufs_quick_key(src[i], 0, 0x10001ull, ~0ull, finger);
+        }
+        ptr_result_put(src_key, finger, e);
+    }
     for (uint32_t i = 0; i < PTR_ENTRIES; i++) {
         uint32_t off = PTR_TABLE + 16u * i, bytes = (uint32_t)e[i].size;
         memcpy(bank + off, &e[i].addr, 8);
@@ -1479,8 +1706,8 @@ static void c0_pointer_table_mesh(uint8_t bank[VK_C0_BYTES], const p_bind_buf ts
 // buffer table at 0x210 + 16 r. Graphics: the largest point size (Maxwell's limit, GLSLC clamps gl_PointSize to it) at
 // 0x610, the base instance at 0x644. Task/mesh: NVN tables at 0x670/0x770 plus Hookshot pointer table at 0x880.
 // Unbound slots read zero, since the replay keeps them zero. Layout: nxnative dm/gfx/nvn/nvn_mtl.m (MIT).
-void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
-                const uint32_t dispatch[3], uint32_t base_instance) {
+static void c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
+                    const uint32_t dispatch[3], uint32_t base_instance, int mesh_table) {
     if (stage == NVN_STAGE_CS && c0_lay) {
         if (!nvn2_c0_pack_handles(bank, VK_C0_BYTES, c0_lay, c0_push, ssbo, ubo, c0_tex, c0_img))
             rt_fatal("vk: invalid NVN 2 compute parameter-block layout");
@@ -1501,7 +1728,7 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
              : -1;
     if (base < 0) return;
     c0_table(bank + base, ssbo);
-    if (stage == NVN_STAGE_TS || stage == NVN_STAGE_MS) c0_pointer_table(bank, ssbo);
+    if (mesh_table && (stage == NVN_STAGE_TS || stage == NVN_STAGE_MS)) c0_pointer_table(bank, ssbo);
     if (stage == NVN_STAGE_CS) {
         memcpy(bank + 0x200, dispatch, 12);
         c0_table(bank + 0x210, ubo);
@@ -1512,6 +1739,11 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
     memcpy(bank + 0x644, &base_instance, 4);
 }
 
+void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
+                const uint32_t dispatch[3], uint32_t base_instance) {
+    c0_fill(bank, stage, ssbo, ubo, dispatch, base_instance, 1);
+}
+
 static int c0_on(void) {   // TOTK_FIX_C0=0: c0 reads zeros instead of the driver constants
     static int on = -1;
     if (on < 0) {
@@ -1520,8 +1752,23 @@ static int c0_on(void) {   // TOTK_FIX_C0=0: c0 reads zeros instead of the drive
     return on;
 }
 
+typedef struct { uint8_t bytes[16u * PTR_ENTRIES]; int valid; } MeshPtrTable;
+
+static void c0_mesh_table(VkExec *ex, uint8_t bank[VK_C0_BYTES], MeshPtrTable *table) {
+    // Task and mesh banks of this descriptor build read one snapshot of the same six source arrays. Keep this
+    // table separate from pointer_binding's SSBO-only table; it also scans the task and mesh user UBOs.
+    if (!table->valid) {
+        c0_pointer_table_mesh(bank, ex->ubo[NVN_STAGE_TS], ex->ubo[NVN_STAGE_MS], ex->ssbo[NVN_STAGE_TS],
+                              ex->ssbo[NVN_STAGE_MS], ex->ssbo[NVN_STAGE_VS], ex->ssbo[NVN_STAGE_CS]);
+        memcpy(table->bytes, bank + PTR_TABLE, sizeof table->bytes);
+        table->valid = 1;
+    } else {
+        memcpy(bank + PTR_TABLE, table->bytes, sizeof table->bytes);
+    }
+}
+
 // c0 from replay scratch; a bank equal to the stage's previous one reuses its range, so it costs no copy.
-static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
+static VkDescriptorBufferInfo c0_info(VkExec *ex, int st, MeshPtrTable *mesh_table) {
     int k = c0_stage_index(st);
     if (k < 0) rt_fatal("vk_exec: synthetic c0 is unavailable for stage %d", st);
     // vk_c0_fill reads buffer bindings, compute root words and dispatch size, or the graphics base instance:
@@ -1549,11 +1796,11 @@ static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
         return (VkDescriptorBufferInfo){B.c0_buf[k], B.c0_off[k], VK_C0_BYTES};
     B.c0_in[k] = in;
     uint8_t tmp[VK_C0_BYTES];
-    vk_c0_fill(tmp, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst);
+    // The combined mesh table below overwrites all three pointer entries; omit the single-stage scan whose result
+    // would be discarded. Public vk_c0_fill retains the single-stage table for its other callers and probes.
+    c0_fill(tmp, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst, !is_mesh);
     // Task/mesh GlobalToStorage: scan TS+MS UBOs (c3/c4 meshlet & bone descriptors) and TS+MS+VS+CS SSBOs.
-    if (is_mesh)
-        c0_pointer_table_mesh(tmp, ex->ubo[NVN_STAGE_TS], ex->ubo[NVN_STAGE_MS], ex->ssbo[NVN_STAGE_TS],
-                              ex->ssbo[NVN_STAGE_MS], ex->ssbo[NVN_STAGE_VS], ex->ssbo[NVN_STAGE_CS]);
+    if (is_mesh) c0_mesh_table(ex, tmp, mesh_table);
     if (!B.c0_valid[k] || memcmp(tmp, B.c0[k], VK_C0_BYTES)) {
         memcpy(scratch(ex, VK_C0_BYTES, &B.c0_buf[k], &B.c0_off[k]), tmp, VK_C0_BYTES);
         memcpy(B.c0[k], tmp, VK_C0_BYTES);
@@ -1572,11 +1819,11 @@ static void limits_init(void) {
     __atomic_store_n(&LIM.ubo_max, l->maxUniformBufferRange, __ATOMIC_RELEASE);
 }
 
-static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
+static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot, MeshPtrTable *mesh_table) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.ubo_max, align = LIM.ubo_align;
     VkDescriptorBufferInfo bi;
-    if (slot == 0 && c0_on()) return c0_info(ex, st);
+    if (slot == 0 && c0_on()) return c0_info(ex, st, mesh_table);
     if (slot == 1 && ex->prog) {   // compiler constants stored after the shader code
         const prog_t *p = ex->prog;
         const uint8_t *ctl = NULL, *code = NULL;
@@ -1718,14 +1965,25 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
 // Guarded NVN 2 candidates use the same bytes that the dispatch binds as uniform banks. Bank 0 includes pushed
 // roots and packed descriptor tables; bank 1 is the program's bounded compiler-constant data. No scalar is guessed
 // to be a pointer here: bind_range determines whether a candidate has backing, and the shader checks the true range.
-static p_bind_buf guarded_storage_binding(const VkExec *ex, int st, const GfxShaderRes *r) {
+typedef struct { uint8_t bank[VK_C0_BYTES]; int valid; } GuardedC0Bank;
+
+static const uint8_t *guarded_c0_bank(const VkExec *ex, GuardedC0Bank *scratch) {
+    // Every c0 candidate of this descriptor build reads the same parameter bank. Rebuild on the next call to
+    // bind_resources, so guest writes and intervening command-stream updates are observed by the next dispatch.
+    if (!scratch->valid) {
+        vk_c0_fill(scratch->bank, NVN_STAGE_CS, ex->ssbo[NVN_STAGE_CS], ex->ubo[NVN_STAGE_CS], c0_dim, c0_binst);
+        scratch->valid = 1;
+    }
+    return scratch->bank;
+}
+
+static p_bind_buf guarded_storage_binding(const VkExec *ex, int st, const GfxShaderRes *r, GuardedC0Bank *scratch) {
     uint64_t off = (uint64_t)r->handle * 4;
     p_bind_buf b = {0};
     if (st != NVN_STAGE_CS || !c0_lay) return b;
     if (r->cbuf_slot == 0) {
         if (!c0_on() || off > VK_C0_BYTES - 8) return b;
-        uint8_t bank[VK_C0_BYTES];
-        vk_c0_fill(bank, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst);
+        const uint8_t *bank = guarded_c0_bank(ex, scratch);
         memcpy(&b.addr, bank + off, 8);
         size_t ub = nvn2_c0_part(c0_lay, 1), end = nvn2_c0_part(c0_lay, 3);
         if (off >= ub && off < end && (off - ub) % 16 == 0) {
@@ -1764,7 +2022,25 @@ static int guarded_is_declared_ssbo(int st, const GfxShaderRes *r, const p_bind_
     return off >= sb && off < end && (off - sb) % 16 == 0;
 }
 
-static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
+typedef struct { PtrEntry e[PTR_ENTRIES]; int valid; } BindingPtrTable;
+
+static p_bind_buf pointer_binding(VkExec *ex, int st, uint32_t off, BindingPtrTable *ptr) {
+    // Array elements are entries of one table snapshot. The caller provides fresh scratch per binding, so no
+    // result survives a draw, another binding, or an intervening op that could change its source buffers.
+    if (!ptr->valid) {
+        if (st == NVN_STAGE_TS || st == NVN_STAGE_MS)
+            pointer_table4(ex->ssbo[NVN_STAGE_TS], ex->ssbo[NVN_STAGE_MS], ex->ssbo[NVN_STAGE_VS],
+                           ex->ssbo[NVN_STAGE_CS], ptr->e);
+        else
+            pointer_table(ex->ssbo[st], ptr->e);
+        ptr->valid = 1;
+    }
+    uint32_t i = (off - PTR_TABLE) / 16u;
+    return i < PTR_ENTRIES ? (p_bind_buf){.addr = ptr->e[i].addr, .size = ptr->e[i].size} : (p_bind_buf){0};
+}
+
+static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written, BindingPtrTable *ptr,
+                                      GuardedC0Bank *guarded_c0) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.sbo_max, align = LIM.sbo_align;
     VkDescriptorBufferInfo bi;
@@ -1773,17 +2049,10 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     const p_bind_buf *b = NULL;
     int guarded = !!(r->flags & GFX_RES_SSBO_GUARDED);
     if (!guarded) slot = ssbo_slot(r, st, &ubo);
-    if (guarded) up = guarded_storage_binding(ex, st, r), b = &up;
+    if (guarded) up = guarded_storage_binding(ex, st, r, guarded_c0), b = &up;
     else if (slot == -2) {   // c0+0x880 Hookshot pointer table entry
         uint32_t off = (uint32_t)r->handle * 4u;
-        PtrEntry e[PTR_ENTRIES];
-        if (st == NVN_STAGE_TS || st == NVN_STAGE_MS)
-            pointer_table4(ex->ssbo[NVN_STAGE_TS], ex->ssbo[NVN_STAGE_MS], ex->ssbo[NVN_STAGE_VS],
-                           ex->ssbo[NVN_STAGE_CS], e);
-        else
-            pointer_table(ex->ssbo[st], e);
-        uint32_t i = (off - PTR_TABLE) / 16u;
-        if (i < PTR_ENTRIES) up.addr = e[i].addr, up.size = e[i].size;
+        up = pointer_binding(ex, st, off, ptr);
         b = &up;
     } else if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
@@ -1801,6 +2070,13 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         // vk_exec_bind.c, MIT, Copyright (c) 2026 Adrià). UBOs, written SSBOs, guarded slots, and pointer-table
         // entries keep their explicit size.
         uint64_t want = (!ubo && !may_write && !guarded && slot != -2) ? 0 : (bare ? 0 : b->size + lead);
+        // A small read-only vertex storage buffer the game writes on the CPU: its bytes as of the submit call
+        // (vk_usnap.c MKW_SSBO_SNAPSHOT; skinned pedestrians' bone matrices, Crown City sheets).
+        if (st == NVN_STAGE_VS && !may_write && !guarded && !ubo && slot >= 0 && !bare &&
+            vk_usnap_find_ssbo(at, b->size + lead, align, &bi)) {
+            count_use(VK_MCLS_SCRATCH, VK_MUSE_SSBO, bi.range);
+            return bi;
+        }
         if (mesh && at) {
             VkMemSpan sp;
             if (!vk_mem_resolve(at, 1, &sp)) return zero_info(max);
@@ -1819,9 +2095,12 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         int bound_ok = bind_range(ex, at, want, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO, may_write, wb, guarded, &bi);
         if (vk_dump_armed && st == NVN_STAGE_CS && vk_dump_active()) {   // capture frame: what each compute binding got
             static int nlog;
-            if (nlog++ < 4000)
-                rt_log("dbind cs %s handle %#x slot %d addr %#llx size %#llx lead %#llx want %#llx -> %s offset %#llx range %#llx",
-                       ubo ? "ubo" : "ssbo", r->handle * 4, slot, (unsigned long long)b->addr, (unsigned long long)b->size,
+            const uint8_t *dctl, *dcode = NULL;
+            uint32_t dlen;
+            uint64_t dorg = ex->prog && find_stage(ex->prog, NVN_STAGE_CS, &dctl, &dcode, &dlen) ? nvn2_origin(dcode) : 0;
+            if (nlog++ < 6000)
+                rt_log("dbind cs %016llx %s cbuf %d handle %#x slot %d addr %#llx size %#llx lead %#llx want %#llx -> %s offset %#llx range %#llx",
+                       (unsigned long long)dorg, ubo ? "ubo" : "ssbo", r->cbuf_slot, r->handle * 4, slot, (unsigned long long)b->addr, (unsigned long long)b->size,
                        (unsigned long long)lead, (unsigned long long)want, bound_ok ? "bound" : "FAILED",
                        (unsigned long long)bi.offset, (unsigned long long)bi.range);
         }
@@ -1855,6 +2134,15 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     } else {
         warn_once(W_SSBO_SLOT, "a storage buffer whose address is at c%d+%#x (stage %d) is not replayed: a zero buffer is bound",
                   r->cbuf_slot, r->handle * 4, st);
+        if (vk_dump_armed && vk_dump_active()) {
+            static int nz;
+            const uint8_t *zc, *zcode = NULL;
+            uint32_t zl;
+            uint64_t zo = ex->prog && find_stage(ex->prog, st, &zc, &zcode, &zl) ? nvn2_origin(zcode) : 0;
+            if (nz++ < 2000)
+                rt_log("dbind st%d %016llx ssbo cbuf %d handle %#x NOT REPLAYED (zero buffer)%s", st, (unsigned long long)zo,
+                       r->cbuf_slot, r->handle * 4, written ? " written" : "");
+        }
     }
     bi = zero_info(max);
     // Vulkan requires a nonzero descriptor range. Both unguarded and guarded unbacked fallback users bind the full dummy buffer
@@ -2630,6 +2918,11 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         if (i1 > lo[s] && !info->tpl[s]) need_w = 1;
     }
     uint32_t nd = 0;
+    MeshPtrTable mesh_table = {0};      // shared only by task/mesh c0 banks built in this call
+    BindingPtrTable ptr_mesh = {0};     // Hookshot table from TS+MS+VS+CS SSBOs
+    BindingPtrTable ptr_other = {0};    // single-stage table for ordinary VS/FS/CS -2 slots
+    GuardedC0Bank guarded_c0;           // lazily filled; ordinary graphics draws need none of its bank bytes
+    guarded_c0.valid = 0;
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *b = &info->bindings[i];
         const GfxShaderRes *r = b->res;
@@ -2656,14 +2949,15 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
             o->buffer = (VkDescriptorBufferInfo){B.sup_buf, B.sup_off, SUPPORT_BYTES};
         } else if (b->kind == GFX_RES_UBO) {
-            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
+            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k, &mesh_table);
         } else if (b->kind == GFX_RES_SSBO) {
+            BindingPtrTable *ptr = (st == NVN_STAGE_TS || st == NVN_STAGE_MS) ? &ptr_mesh : &ptr_other;
             for (uint32_t k = 0; k < cnt; k++) {
                 GfxShaderRes rk = *r;
                 // Array descriptors at one c0 base (AddGlobalTables count=3 at 0x880): consecutive 16-byte entries.
                 if (cnt > 1 && r->cbuf_slot == 0 && (uint32_t)r->handle * 4u + 16u * k < VK_C0_BYTES)
                     rk.handle = (uint16_t)(r->handle + (int)k * 4);
-                o[k].buffer = ssbo_info(ex, st, &rk, r->flags & 1);
+                o[k].buffer = ssbo_info(ex, st, &rk, r->flags & 1, ptr, &guarded_c0);
             }
         } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {
             int img = b->kind == GFX_RES_IMG;
@@ -2875,10 +3169,19 @@ static void bind_vertex_buffers(VkExec *ex) {
     memcpy(B.vcls, vcls, sizeof vcls), memcpy(B.vpool, vpool, sizeof vpool);
     memcpy(B.vin, ex->vbuf, sizeof B.vin);
     B.vgen = gen;
-    if (B.vb_valid && !memcmp(B.vb, vb, sizeof vb) && !memcmp(B.vo, vo, sizeof vo) && !memcmp(B.vsz, vsz, sizeof vsz) &&
-        (dyn || !memcmp(B.vstr, vstr, sizeof vstr)))
-        return;
-    vkCmdBindVertexBuffers2(ex->cb, 0, 17, vb, vo, vsz, dyn ? NULL : vstr);
+    // Vertex bindings persist independently: most draws replace just one stream. Keep one command, but send only
+    // the span containing changed bindings instead of rebinding all 17 (including the constant-zero stream).
+    unsigned first = 0, end = 17;
+    if (B.vb_valid) {
+        first = 17, end = 0;
+        for (unsigned b = 0; b < 17; b++)
+            if (B.vb[b] != vb[b] || B.vo[b] != vo[b] || B.vsz[b] != vsz[b] || (!dyn && B.vstr[b] != vstr[b])) {
+                if (first == 17) first = b;
+                end = b + 1;
+            }
+        if (!end) return;
+    }
+    vkCmdBindVertexBuffers2(ex->cb, first, end - first, vb + first, vo + first, vsz + first, dyn ? NULL : vstr + first);
     ex->recorded++;
     for (int b = 0; b < 17; b++)
         if (vcls[b]) vk_mem_count(vcls[b], VK_MUSE_VB, vsz[b]);
@@ -3386,7 +3689,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
-        vk_pipeline_set_dynamic(ex->cb, &s);
+        vk_pipeline_set_dynamic_changed(ex->cb, &s, B.st_valid ? &B.st : NULL);
         ex->recorded++;
         B.st = s, B.st_valid = 1;
     }
@@ -3466,6 +3769,8 @@ typedef struct {
     uint32_t ncmd, stride, max;
     VkMemSpan args, cnt, sb;  // spans to copy (buffer 0: none)
     uint64_t sb_size, origin, ind_addr;
+    uint64_t vtx_addr, vtx_size, mat_addr, mat_size, idx_addr, idx_size;
+    uint64_t u7_addr, u7_size, u9_addr, u9_size;
     uint32_t seq;
     int pass, draw;
     VkBuffer rb;
@@ -3543,21 +3848,77 @@ out:
 int vk_dump_active(void);
 void vk_dump_where(int *pass, int *draw);
 static void inst_trace(VkExec *ex, int kind, uint32_t base, uint32_t count, uint64_t ind, uint64_t cnt, uint32_t max,
-                       uint32_t stride) {
+                       uint32_t stride, const p_draw_idx *direct_idx) {
     uint64_t want = inst_origin();
-    if (!vk_dump_armed || !want || inst_npending == INST_PENDING || !ex->prog || !vk_dump_active()) return;
+    if (!vk_dump_armed || !want || inst_npending == INST_PENDING || !ex->prog) return;
+    static int auto_on = -1;
+    static unsigned auto_n;
+    if (auto_on < 0) {
+        const char *e = cfg_get("MKW_INST_AUTOCAP");
+        auto_on = e && *e == '1';
+    }
     const uint8_t *ctl, *code = NULL;
     uint32_t len;
     if (!find_stage(ex->prog, NVN_STAGE_VS, &ctl, &code, &len)) return;
     uint64_t origin = nvn2_origin(code);
     const p_bind_buf *b = &ex->ssbo[NVN_STAGE_VS][5];
     if (want == INST_ALL ? ex->pass_w < 1000 || !b->addr : origin != want) return;
+    int in_dump = vk_dump_active();
+    if (!in_dump && (!auto_on || auto_n >= 16)) return;
+    if (!in_dump) {
+        if (!auto_n++) plat_file_mkdir_p(vk_dump_dir());
+        if (auto_n == 16) rt_log("dinst: automatic capture reached 16 matching draws");
+    }
     static uint32_t seq;
     InstTrace *t = calloc(1, sizeof *t);
     if (!t) return;
     t->kind = kind, t->base = base, t->count = count, t->max = max, t->stride = stride, t->seq = ++seq;
     t->origin = origin, t->ind_addr = ind;
     vk_dump_where(&t->pass, &t->draw);
+    // A per-vertex transform index can turn one mesh into a screen-wide sheet when its stream or format is wrong.
+    // Record the exact input declaration and ranges for a targeted F12 draw; ordinary frames never enter this path.
+    rt_log("dinst #%u pass %04d draw %d vs %016llx vertex inputs:", t->seq, t->pass, t->draw,
+           (unsigned long long)origin);
+    for (int l = 0; l < 16; l++) {
+        va_st a = {0};
+        memcpy(&a, &ex->pipe.vattr[l], sizeof a);
+        if (!a.fmt || a.stream >= 16) continue;
+        const vs_st *s = &ex->pipe.vstream[a.stream];
+        const NVNbufferRange *v = &ex->vbuf[a.stream];
+        rt_log("dinst #%u   loc %d fmt %#x offset %u stream %u stride %u divisor %u buffer %#llx+%#llx",
+               t->seq, l, (unsigned)a.fmt, (unsigned)a.offset, (unsigned)a.stream, s->stride, s->divisor,
+               (unsigned long long)v->address, (unsigned long long)v->size);
+    }
+    for (int slot = 0; slot < 3; slot++) {
+        const p_bind_buf *b = &ex->ssbo[NVN_STAGE_VS][slot];
+        rt_log("dinst #%u   vs ssbo %d %#llx+%#llx", t->seq, slot,
+               (unsigned long long)b->addr, (unsigned long long)b->size);
+    }
+    va_st index_attr = {0};
+    memcpy(&index_attr, &ex->pipe.vattr[7], sizeof index_attr);
+    if (index_attr.fmt && index_attr.stream < 16) {
+        const NVNbufferRange *v = &ex->vbuf[index_attr.stream];
+        t->vtx_addr = v->address, t->vtx_size = v->size;
+    }
+    // The skinning shader's c0+0x130 pointer selects vertex storage slot 2.
+    const p_bind_buf *mat = &ex->ssbo[NVN_STAGE_VS][2];
+    t->mat_addr = mat->addr, t->mat_size = mat->size;
+    const p_bind_buf *u7 = &ex->ubo[NVN_STAGE_VS][7], *u9 = &ex->ubo[NVN_STAGE_VS][9];
+    t->u7_addr = u7->addr, t->u7_size = u7->size;
+    t->u9_addr = u9->addr, t->u9_size = u9->size;
+    if (direct_idx && direct_idx->itype >= 0 && direct_idx->itype <= 2 && direct_idx->count > 0) {
+        t->idx_addr = direct_idx->ibuf;
+        t->idx_size = (uint64_t)direct_idx->count << direct_idx->itype;
+        rt_log("dinst #%u   indices %d type %d base vertex %d buffer %#llx+%#llx restart %u",
+               t->seq, direct_idx->count, direct_idx->itype, direct_idx->base_vertex,
+               (unsigned long long)t->idx_addr, (unsigned long long)t->idx_size, (unsigned)ex->prim_restart.enable);
+    }
+    uint8_t bank[VK_C0_BYTES];
+    vk_c0_fill(bank, NVN_STAGE_VS, ex->ssbo[NVN_STAGE_VS], ex->ubo[NVN_STAGE_VS], c0_dim, c0_binst);
+    char path[480];
+    snprintf(path, sizeof path, "%s/vi%u_p%04d_d%d_c0.bin", vk_dump_dir(), t->seq, t->pass, t->draw);
+    FILE *out = fopen(path, "wb");
+    if (out) fwrite(bank, 1, sizeof bank, out), fclose(out);
     t->ncmd = max < INST_CMDS ? max : INST_CMDS;
     if (ind && !vk_mem_resolve(ind, (uint64_t)stride * t->ncmd, &t->args)) t->args.buffer = VK_NULL_HANDLE;
     if (cnt && !vk_mem_resolve(cnt, 4, &t->cnt)) t->cnt.buffer = VK_NULL_HANDLE;
@@ -3679,6 +4040,17 @@ static void cs_snap(VkExec *ex, int post) {
 // vk_exec_pass_end, after vkCmdEndRendering: the copies of the traced draws of this pass.
 void vk_exec_inst_pass_end(VkExec *ex) {
     VkCtx *c = vk_ctx();
+    if (inst_npending) {
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                               .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                               .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                               .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(ex->cb, &di);
+        ex->recorded++;
+    }
     for (int i = 0; i < inst_npending; i++) {
         InstTrace *t = inst_pending[i];
         uint64_t sz = t->args.buffer ? (uint64_t)t->stride * t->ncmd : 0;
@@ -3715,6 +4087,18 @@ void vk_exec_inst_pass_end(VkExec *ex) {
             VkBufferCopy cp = {t->cnt.offset, t->off_cnt, 4};
             vkCmdCopyBuffer(ex->cb, t->cnt.buffer, t->rb, 1, &cp);
         }
+        char base[180];
+        snprintf(base, sizeof base, "%s/vi%u_p%04d_d%d", vk_dump_dir(), t->seq, t->pass, t->draw);
+        p_bind_buf vtx = {.addr = t->vtx_addr, .size = t->vtx_size < (1u << 20) ? t->vtx_size : (1u << 20)};
+        p_bind_buf mat = {.addr = t->mat_addr, .size = t->mat_size < (1u << 20) ? t->mat_size : (1u << 20)};
+        p_bind_buf idx = {.addr = t->idx_addr, .size = t->idx_size < (1u << 20) ? t->idx_size : (1u << 20)};
+        p_bind_buf u7 = {.addr = t->u7_addr, .size = t->u7_size < (1u << 20) ? t->u7_size : (1u << 20)};
+        p_bind_buf u9 = {.addr = t->u9_addr, .size = t->u9_size < (1u << 20) ? t->u9_size : (1u << 20)};
+        cs_snap_copy(ex, base, 'v', 0, &vtx);
+        cs_snap_copy(ex, base, 'm', 0, &mat);
+        cs_snap_copy(ex, base, 'i', 0, &idx);
+        cs_snap_copy(ex, base, 'u', 7, &u7);
+        cs_snap_copy(ex, base, 'u', 9, &u9);
         ex->recorded += 2;
     }
     if (inst_npending) {
@@ -3736,7 +4120,7 @@ static void op_draw(VkExec *ex, const p_draw *d) {
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
     vk_exec_frame.draws++;
     vk_drawstats_inst(d->instances > 0 ? (uint32_t)d->instances : 1);
-    inst_trace(ex, 0, (uint32_t)d->base_instance, d->instances > 0 ? (uint32_t)d->instances : 1, 0, 0, 0, 0);
+    inst_trace(ex, 0, (uint32_t)d->base_instance, d->instances > 0 ? (uint32_t)d->instances : 1, 0, 0, 0, 0, NULL);
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;
     if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && n >= 4) {   // quads become two triangles each
         uint32_t q = n / 4;
@@ -3799,6 +4183,199 @@ static int restart_for(const VkExec *ex, int prim, int itype) {
     return 0;
 }
 
+// MKW_SKIN_CHECK=1 (diagnostic, Crown City sheets): every draw of the skinned vertex stage 2367473af09b1016 checks what
+// it will read. Bones per object = word 0 of vertex storage slot 2, object slot = c7[9].y (uniform slot 4, byte 0x94),
+// matrix i at 16 + 48 * i. Logged ("dskin"): an object block past the end of the buffer, and matrices that are not
+// finite or have a row longer than 1000, both in the submit-time copy (what the draw reads) and in live memory at
+// record time and again when the submission completes. One summary line per 2000 checked draws.
+typedef struct {
+    uint64_t addr, slot, bones, n, seq;
+    float snap_bad, live_bad;
+} SkinCheck;
+
+uint64_t vk_skin_buf_lo, vk_skin_buf_hi;   // the bone buffer the skinned pedestrians read (skin_check)
+
+// MKW_SKIN_CHECK: data the replay writes into the bone buffer (inline UpdateUniformBuffer, buffer copies). Logs each
+// write's offset and size and how many of its floats are broken (NaN, infinity, |x| > 1e6) as they arrive ("dskinu").
+void vk_skin_write(const char *how, uint64_t dst, uint64_t size, const void *data) {
+    if (!vk_skin_buf_hi || dst + size <= vk_skin_buf_lo || dst >= vk_skin_buf_hi) return;
+    static uint64_t writes, bytes, bad_writes;
+    static int logs;
+    uint64_t bad = 0;
+    if (data)
+        for (uint64_t i = 0; i + 4 <= size; i += 4) {
+            float f;
+            memcpy(&f, (const uint8_t *)data + i, 4);
+            bad += !(f == f) || f > 1e6f || f < -1e6f;
+        }
+    writes++, bytes += size, bad_writes += bad != 0;
+    if (logs < 60 && (bad || logs < 10))
+        logs++, rt_log("dskinu %s at +%#llx size %#llx: %llu broken floats%s", how, (unsigned long long)(dst - vk_skin_buf_lo),
+                       (unsigned long long)size, (unsigned long long)bad, data ? "" : " (data not visible: GPU copy)");
+    if (writes % 500 == 0)
+        rt_log("dskinu summary: %llu writes, %llu bytes, %llu carried broken floats", (unsigned long long)writes,
+               (unsigned long long)bytes, (unsigned long long)bad_writes);
+}
+
+void rt_skin_watch_arm(uint64_t addr, uint64_t size, uint64_t frame);   // ov_system.c MKW_SKIN_WATCH
+void rt_skin_watch_poll(uint64_t frame);
+void rt_skin_watch_seen(uint64_t addr, uint64_t size, uint32_t bones, uint32_t slot, int bad, uint64_t frame);
+static int skin_on(void) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("MKW_SKIN_CHECK");
+    return on;
+}
+
+// 0 good, else the first bad matrix + 1. m points at the object's first matrix (bones of them, 12 floats each).
+static int skin_bad(const float *m, uint64_t bones) {
+    for (uint64_t k = 0; k < bones; k++)
+        for (int r = 0; r < 3; r++) {
+            const float *row = m + 12 * k + 4 * r;
+            float len = 0;
+            for (int c = 0; c < 3; c++) {
+                if (!isfinite(row[c])) return (int)k + 1;
+                len += row[c] * row[c];
+            }
+            if (!isfinite(row[3]) || len > 1e6f || fabsf(row[3]) > 1e6f) return (int)k + 1;
+        }
+    return 0;
+}
+
+// MKW_SKIN_CHECK: does anything update the pedestrians? Once per frame per bone buffer (up to SKM_BUFS), every object's
+// block (bones x 48 bytes) is hashed and compared with the last frame. Every 120 frames: "dskinm" with the objects
+// whose block changed in that window, the ones that never changed since first seen, the broken ones, and how many of
+// the broken ones never changed.
+enum { SKM_BUFS = 6, SKM_SLOTS = 256 };
+static struct {
+    uint64_t addr, size, frame, first;
+    uint32_t bones, nslot;
+    uint64_t hash[SKM_SLOTS];
+    uint8_t changed[SKM_SLOTS], ever[SKM_SLOTS], bad[SKM_SLOTS];
+} skm[SKM_BUFS];
+
+static uint64_t skm_hash(const uint8_t *p, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h;
+}
+
+static void skin_motion(uint64_t addr, uint64_t size, uint64_t frame) {
+    int k;
+    for (k = 0; k < SKM_BUFS && skm[k].addr && skm[k].addr != addr; k++) {}
+    if (k == SKM_BUFS) return;
+    if (!skm[k].addr) skm[k].addr = addr, skm[k].size = size, skm[k].first = frame, skm[k].frame = 0;
+    if (skm[k].frame == frame) return;
+    int fresh = !skm[k].frame;
+    skm[k].frame = frame;
+    const uint8_t *m = (const uint8_t *)(uintptr_t)addr;
+    uint32_t bones = *(const uint32_t *)m;
+    if (!bones || bones > 64) return;
+    uint64_t n = (size - 16) / 48 / bones;
+    if (n > SKM_SLOTS) n = SKM_SLOTS;
+    skm[k].bones = bones, skm[k].nslot = (uint32_t)n;
+    for (uint64_t s = 0; s < n; s++) {
+        const uint8_t *blk = m + 16 + 48 * bones * s;
+        uint64_t h = skm_hash(blk, 48 * bones);
+        if (!fresh && h != skm[k].hash[s]) skm[k].changed[s] = 1, skm[k].ever[s] = 1;
+        skm[k].hash[s] = h;
+        skm[k].bad[s] |= skin_bad((const float *)blk, bones) != 0;
+    }
+    if ((frame - skm[k].first) % 120 == 119) {
+        uint32_t ch = 0, never = 0, bad = 0, badnever = 0, zero = 0;
+        for (uint32_t s = 0; s < n; s++) {
+            ch += skm[k].changed[s];
+            never += !skm[k].ever[s];
+            bad += skm[k].bad[s];
+            badnever += skm[k].bad[s] && !skm[k].ever[s];
+            const uint8_t *blk = m + 16 + 48 * bones * s;
+            int z = 1;
+            for (uint32_t i = 0; i < 48 * bones && z; i++) z = !blk[i];
+            zero += z;
+            skm[k].changed[s] = 0;
+        }
+        rt_log("dskinm buffer %#llx (%u objects x %u bones): %u changed in the last 120 frames, %u never changed, %u all-zero, "
+               "%u broken (%u of them never changed)", (unsigned long long)addr, (uint32_t)n, bones, ch, never, zero, bad, badnever);
+    }
+}
+
+static volatile int32_t skin_logs;
+static void skin_done(void *arg) {   // completion thread
+    SkinCheck *s = arg;
+    const float *m = (const float *)(uintptr_t)(s->addr + 16 + 48 * s->slot * s->bones);
+    int bad = skin_bad(m, s->bones);
+    if (bad && __atomic_fetch_add(&skin_logs, 1, __ATOMIC_RELAXED) < 200)
+        rt_log("dskin #%llu at completion: live matrix %d of slot %llu is bad", (unsigned long long)s->seq, bad - 1,
+               (unsigned long long)s->slot);
+    free(s);
+}
+
+static void skin_check(VkExec *ex) {
+    if (!skin_on() || !ex->prog) return;
+    const uint8_t *ctl, *code = NULL;
+    uint32_t len;
+    if (!find_stage(ex->prog, NVN_STAGE_VS, &ctl, &code, &len) || nvn2_origin(code) != UINT64_C(0x2367473af09b1016)) return;
+    static uint64_t seq, checked, out_of_range, snap_bad, live_bad, differ, no_snap;
+    seq++, checked++;
+    rt_skin_watch_poll(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+    const p_bind_buf *mb = &ex->ssbo[NVN_STAGE_VS][2], *ub = &ex->ubo[NVN_STAGE_VS][4];
+    if (mb->addr && mb->size) vk_skin_buf_lo = mb->addr, vk_skin_buf_hi = mb->addr + mb->size;
+    if (mb->addr && mb->size >= 64) skin_motion(mb->addr, mb->size, __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+    if (vk_dump_armed && vk_dump_active()) {   // F12 frame: where this frame's bone buffer is (match against dbind lines)
+        static uint64_t last;
+        if (mb->addr != last) last = mb->addr, rt_log("dskin capture: bone buffer %#llx size %#llx", (unsigned long long)mb->addr,
+                                                     (unsigned long long)mb->size);
+    }
+    if (mb->addr && mb->size >= 16 && ub->addr && ub->size >= 0x98) {
+        const uint8_t *u = vk_usnap_bytes(ub->addr + 0x94, 4);
+        uint32_t slot = u ? *(const uint32_t *)u : *(const uint32_t *)(uintptr_t)(ub->addr + 0x94);
+        const uint8_t *sm = vk_usnap_bytes(mb->addr, mb->size);
+        uint32_t bones = sm ? *(const uint32_t *)sm : *(const uint32_t *)(uintptr_t)mb->addr;
+        uint64_t n = (mb->size - 16) / 48, need = ((uint64_t)slot + 1) * bones;
+        if (!sm) no_snap++;
+        if (!bones || need > n) {
+            out_of_range++;
+            if (__atomic_fetch_add(&skin_logs, 1, __ATOMIC_RELAXED) < 200)
+                rt_log("dskin #%llu object block past the buffer: slot %u x %u bones = %llu of %llu matrices (%s)",
+                       (unsigned long long)seq, slot, bones, (unsigned long long)need, (unsigned long long)n,
+                       sm ? "submit copy" : "live");
+        } else {
+            uint64_t off = 16 + 48ull * slot * bones;
+            const float *live = (const float *)(uintptr_t)(mb->addr + off);
+            int lb = skin_bad(live, bones), sb = sm ? skin_bad((const float *)(sm + off), bones) : lb;
+            if (sm && memcmp(sm + off, live, 48 * bones)) differ++;
+            if (sb) snap_bad++;
+            rt_skin_watch_seen(mb->addr, mb->size, bones, slot, sb || lb, __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+            if (lb) live_bad++;
+            if ((sb || lb) && __atomic_fetch_add(&skin_logs, 1, __ATOMIC_RELAXED) < 200) {
+                rt_log("dskin #%llu slot %u (%u bones): bad matrix %d in the %s, %d live at record time", (unsigned long long)seq,
+                       slot, bones, (sb ? sb : lb) - 1, sm ? "submit copy" : "live buffer", lb - 1);
+                static int vals;
+                if (vals++ < 40) {   // the bad matrix and every bone of the object, as floats and raw bits of the first row
+                    const float *base = sm ? (const float *)(sm + off) : live;
+                    for (uint32_t k = 0; k < bones; k++) {
+                        const float *mm = base + 12 * k;
+                        uint32_t raw;
+                        memcpy(&raw, mm, 4);
+                        rt_log("dskin   bone %2u: %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g (%08x)%s", k,
+                               mm[0], mm[1], mm[2], mm[3], mm[4], mm[5], mm[6], mm[7], mm[8], mm[9], mm[10], mm[11], raw,
+                               (int)k == (sb ? sb : lb) - 1 ? "  <- bad" : "");
+                    }
+                }
+            }
+            SkinCheck *s = calloc(1, sizeof *s);
+            if (s) {
+                *s = (SkinCheck){mb->addr, slot, bones, n, seq, 0, 0};
+                vk_completion_add(ex->fence, skin_done, s);
+            }
+        }
+    }
+    if (checked % 2000 == 0)
+        rt_log("dskin summary: %llu draws, %llu block past the buffer, %llu bad in the copy, %llu bad live, %llu copy != "
+               "live at record, %llu without a copy", (unsigned long long)checked, (unsigned long long)out_of_range,
+               (unsigned long long)snap_bad, (unsigned long long)live_bad, (unsigned long long)differ,
+               (unsigned long long)no_snap);
+}
+
 static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     c0_binst = (uint32_t)d->base_instance;
     static const uint32_t isize[3] = {1, 2, 4};
@@ -3807,7 +4384,18 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, restart)) return;
     vk_exec_frame.draws++;
     vk_drawstats_inst(d->instances > 0 ? (uint32_t)d->instances : 1);
-    inst_trace(ex, 1, (uint32_t)d->base_instance, d->instances > 0 ? (uint32_t)d->instances : 1, 0, 0, 0, 0);
+    inst_trace(ex, 1, (uint32_t)d->base_instance, d->instances > 0 ? (uint32_t)d->instances : 1, 0, 0, 0, 0, d);
+    skin_check(ex);
+    {   // MKW_SKIN_WATCH_TEST=1: self-test of the write-watch on a CPU-written vertex uniform block (frame 400 on)
+        static int t = -1;
+        if (t < 0) t = cfg_bool("MKW_SKIN_WATCH_TEST");
+        uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        if (t && f >= 400) {
+            const p_bind_buf *u = &ex->ubo[NVN_STAGE_VS][3];
+            if (u->addr && u->size) rt_skin_watch_arm(u->addr, u->size, f);
+            rt_skin_watch_poll(f);
+        }
+    }
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
@@ -3856,7 +4444,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     VK_MEM_USE(ib);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
-    inst_trace(ex, 2, 0, 0, d->ind, 0, 1, sizeof(VkDrawIndexedIndirectCommand));
+    inst_trace(ex, 2, 0, 0, d->ind, 0, 1, sizeof(VkDrawIndexedIndirectCommand), NULL);
     ex->recorded += 2;
     note_work(ex, 1, 0);
     // An imported pool's GPU address is its host address (bind_range reads it the same way); device memory is not.
@@ -3895,7 +4483,7 @@ static void op_draw_idx_ind_count(VkExec *ex, const p_draw_idx_ind_count *d) {
                          d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirectCount(ex->cb, ip.buffer, ip.offset, cp.buffer, cp.offset, (uint32_t)d->max_count, stride);
     vk_drawstats_count(ex, &cp);
-    inst_trace(ex, 3, 0, 0, d->ind, d->count, (uint32_t)d->max_count, stride);
+    inst_trace(ex, 3, 0, 0, d->ind, d->count, (uint32_t)d->max_count, stride, NULL);
     ex->recorded += 2;
     note_work(ex, 1, 0);
     vk_mem_count(ip.cls, VK_MUSE_IND, ind_bytes);
@@ -3979,6 +4567,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
 
 static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     if (!u->size) return;
+    if (skin_on()) vk_skin_write("inline update", u->dst, u->size, u->data);
     VkMemSpan sp;
     if (!vk_mem_resolve(u->dst, u->size, &sp)) return warn_once(W_UB, "UpdateUniformBuffer to %#llx is not backed: dropped", (unsigned long long)u->dst);
     cb_res(ex);

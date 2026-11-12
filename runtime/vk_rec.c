@@ -27,6 +27,7 @@ static CacheLine head_line, tail_line;
 static volatile int32_t sleeping;        // the recorder waits for wake_ev
 static PlatEvent wake_ev;              // auto-reset
 static uint64_t put_h;                 // producer: words written (published up to head)
+static uint64_t seen_tail;             // producer: last acquire of tail; can only understate the free space
 static VkCommandBuffer rec_cb;         // the part being recorded (set while the recorder is idle)
 static int rec_live;                   // producer: rec_begin started the recorder for rec_cb
 static PlatThread *rec_thread;
@@ -96,12 +97,17 @@ static void wake(void) {
 }
 
 static void wait_space(uint64_t need) {
-    if (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) <= RING_WORDS) return;
+    // An acquired tail remains safe to reuse while the consumer advances. Most parts fit in the ring, so avoid
+    // rereading the consumer's cache line for every packet; refresh only when this conservative view is full.
+    // Like put_h and the consumer's t, seen_tail lives for the recorder thread's whole lifetime (no per-part reset).
+    if (put_h + need - seen_tail <= RING_WORDS) return;
+    seen_tail = __atomic_load_n(&tail, __ATOMIC_ACQUIRE);
+    if (put_h + need - seen_tail <= RING_WORDS) return;
     RS_.full_waits++;
     unpub = 0;
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     wake();
-    while (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) > RING_WORDS) _mm_pause();
+    while (put_h + need - (seen_tail = __atomic_load_n(&tail, __ATOMIC_ACQUIRE)) > RING_WORDS) _mm_pause();
 }
 
 // Room for a packet of bytes of arguments; the caller fills it and calls pub().

@@ -4,10 +4,10 @@
 // the setting is read at start, and is greyed out with a note when an environment variable fixes it.
 //
 //   opt_begin("##screen", scale);
-//   opt_toggle("TOTK_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
+//   opt_toggle("MKW_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
 //   opt_end();
 //
-// key: the setting's TOTK_ name, which must have a cfg_meta row. Present path only (ImGui).
+// key: the setting's MKW_ name, which must have a cfg_meta row. Present path only (ImGui).
 #pragma once
 #include "imgui.h"
 
@@ -53,7 +53,7 @@ bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId de
                 const char *fmt = "%g");
 
 // Binding rows (remapping on the Controls tab): a label and three cells, each selectable on its own (left / right move between them).
-// opt_bind_header: the column titles above them. opt_bind_row: key is the setting's name without TOTK_ (BIND_A; the
+// opt_bind_header: the column titles above them. opt_bind_row: key is the setting's name without MKW_ (BIND_A; the
 // description names it when the environment sets it); a disabled cell shows its text greyed and takes no cursor; note
 // (NULL none) follows the description. Returns the cell A / Enter / a click activated (0..2), 10 + the cell Delete,
 // Backspace or X cleared, or -1. opt_focus_key("<key>#<cell>") puts the cursor on a cell.

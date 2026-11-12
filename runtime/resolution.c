@@ -206,7 +206,7 @@ static uint64_t pack(unsigned w, unsigned h) { return (uint64_t)h << 32 | w; }
 
 void res_init(void) {
     if (!bigger()) {
-        rt_log("resolution: the game's own (output 1920x1080, scene 1600x900)");
+        rt_log("resolution: MKW graphics config %s", res_mkw_lines() ? "will use the selected frame size" : "unchanged (Original)");
         return;
     }
     int output = rt_patch_set("output"), scene = rt_patch_set("scene");
@@ -286,6 +286,116 @@ void res_fov_live(void) {
     memcpy((uint8_t *)rt_patch_page() + 60, &k, sizeof k);   // before the switch: a site that sees it on reads k
     rt_patch_switch(set, pct != 100);
     rt_log("resolution: field of view %d%% of the game's", pct);
+}
+
+// ---- MKW render resolution (MKW_RESOLUTION, Graphics tab, read at start)
+// Mario Kart World picks its frame size from System/GymlArchive/general_format.Product_<ver>.sarc.zs ->
+// GamePerformanceGraphicsConfigGParam/30_Extendted (BYML: Resolution{Low,Middle}{For3D,Screen}[ForDiv,ForDiv4], 1080
+// and 1440 in 1.8.0). GraphicsSystem's setup (1.8.0 main+0xb879f0) reads the twelve fields, clamps each to 2160 lines
+// and sizes its targets at 16:9 from them, so the fields alone move the 3D scene and the 2D screen; no code patch.
+// Every *For3D* and *Screen* integer becomes the chosen lines; romfs.c serves the rebuilt archive in place of the
+// original. Approach and field names: adriadam10/mkw-recomp runtime/sdk/fs/romfs_res.c (MIT, Copyright (c) 2026
+// Adrià), which measured them on 1.0.0.
+#define MKW_GPARAM_MEMBER "Gyml/GamePerformanceGraphicsConfigGParam/30_Extendted.game__GamePerformanceGraphicsConfigGParam.bgyml"
+#define MKW_LINES_MAX 2160   // GraphicsSystem's clamp (0x870)
+
+int res_mkw_lines(void) {
+    const char *v = cfg_value("MKW_RESOLUTION");
+    if (!v || !strcmp(v, "original")) return 0;
+    int lines = atoi(v);
+    if (lines < 360) return 0;
+    return lines > MKW_LINES_MAX ? MKW_LINES_MAX : lines & ~1;
+}
+
+static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint32_t le24(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16; }
+
+// The member's offset in a SARC, 0 when absent; *len its size.
+static size_t sarc_member(const uint8_t *s, size_t n, const char *name, size_t *len) {
+    if (n < 0x20 || memcmp(s, "SARC", 4)) return 0;
+    uint32_t hdr = (uint32_t)(s[4] | s[5] << 8), data = le32(s + 12);
+    if (hdr + 12 > n) return 0;
+    uint32_t count = (uint32_t)(s[hdr + 6] | s[hdr + 7] << 8), names = hdr + 12 + count * 16 + 8;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t e = hdr + 12 + (size_t)i * 16;
+        if (e + 16 > n) return 0;
+        uint32_t attr = le32(s + e + 4), lo = le32(s + e + 8), hi = le32(s + e + 12);
+        size_t off = names + (size_t)(attr & 0xffffff) * 4;
+        if (off >= n || hi < lo || (size_t)data + hi > n) return 0;
+        if (!strncmp((const char *)s + off, name, n - off)) {
+            *len = hi - lo;
+            return data + lo;
+        }
+    }
+    return 0;
+}
+
+// Every int/uint entry under dictionary `node` whose dotted name holds For3D or Screen is set to `lines`; returns how
+// many changed. b/n: the BYML, keys: its key table offset.
+static int gparam_patch(uint8_t *b, size_t n, uint32_t keys, uint32_t node, const char *prefix, uint32_t lines, int depth) {
+    if ((size_t)node + 4 > n || b[node] != 0xc1 || depth > 4 || (size_t)keys + 4 > n) return 0;
+    uint32_t count = le24(b + node + 1), nkeys = le24(b + keys + 1);
+    int changed = 0;
+    for (uint32_t k = 0; k < count && (size_t)node + 4 + 8 * (size_t)(k + 1) <= n; k++) {
+        uint8_t *e = b + node + 4 + 8 * (size_t)k;
+        uint32_t ki = le24(e), type = e[3];
+        if (ki >= nkeys || (size_t)keys + 8 + 4 * (size_t)ki > n) continue;
+        uint32_t ko = keys + le32(b + keys + 4 + 4 * ki);
+        if (ko >= n || !memchr(b + ko, 0, n - ko)) continue;
+        char name[160];
+        snprintf(name, sizeof name, "%s%s", prefix, (const char *)b + ko);
+        if (type == 0xc1) {
+            char sub[164];
+            snprintf(sub, sizeof sub, "%s.", name);
+            changed += gparam_patch(b, n, keys, le32(e + 4), sub, lines, depth + 1);
+        } else if ((type == 0xd1 || type == 0xd3) && (strstr(name, "For3D") || strstr(name, "Screen"))) {
+            uint32_t was = le32(e + 4);
+            e[4] = (uint8_t)lines, e[5] = (uint8_t)(lines >> 8), e[6] = (uint8_t)(lines >> 16), e[7] = (uint8_t)(lines >> 24);
+            rt_log("resolution: %s %u -> %u", name, was, lines);
+            changed++;
+        } else if (type == 0xd0 && !strcmp(name, "PostProcess.IsEnableUpscale") && cfg_get("MKW_GAME_UPSCALE")) {
+            uint32_t v = (uint32_t)atoi(cfg_get("MKW_GAME_UPSCALE"));
+            rt_log("resolution: %s %u -> %u (MKW_GAME_UPSCALE)", name, le32(e + 4), v);
+            e[4] = (uint8_t)v, e[5] = e[6] = e[7] = 0;
+        }
+    }
+    return changed;
+}
+
+int res_gparam_build(const void *in, size_t n, void **out, size_t *out_n) {
+    int lines = res_mkw_lines();
+    *out = NULL;
+    if (!lines) return 0;
+    unsigned long long raw = ZSTD_getFrameContentSize(in, n);
+    if (raw == ZSTD_CONTENTSIZE_UNKNOWN || raw == ZSTD_CONTENTSIZE_ERROR || raw > (256u << 20)) {
+        rt_log("resolution: the graphics config archive is not a zstd frame with a size; the game's own resolution");
+        return 0;
+    }
+    uint8_t *s = malloc((size_t)raw);
+    if (!s) return 0;
+    size_t got = ZSTD_decompress(s, (size_t)raw, in, n);
+    size_t len = 0, at = ZSTD_isError(got) ? 0 : sarc_member(s, got, MKW_GPARAM_MEMBER, &len);
+    int changed = 0;
+    if (at && len > 16 && !memcmp(s + at, "YB", 2))
+        changed = gparam_patch(s + at, len, le32(s + at + 4), le32(s + at + 12), "", (uint32_t)lines, 0);
+    if (!changed) {
+        rt_log("resolution: no resolution fields in %s; the game's own resolution", MKW_GPARAM_MEMBER);
+        free(s);
+        return 0;
+    }
+    size_t cap = ZSTD_compressBound(got);
+    void *z = malloc(cap);
+    size_t zn = z ? ZSTD_compress(z, cap, s, got, 9) : 0;
+    free(s);
+    if (!z || ZSTD_isError(zn)) {
+        free(z);
+        return 0;
+    }
+    *out = z;
+    *out_n = zn;
+    rt_log("resolution: MKW frame at %d lines (%dx%d, 16:9): %d graphics config fields", lines, (lines * 16 / 9) & ~1,
+           lines, changed);
+    return 1;
 }
 
 void res_wanted(unsigned out[2]) {

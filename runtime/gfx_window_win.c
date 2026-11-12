@@ -1,9 +1,9 @@
 ﻿// The Win32 back end of the window (gfx_wsys.h): the window and its message loop on a thread of their own, F11
-// fullscreen, the settings TOTK_WINDOW_SIZE and TOTK_FULLSCREEN, the monitor's refresh rate, focus, the Vulkan surface.
+// fullscreen, the settings MKW_WINDOW_SIZE / MKW_FULLSCREEN (TOTK_* aliases still resolve), the monitor's refresh rate, focus, the Vulkan surface.
 // The swapchain and the present are gfx_present.c's. The in-game menu's keyboard and mouse come from the window
 // procedure (ui/menu_win.cpp), and so do the game's (input_win.c).
 //
-// The process is per-monitor DPI aware (totk.manifest): every size here is physical pixels, TOTK_WINDOW_SIZE included,
+// The process is per-monitor DPI aware (mkw.manifest): every size here is physical pixels, MKW_WINDOW_SIZE included,
 // and the swapchain matches the screen pixel for pixel. A window moved to a monitor at another display scale keeps its
 // client size (WM_GETDPISCALEDSIZE); the menu takes its text size floor from the window's DPI (gfx_window_dpi).
 #include <stdio.h>
@@ -202,8 +202,13 @@ int gfx_window_monitor_size(int *w, int *h) {
 
 void vk_dump_key(void);   // vk_dump.c: TOTK_DUMP=key
 void vk_drawstats_key(void);   // vk_drawstats.c: MKW_DRAWSTATS=key:<frames>
+void kern_debug_dump(void);    // kernel.c: Ctrl+F9 loading-stall diagnostics
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     LRESULT input_res;
+    if (m == WM_KEYDOWN && w == VK_F9 && (GetKeyState(VK_CONTROL) & 0x8000) && !(l & (1 << 30))) {
+        kern_debug_dump();
+        return 0;
+    }
     if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) vk_dump_key();
     if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30))) vk_drawstats_key();
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
@@ -304,13 +309,13 @@ static void raise_window(HWND h) {
 static void window_main(void *arg) {
     (void)arg;
     HINSTANCE inst = GetModuleHandleW(NULL);
-    // Icon resource 1 of totk.rc (runtime/totk.ico): the title bar, the taskbar button and Alt+Tab.
+    // Icon resource 1 of mkw.rc (runtime/mkw.ico): the title bar, the taskbar button and Alt+Tab.
     WNDCLASSEXW wc = {.cbSize = sizeof wc, .lpfnWndProc = wnd_proc, .hInstance = inst,
                       .hIcon = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
                                           GetSystemMetrics(SM_CYICON), LR_SHARED),
                       .hIconSm = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                             GetSystemMetrics(SM_CYSMICON), LR_SHARED),
-                      .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"MarioKartWorldWindow"};
+                      .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"MKWWindow"};
     RegisterClassExW(&wc);
     int cw, ch, ow, oh;
     cfg_window_size(&cw, &ch);
@@ -318,8 +323,8 @@ static void window_main(void *arg) {
     // The window opens behind the user's windows without taking focus: it shows the game's blank loading frames for a
     // while, and must not cover what the player works on meanwhile. The game still counts itself in focus until the
     // first WM_ACTIVATEAPP, so loading goes on, and keyboard input waits for the foreground (input_win.c). Its taskbar
-    // button flashes until it is brought up, and TOTK_FULLSCREEN waits for that first activation.
-    // TOTK_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
+    // button flashes until it is brought up, and MKW_FULLSCREEN waits for that first activation.
+    // MKW_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
     int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Mario Kart World", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
                              NULL, inst, NULL);
@@ -337,13 +342,21 @@ static void window_main(void *arg) {
         outer_size(g_hwnd, cw, ch, &ow, &oh);
         SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         if (!background) {
-            g_fs_pending = cfg_fullscreen();
+            int want_fs = cfg_fullscreen();
             raise_window(g_hwnd);   // a frontend's player may have no way to reach a window left behind
             FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
             FlashWindowEx(&fw);
-            if (g_fs_pending) {
-                g_fs_pending = 0;
-                PostMessageW(g_hwnd, WM_APP_FULLSCREEN, 0, 0);
+            // Apply fullscreen on this thread before g_wnd_ready. Posting WM_APP_FULLSCREEN raced the
+            // first Vulkan surface/swapchain: the HWND could already be 3840x2160 while currentExtent
+            // was still 1920x1080, so the game drew into the top-left quarter until the user toggled FS.
+            // SDL does SetWindowFullscreen + SyncWindow before open returns; match that here.
+            if (want_fs) {
+                if (!is_fullscreen(g_hwnd)) {
+                    input_cursor_suspend(1);
+                    toggle_fullscreen(g_hwnd);
+                    input_cursor_suspend(0);
+                }
+                if (!is_fullscreen(g_hwnd)) g_fs_pending = 1;   // raise failed: finish on first activation
             }
         }
         note_applied();

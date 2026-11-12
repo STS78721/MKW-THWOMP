@@ -382,6 +382,70 @@ static void heapdef_overlay(void) {
 }
 
 static int xbox_prompts_ready;    // romfs-patches-xbox/manifest.tsv was next to romfs-index.bin at start
+
+// MKW_RESOLUTION (resolution.c res_gparam_build): the graphics config archive with the chosen frame lines, written to
+// <profile>/resolution/ and served in place of the original (or of an overlay that replaces it).
+static void gparam_overlay(void) {
+    static const char *const names[] = {"System/GymlArchive/general_format.Product_180.sarc.zs",
+                                        "System/GymlArchive/general_format.Product_100.sarc.zs"};
+    if (!res_mkw_lines()) return;
+    const char *name = NULL;
+    uint64_t i = 0;
+    for (size_t k = 0; k < sizeof names / sizeof *names && !name; k++) {
+        i = lower(names[k]);
+        if (i < file_count && !strcmp(entry_name(entry(i)), names[k])) name = names[k];
+    }
+    if (!name) {
+        rt_log("RomFS: no general_format graphics config archive; the game keeps its own resolution");
+        return;
+    }
+    Overlay *base = NULL;
+    for (size_t k = 0; k < noverlay; k++)
+        if (overlays[k].index == i) base = &overlays[k];
+    PlatFile *f = base ? open_read(base->path) : image;
+    uint64_t off = base ? 0 : entry(i).offset, n = base ? base->size : entry(i).size;
+    void *in = n && n < (64u << 20) && f ? malloc((size_t)n) : NULL;
+    int ok = in && read_at(f, in, (uint32_t)n, off) == (int64_t)n;
+    if (base && f) plat_file_close(f);
+    void *out = NULL;
+    size_t out_n = 0;
+    ok = ok && res_gparam_build(in, (size_t)n, &out, &out_n);
+    free(in);
+    if (!ok) return;
+    const char *leaf = strrchr(name, '/') + 1;
+    char dir[2100], file[2200];
+    need(snprintf(dir, sizeof dir, "%s/resolution", rt_config()->profile) < (int)sizeof dir, "resolution path");
+    need(snprintf(file, sizeof file, "%s/%s", dir, leaf) < (int)sizeof file, "resolution path");
+    plat_file_mkdir_p(dir);
+    ok = plat_file_write(file, out, out_n);
+    free(out);
+    PlatFile *r = ok ? open_read(file) : NULL;
+    if (!r) {
+        rt_log("RomFS: cannot write %s; the game keeps its own resolution", file);
+        return;
+    }
+    Identity id = identity_of(r);
+    plat_file_close(r);
+    char *copy = strdup(file);
+    need(copy != NULL, "overlay path copy");
+    if (base) {
+        free(base->path);
+        base->path = copy;
+        base->size = out_n;
+        base->id = id;
+    } else {
+        if (noverlay == overlay_cap) {
+            overlay_cap = overlay_cap ? overlay_cap * 2 : 16;
+            overlays = realloc(overlays, overlay_cap * sizeof *overlays);
+            need(overlays != NULL, "overlay table");
+        }
+        char *rel = strdup(name);
+        need(rel != NULL, "overlay path copy");
+        overlays[noverlay++] = (Overlay){i, out_n, copy, rel, id};
+    }
+    rt_log("RomFS overlay: %s (%zu bytes, MKW_RESOLUTION %d lines) replaces %s", file, out_n, res_mkw_lines(),
+           base ? "the overlay's archive" : "the original");
+}
 static int xbox_prompts_active;   // and overlay_init loaded it
 
 int romfs_xbox_prompts_ready(void) { return xbox_prompts_ready; }
@@ -435,6 +499,7 @@ static void overlay_init(void) {
     for (int i = 0; i < 2; i++)
         if (dirs[i] && *dirs[i] && strcmp(dirs[i], "0")) overlay_load(dirs[i], 0);
     heapdef_overlay();
+    gparam_overlay();
     added_init();
     if (noverlay) qsort(overlays, noverlay, sizeof *overlays, overlay_order);
     for (size_t k = 1; k < noverlay; k++)
@@ -467,7 +532,7 @@ static void load_index(void) {
     else strcpy(index_dir, ".");
     uint64_t sz = 0;
     index_bytes = plat_file_read(path, &sz);
-    if (!index_bytes) rt_fatal("RomFS index %s missing (tools/build_game.py writes it next to totk.exe)", path);
+    if (!index_bytes) rt_fatal("RomFS index %s missing (tools/build_game.py writes it next to mkw.exe)", path);
     need(sz >= 24 && sz < (128 << 20), "index size");
     index_size = (size_t)sz;
     uint8_t d[32];
@@ -506,7 +571,7 @@ static void init_once(void *param) {
     const char *dir = rt_config()->romfs;
     need(snprintf(image_file, sizeof image_file, "%s/romfs.bin", dir) < (int)sizeof image_file, "image path");
     image = open_read(image_file);
-    if (!image) rt_fatal("RomFS image %s missing; put romfs.bin into the romfs folder next to totk or set TOTK_ROMFS",
+    if (!image) rt_fatal("RomFS image %s missing; put romfs.bin into the romfs folder next to mkw.exe or set MKW_ROMFS",
                          image_file);
     PlatFileId sz;
     need(plat_file_id(image, &sz), "image size");

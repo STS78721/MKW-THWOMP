@@ -1,5 +1,5 @@
-/* Mario Kart World PC: the application manifest (mkw.manifest), the icon (mkw.ico) and the version block Windows shows
-   in the file's Properties. tools/build_game.py compiles it with the runtime objects. */
+/* Mario Kart World PC: application manifest (mkw.manifest), icon (mkw.ico), and the version block Windows shows
+   in Properties. tools/build_game.py compiles this with the runtime objects. */
 #include <winver.h>
 1 24 "mkw.manifest"
 1 ICON "mkw.ico"
@@ -13,8 +13,9 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "FileDescription", "Mario Kart World PC"
-            VALUE "ProductName", "Mario Kart World PC"
+            VALUE "CompanyName", "Mario Kart World"
+            VALUE "FileDescription", "Mario Kart World"
+            VALUE "ProductName", "Mario Kart World"
             VALUE "InternalName", "mkw"
             VALUE "OriginalFilename", "mkw.exe"
             VALUE "FileVersion", "1.0.0"
@@ -26,3 +27,5 @@ BEGIN
         VALUE "Translation", 0x0409, 1200
     END
 END
+
+

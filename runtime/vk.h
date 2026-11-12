@@ -249,6 +249,7 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
 void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
+int vk_usnap_find_ssbo(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);   // MKW_SSBO_SNAPSHOT
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
 uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
 const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n);
@@ -588,6 +589,9 @@ VkPipeline vk_pipeline_mesh_graphics(const VkPipeState *s, const GfxShader *task
 // vk_pipeline_vertex_input_dynamic(), else from VkPipeState.vstream).
 void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s);
 void vk_pipeline_set_dynamic_ex(VkCommandBuffer cb, const VkPipeState *s, int mesh);
+// previous is valid only while the same conventional graphics pipeline remains bound in this command buffer.
+// NULL records every dynamic state, as vk_pipeline_set_dynamic does.
+void vk_pipeline_set_dynamic_changed(VkCommandBuffer cb, const VkPipeState *s, const VkPipeState *previous);
 int vk_pipeline_vertex_input_dynamic(void);    // 1: vertex input is VK_EXT_vertex_input_dynamic_state
 VkPipelineCache vk_pipeline_cache(void);        // shared cache for auxiliary Vulkan pipeline creation
 // Translator answers from the bound state: attr_type from the vertex attribute formats (vs), frag_out_type from the

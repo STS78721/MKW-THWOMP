@@ -371,10 +371,10 @@ extern "C" void menu_vk_release(void) {
 // MKW_MENU_TEST=<frame>[:<frames per page>]: at that presented frame the menu opens on its first tab; each tab stays
 // <frames per page> frames (default 30) and its last frame's swapchain image goes to MKW_MENU_TEST_DIR (default: the
 // working directory) as menu-test-<frame>-<page>.png; after the last tab the menu closes.
-// MKW_MENU_TEST_SET=<frame>:<key>=<value>[,<key>=<value>...][;<frame>:...]: cfg_set of each key (TOTK_ prefix
+// MKW_MENU_TEST_SET=<frame>:<key>=<value>[,<key>=<value>...][;<frame>:...]: cfg_set of each key (MKW_ prefix
 // optional) at that presented frame; changes live settings with no input, menu open or not. mkw.ini is written only by
 // the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note).
-enum { TAB_DISPLAY, TAB_SOUND, TAB_CONTROLS, TAB_SYSTEM, TAB_ADVANCED, TAB_COUNT };
+enum { TAB_DISPLAY, TAB_GRAPHICS, TAB_SOUND, TAB_CONTROLS, TAB_SYSTEM, TAB_ADVANCED, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -436,7 +436,7 @@ enum { MAX_GPUS = 8 };
 static char g_gpu_names[MAX_GPUS][VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
 static int g_gpu_n = -1;   // -1: not listed yet
 
-// The Vulkan devices in vkEnumeratePhysicalDevices order, which TOTK_GPU_INDEX counts in (vk_device.c pick_device).
+// The Vulkan devices in vkEnumeratePhysicalDevices order, which MKW_GPU_INDEX counts in (vk_device.c pick_device).
 static void list_gpus(VkInstance inst) {
     if (g_gpu_n >= 0) return;
     VkPhysicalDevice pd[MAX_GPUS];
@@ -521,7 +521,7 @@ static void row_game_lang(void) {
     opt_choice_list("MKW_LANG", UI_MENU_GAME_LANG, vals, names, N, UI_MENU_GAME_LANG_DESC, cur);
 }
 
-// The menu's name of a TOTK_VK_PRESENT mode (gfx_window_present_mode); NULL for another.
+// The menu's name of a MKW_VK_PRESENT mode (gfx_window_present_mode); NULL for another.
 static const char *present_name(const char *mode) {
     static const struct { const char *mode; UiTextId name; } names[] = {
         {"mailbox", UI_MENU_PRESENT_MAILBOX}, {"fifo", UI_MENU_PRESENT_VSYNC}, {"immediate", UI_MENU_PRESENT_IMMEDIATE},
@@ -562,7 +562,7 @@ static void row_vsync(void) {
     opt_choice_list("MKW_VK_PRESENT", UI_MENU_VSYNC, vals, names, 2, UI_MENU_VSYNC_DESC, cur, present_note());
 }
 
-// Rumble in four steps over TOTK_RUMBLE_STRENGTH (percent): the nearest step shows.
+// Rumble in four steps over MKW_RUMBLE_STRENGTH (percent): the nearest step shows.
 static void row_rumble(void) {
     static const char *const vals[] = {"0", "60", "100", "150"};
     const char *names[] = {menu_text(UI_MENU_OFF), menu_text(UI_MENU_RUMBLE_LOW), menu_text(UI_MENU_RUMBLE_NORMAL),
@@ -570,6 +570,35 @@ static void row_rumble(void) {
     int v = cfg_int("MKW_RUMBLE_STRENGTH");
     int cur = v <= 0 ? 0 : v < 80 ? 1 : v < 125 ? 2 : 3;
     opt_choice_list("MKW_RUMBLE_STRENGTH", UI_MENU_RUMBLE, vals, names, 4, UI_MENU_RUMBLE_DESC, cur);
+}
+
+// Colour adjustment (vk_color.c): a profile writes the four values; moving one of them makes the profile Custom.
+// Present path already grades when any value leaves the default.
+static void rows_color(void) {
+    static const struct { const char *name, *b, *c, *s, *g; } presets[] = {
+        {"default", "0", "100", "100", "1"}, {"vivid", "0", "115", "135", "0.95"}, {"clarity", "2", "110", "115", "1"}};
+    static const UiTextId names[] = {UI_MENU_COLOR_DEFAULT, UI_MENU_COLOR_VIVID, UI_MENU_COLOR_CLARITY,
+                                     UI_MENU_COLOR_CUSTOM};
+    opt_group(UI_MENU_COLOR);
+    if (opt_choice("MKW_COLOR_PRESET", UI_MENU_COLOR_PRESET, names, 4, UI_MENU_COLOR_PRESET_DESC)) {
+        const char *p = cfg_value("MKW_COLOR_PRESET");
+        for (const auto &e : presets)
+            if (!strcmp(p, e.name)) {
+                cfg_set("MKW_COLOR_BRIGHTNESS", e.b), cfg_set("MKW_COLOR_CONTRAST", e.c);
+                cfg_set("MKW_COLOR_SATURATION", e.s), cfg_set("MKW_COLOR_GAMMA", e.g);
+                cfg_save();
+            }
+    }
+    bool moved = opt_slider("MKW_COLOR_BRIGHTNESS", UI_MENU_COLOR_BRIGHTNESS, -30, 30, UI_MENU_COLOR_BRIGHTNESS_DESC, 1,
+                            "%+.0f %%");
+    moved |= opt_slider("MKW_COLOR_CONTRAST", UI_MENU_COLOR_CONTRAST, 70, 150, UI_MENU_COLOR_CONTRAST_DESC, 5, "%.0f %%");
+    moved |= opt_slider("MKW_COLOR_SATURATION", UI_MENU_COLOR_SATURATION, 50, 200, UI_MENU_COLOR_SATURATION_DESC, 5,
+                        "%.0f %%");
+    moved |= opt_slider("MKW_COLOR_GAMMA", UI_MENU_COLOR_GAMMA, 0.8f, 1.2f, UI_MENU_COLOR_GAMMA_DESC, 0.02f, "%.2f");
+    if (moved && strcmp(cfg_value("MKW_COLOR_PRESET"), "custom")) {
+        cfg_set("MKW_COLOR_PRESET", "custom");
+        cfg_save();
+    }
 }
 
 static void tab_display(float scale) {
@@ -582,6 +611,24 @@ static void tab_display(float scale) {
     row_frame_limit();
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("MKW_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
+    rows_color();
+    opt_end();
+}
+
+// ---- Graphics: the game's frame resolution (resolution.c, a graphics config overlay read at start) and the
+// anisotropic filtering floor (vk_texture.c make_sampler); both after a restart
+static void tab_graphics(float scale) {
+    opt_begin("##graphics", scale);
+    {
+        static const char *const vals[] = {"original", "720", "900", "1080", "1440", "2160"};
+        const char *names[] = {menu_text(UI_MENU_RESOLUTION_ORIGINAL), "720p", "900p", "1080p", "1440p", "2160p (4K)"};
+        opt_choice_list("MKW_RESOLUTION", UI_MENU_RESOLUTION, vals, names, 6, UI_MENU_RESOLUTION_DESC);
+    }
+    {
+        static const char *const vals[] = {"game", "2", "4", "8", "16"};
+        const char *names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
+        opt_choice_list("MKW_ANISO", UI_MENU_ANISO, vals, names, 5, UI_MENU_ANISO_DESC);
+    }
     opt_end();
 }
 
@@ -707,8 +754,8 @@ static void tab_advanced(float scale) {
     opt_end();
 }
 
-static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_DISPLAY, UI_MENU_TAB_SOUND, UI_MENU_TAB_CONTROLS,
-                                              UI_MENU_TAB_SYSTEM, UI_MENU_TAB_ADVANCED};
+static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_DISPLAY, UI_MENU_TAB_GRAPHICS, UI_MENU_TAB_SOUND,
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_SYSTEM, UI_MENU_TAB_ADVANCED};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // this tab's first row takes the cursor once it is shown; -1 none
@@ -830,6 +877,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     opt_reserve_right(pad);
     switch (g_tab) {
     case TAB_DISPLAY: tab_display(scale); break;
+    case TAB_GRAPHICS: tab_graphics(scale); break;
     case TAB_SOUND: tab_sound(scale); break;
     case TAB_CONTROLS: tab_controls(scale); break;
     case TAB_SYSTEM: tab_system(scale); break;
@@ -870,7 +918,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
 
 static int g_save_pending;   // a changed setting still waits for its write to mkw.ini (opt_save_tick)
 
-// ---- the performance overlay (TOTK_PERF_OVERLAY), in the top right corner. "fps": the frame rate over the presents of
+// ---- the performance overlay (MKW_PERF_OVERLAY), in the top right corner. "fps": the frame rate over the presents of
 // the last half second. "full": a panel of perfmon.c's numbers, in the style of SavageWindRecomp's perf_overlay_draw
 // (menu.mm): the machine's load and temperatures, the frame rate and frame times with a graph, the render thread's waits.
 // Off, it costs a cfg_version load per present.

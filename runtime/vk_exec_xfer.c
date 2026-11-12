@@ -1094,7 +1094,9 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
 
 // ---- buffer to buffer
 
+void vk_skin_write(const char *how, uint64_t dst, uint64_t size, const void *data);   // vk_exec_draw.c
 static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
+    vk_skin_write("buffer copy", p->dst, p->size, plat_mem_readable(p->src, p->size) ? (const void *)(uintptr_t)p->src : NULL);
     uint64_t src = p->src, dst = p->dst, left = p->size;
     int started = 0;
     while (left) {

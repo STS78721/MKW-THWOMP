@@ -168,7 +168,10 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
 // adding control memory again releases the copies recorded there without walking every live copy. 4 KiB pages cost
 // about 500 lookups per AddControlMemory under the exclusive lock (1.4.3 field: 53 calls a frame, 2 MiB ranges, 3.7
 // copies per page), and the recording threads waited on it.
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred; } copy_prefix;   // deferred: 0 unknown, 1 none, 2 some
+enum { COPY_DEFERRED = 1, COPY_WAIT = 2 };
+// work is immutable after EndRecording. The validation pass already visits every op, including inlined recordings,
+// so submit preparation need not walk a static stream again looking for waits or deferred reads that it cannot hold.
+typedef struct { uint64_t magic, bytes, made_at, used_at, work; } copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
@@ -239,19 +242,42 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
     uint8_t *out = malloc(sizeof(copy_prefix) + n);
     if (!out) rt_fatal("nvn: command copy allocation");
     memcpy(out + sizeof(copy_prefix), p, n);
+    uint64_t work = 0;
     for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
         op_hdr h;
         memcpy(&h, p + at, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_ || h.op == OP_JUMP || h.op == OP_CALL || at + h.size > n ||
             (!at && h.op != OP_BEGIN))
             rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)(p + at), h.op, h.size);
+        const void *payload = p + at + 8;
+        if (h.op == OP_WAIT_SYNC) {
+            if (h.size < 8 + sizeof(p_wait_sync)) rt_fatal("nvn: short WaitSync record at %p", (const void *)(p + at));
+            work |= COPY_WAIT;
+        } else if (h.op == OP_PUSH_CONST) {
+            if (h.size < 8 + offsetof(p_push_const, w))
+                rt_fatal("nvn: short push-constant record at %p", (const void *)(p + at));
+            const p_push_const *b = payload;
+            if (b->src) {
+                if (b->bytes <= 0 || b->bytes > (int)sizeof b->w || (b->bytes & 3) ||
+                    h.size < 8 + offsetof(p_push_const, w) + (size_t)b->bytes)
+                    rt_fatal("nvn: invalid deferred push-constant record at %p", (const void *)(p + at));
+                work |= COPY_DEFERRED;
+            }
+        } else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
+            if (h.size < 8 + offsetof(p_bind_handles, h))
+                rt_fatal("nvn: short handle-bind record at %p", (const void *)(p + at));
+            const p_bind_handles *b = payload;
+            if (b->n < 0 || b->n > 32 || h.size < 8 + offsetof(p_bind_handles, h) + 8 * (size_t)b->n)
+                rt_fatal("nvn: invalid handle-bind record at %p", (const void *)(p + at));
+            if (b->src && b->n) work |= COPY_DEFERRED;
+        }
         at += h.size;
         if (h.op == OP_END) {
             if (at != n) rt_fatal("nvn: recording at %p ends at %zu of %zu bytes", (const void *)p, at, n);
             break;
         }
     }
-    *(copy_prefix *)out = (copy_prefix){COPY_MAGIC, n, 0, 0};
+    *(copy_prefix *)out = (copy_prefix){COPY_MAGIC, n, 0, 0, work};
     return out + sizeof(copy_prefix);
 }
 
@@ -1010,6 +1036,8 @@ static uint64_t wait_target(const uint8_t *p, int depth) {
 static void wait_submission(const uint64_t *handles, int n) {
     uint64_t target = 0;
     for (int i = 0; i < n; i++) {
+        const copy_prefix *pf = (const copy_prefix *)(uintptr_t)handles[i] - 1;
+        if (!(pf->work & COPY_WAIT)) continue;
         uint64_t value = wait_target((const uint8_t *)(uintptr_t)handles[i], 0);
         if (value > target) target = value;
     }
@@ -1078,15 +1106,18 @@ void nvn_submit_prepare(const uint64_t *handles, int n) {
         nvn_mode_trace(NVN_MODE_HANDLE, 0, handle, (uint32_t)i, now);
     }
     wait_submission(handles, n);
-    for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
+    for (int i = 0; i < n; i++) {
+        const copy_prefix *pf = (const copy_prefix *)(uintptr_t)handles[i] - 1;
+        if (pf->work & COPY_DEFERRED) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
+    }
 }
 
 // Asynchronous replay. A copy a queued submission still reads keeps that submission's deferred binds: when it holds
-// deferred binds (or is not known to hold none), this submission gets a clone, resolved here and freed after its replay.
-void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
+// deferred binds, this submission gets a clone, resolved here and freed after its replay.
+static void prepare_async(const uint64_t *handles, uint64_t *out, int n, const uint64_t *probe_replayed) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
     nvn_mode_trace(NVN_MODE_PREPARE, 0, 0, (uint32_t)n, now);
-    uint64_t replayed = gfx_replayed_submits();
+    uint64_t replayed = probe_replayed ? *probe_replayed : gfx_replayed_submits();
     plat_mutex_lock(&copy_lock);
     if (nzombies) zombie_sweep(replayed);
     for (int i = 0; i < n; i++) {
@@ -1099,7 +1130,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         }
         nvn_mode_trace(NVN_MODE_HANDLE, 0, handle, (uint32_t)i, now);
         out[i] = handle;
-        if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
+        if (pf->used_at > replayed && pf->used_at != now && (pf->work & COPY_DEFERRED)) {
             size_t sz = sizeof *pf + pf->bytes;
             copy_prefix *cl = malloc(sz);
             if (!cl) rt_fatal("nvn: out of memory (recording clone, %zu bytes)", sz);
@@ -1116,12 +1147,22 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     plat_mutex_unlock(&copy_lock);
     wait_submission(out, n);
     for (int i = 0; i < n; i++) {
-        int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
-        if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
+        const copy_prefix *pf = (const copy_prefix *)(uintptr_t)out[i] - 1;
+        if (pf->work & COPY_DEFERRED) resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
     }
     if (now % 7200 == 0)
         rt_log("nvn: asynchronous replay at submit %llu: %llu recording clones so far, %u copies waiting for the replay",
                (unsigned long long)now, (unsigned long long)__atomic_load_n(&n_clones, __ATOMIC_RELAXED), nzombies);
+}
+
+void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
+    prepare_async(handles, out, n, NULL);
+}
+
+// Only --probe-nvn uses this hook: hold the completed watermark back to model queued work on the null backend.
+// Gameplay always obtains the real backend watermark through nvn_submit_prepare_async above.
+void nvn_probe_prepare_async(const uint64_t *handles, uint64_t *out, int n, uint64_t replayed) {
+    prepare_async(handles, out, n, &replayed);
 }
 
 uint64_t nvn_submit_count(void) { return __atomic_load_n(&nsubmits, __ATOMIC_RELAXED); }

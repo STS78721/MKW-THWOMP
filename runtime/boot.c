@@ -217,7 +217,25 @@ void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h)
     free(raw);
 }
 
-static void save_shot(const tex_t *t, const char *path) {
+static void presented_rect(const tex_t *t, const int crop[4], uint32_t rect[4]) {
+    uint32_t w = t->d.width, h = t->d.height;
+    rect[0] = rect[1] = 0;
+    rect[2] = w;
+    rect[3] = h;
+    if (!crop || crop[2] <= 0 || crop[3] <= 0) return;
+    int64_t x = crop[0], y = crop[1], right = x + crop[2], bottom = y + crop[3];
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (right > w) right = w;
+    if (bottom > h) bottom = h;
+    if (right <= x || bottom <= y) return;
+    rect[0] = (uint32_t)x;
+    rect[1] = (uint32_t)y;
+    rect[2] = (uint32_t)(right - x);
+    rect[3] = (uint32_t)(bottom - y);
+}
+
+static void save_shot(const tex_t *t, const int crop[4], const char *path) {
     int fmt = t->d.format;
     int bgra = fmt == NVN_FORMAT_BGRA8 || fmt == NVN_FORMAT_BGRA8_SRGB;
     if (!bgra && fmt != NVN_FORMAT_RGBA8 && fmt != NVN_FORMAT_RGBA8_SRGB)
@@ -236,13 +254,15 @@ static void save_shot(const tex_t *t, const char *path) {
             px[i] = px[i + 2];
             px[i + 2] = x;
         }
-    if (w == 3840 && h == 2160) {
-        // Match nvnQueuePresentTexture's MKW DRS default crop (title often 1704×960).
-        int active_w = 1704, active_h = 960;
+    uint32_t rect[4];
+    presented_rect(t, crop, rect);
+    if (rect[0] || rect[1] || rect[2] != w || rect[3] != h) {
+        uint32_t active_w = rect[2], active_h = rect[3];
         uint8_t *crop_px = malloc(4ull * active_w * active_h);
         if (crop_px) {
-            for (int y = 0; y < active_h; y++)
-                memcpy(crop_px + 4ull * y * active_w, px + 4ull * y * w, 4ull * active_w);
+            for (uint32_t y = 0; y < active_h; y++)
+                memcpy(crop_px + 4ull * y * active_w,
+                       px + 4ull * ((rect[1] + y) * (uint64_t)w + rect[0]), 4ull * active_w);
             rt_write_png(path, crop_px, active_w, active_h);
             free(crop_px);
             free(px);
@@ -259,7 +279,7 @@ static void save_shot(const tex_t *t, const char *path) {
 // present), box-filtered to 480x270; TOTK_SHOTS=w<lo>-<hi>:<step> takes them by world-clock seconds instead, the first
 // present at or after each step (full size with TOTK_SHOTS_FULL=1), for finding short glitches. Pipeline builds stay asynchronous, so the
 // pictures show what a player sees.
-static void series_shot(const tex_t *t, uint64_t n) {
+static void series_shot(const tex_t *t, const int crop[4], uint64_t n) {
     static int parsed;
     static unsigned long long lo, hi, step, next;
     static const char *dir;
@@ -287,10 +307,9 @@ static void series_shot(const tex_t *t, uint64_t n) {
     int bgra = fmt == NVN_FORMAT_BGRA8 || fmt == NVN_FORMAT_BGRA8_SRGB;
     if (!bgra && fmt != NVN_FORMAT_RGBA8 && fmt != NVN_FORMAT_RGBA8_SRGB) return;
     uint32_t w = t->d.width, h = t->d.height;
-    // MKW DRS presents into a 3840×2160 target with the active tile in the top-left (title ~1704×960).
-    // FULL series used to dump the whole black frame; crop like --shot so night fallbacks are usable.
-    uint32_t src_w = w, src_h = h, crop_x = 0, crop_y = 0;
-    if (full && w == 3840 && h == 2160) src_w = 1704, src_h = 960;
+    uint32_t rect[4];
+    presented_rect(t, crop, rect);
+    uint32_t crop_x = rect[0], crop_y = rect[1], src_w = rect[2], src_h = rect[3];
     uint32_t ow = full ? src_w : 480, oh = full ? src_h : 270;
     uint8_t *px = malloc(4ull * w * h), *out = malloc(4ull * ow * oh);
     if (!px || !out) rt_fatal("boot: out of memory for a TOTK_SHOTS frame");
@@ -326,12 +345,12 @@ static void series_shot(const tex_t *t, uint64_t n) {
 // A --seconds run ends at the first present after the world clock (game time since the save's first frame,
 // frame_step_world_us) passed S seconds, so a run covers the same game time at any frame rate; any other frame is
 // counted by the back end only.
-void rt_frame_presented(const tex_t *t, uint64_t n) {
+void rt_frame_presented(const tex_t *t, const int crop[4], uint64_t n) {
     const RtConfig *cfg = rt_config();
-    series_shot(t, n);
+    series_shot(t, crop, n);
     int64_t w = cfg->seconds ? frame_step_world_us() : -1;
     if (w < 0 || (double)w < cfg->seconds * 1e6) return;
-    if (cfg->shot) save_shot(t, cfg->shot);
+    if (cfg->shot) save_shot(t, crop, cfg->shot);
     GfxStats g = gfx_stats();
     rt_logf("boot: frames %llu presented (nvn calls %llu, distinct %llu, unimplemented %llu, validation errors %llu, "
            "shader failures %llu, draws skipped %llu)\n", (unsigned long long)g.frames,

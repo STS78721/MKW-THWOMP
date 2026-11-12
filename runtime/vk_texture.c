@@ -2035,9 +2035,19 @@ static VkSampler make_sampler(VkCtx *c, const samp_par *d) {
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
     float lim = c->props.limits.maxSamplerLodBias;
     si.mipLodBias = fmaxf(-lim, fminf(lim, d->lod_bias));
-    if (d->aniso > 1) {
+    // MKW_ANISO=N (Graphics tab, "game" by default): at least N-times anisotropic filtering on mipmapped samplers with
+    // linear minification, on top of what the game asks (adriadam10/mkw-recomp vk_tex_slots.c, MIT, Copyright (c) 2026
+    // Adrià). Samplers are made once per state, so it takes effect at the next start.
+    static float aniso_min = -1;
+    if (aniso_min < 0) {
+        aniso_min = (float)atof(cfg_value("MKW_ANISO"));   // "game": 0
+        if (aniso_min > 1) rt_log("vk: anisotropic filtering at least %gx (MKW_ANISO)", (double)aniso_min);
+    }
+    float aniso = d->aniso;
+    if (mf >= NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST && si.minFilter == VK_FILTER_LINEAR && aniso < aniso_min) aniso = aniso_min;
+    if (aniso > 1) {
         si.anisotropyEnable = VK_TRUE;
-        si.maxAnisotropy = fminf(d->aniso, c->props.limits.maxSamplerAnisotropy);
+        si.maxAnisotropy = fminf(aniso, c->props.limits.maxSamplerAnisotropy);
     }
     if (d->cmp_mode) {
         si.compareEnable = VK_TRUE;

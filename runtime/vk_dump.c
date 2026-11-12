@@ -25,6 +25,7 @@
 // before the submission (vk_exec_draw.c upd_note).
 // TOTK_DUMP_SKIP_RUNS=1: a render pass with the same targets as the render pass before it is logged but not copied
 // (the terrain decals draw one pass each into the G-buffer and would use up both caps).
+// MKW_DUMP_SKIP_IMAGES=1: keep pass logs and targeted buffer diagnostics, without the large PNG readbacks.
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -50,7 +51,7 @@ static uint64_t dump_frame, log_from;   // log_from: TOTK_DUMP_LOG, first frame 
 static char dir[400];
 static FILE *passes_f, *images_f;
 static int seq, finished, copied;      // copied: passes and dispatches of the dump frame whose images were copied
-static int skip_runs, dump_ubo;        // TOTK_DUMP_SKIP_RUNS, TOTK_DUMP_UBO
+static int skip_runs, skip_images, dump_ubo;   // TOTK_DUMP_SKIP_RUNS, MKW_DUMP_SKIP_IMAGES, TOTK_DUMP_UBO
 static uint32_t want_tex[16][2];       // TOTK_DUMP_TEX: slot id and 0, or width and height
 static int nwant_tex;
 static uint64_t last_targets;          // targets_sig of the last render pass; 0 after a dispatch
@@ -806,6 +807,112 @@ static void pick_report(void *arg) {   // completion thread, once
     rt_log("vk_dump: wrote %s (%d depth samples)", path, pick_n);
 }
 
+// MKW_DUMP_COLOR_PICK=x,y: on the F12 frame, sample a 3x3 patch around a suspect pixel before every draw into a
+// full-resolution R11G11B10 scene target. The depth picker cannot name a lighting draw that changes only colour.
+// This runs only in the dump frame and never adds a readback or a pass split to ordinary play.
+enum { COLOR_G = 9, COLOR_MAX = 4096, COLOR_STEP = 20 };
+typedef struct { int pass, pipe, draw; uint64_t prog; uint32_t w, h; } ColorEv;
+static int color_on = -1, color_x, color_y, color_n, color_pass_first = -1, color_reported;
+static VkBuffer color_buf;
+static VmaAllocation color_alloc;
+static ColorEv color_ev[COLOR_MAX];
+
+static int color_enabled(void) {
+    if (color_on >= 0) return color_on;
+    color_on = 0;
+    const char *e = cfg_get("MKW_DUMP_COLOR_PICK");
+    if (!e || !*e) return 0;
+    char *end;
+    unsigned long x = strtoul(e, &end, 10);
+    if (end == e || *end != ',') return 0;
+    const char *ystr = end + 1;
+    unsigned long y = strtoul(ystr, &end, 10);
+    if (end == ystr || *end || x > INT32_MAX || y > INT32_MAX) return 0;
+    color_x = (int)x, color_y = (int)y;
+    VkCtx *c = vk_ctx();
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                             .size = (VkDeviceSize)COLOR_MAX * COLOR_G * 4,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT};
+    if (c && vmaCreateBuffer(c->vma, &bi, &ai, &color_buf, &color_alloc, NULL) == VK_SUCCESS) color_on = 1;
+    rt_log("vk_dump: MKW_DUMP_COLOR_PICK %s at (%d,%d)", color_on ? "on" : "could not allocate buffer", color_x, color_y);
+    return color_on;
+}
+
+static int color_wanted(VkExec *ex) {
+    const VkExecTarget *t = &ex->color[0];
+    return color_enabled() && t->image && t->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+           ex->pass_w >= PICK_MIN_W && ex->pass_h >= PICK_MIN_W &&
+           (unsigned)color_x < t->width && (unsigned)color_y < t->height;
+}
+
+// Caller has ended rendering and put the target back in GENERAL.
+static void color_copy(VkExec *ex, int pipe, int draw) {
+    if (color_n >= COLOR_MAX) return;
+    const VkExecTarget *t = &ex->color[0];
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    VkBufferImageCopy r[COLOR_G];
+    for (int g = 0; g < COLOR_G; g++) {
+        int x = color_x + (g % 3 - 1) * COLOR_STEP, y = color_y + (g / 3 - 1) * COLOR_STEP;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if ((uint32_t)x >= t->width) x = (int)t->width - 1;
+        if ((uint32_t)y >= t->height) y = (int)t->height - 1;
+        r[g] = (VkBufferImageCopy){.bufferOffset = ((VkDeviceSize)color_n * COLOR_G + g) * 4,
+                                   .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, t->level, t->base_layer, 1},
+                                   .imageOffset = {x, y, 0}, .imageExtent = {1, 1, 1}};
+    }
+    vkCmdCopyImageToBuffer(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, color_buf, COLOR_G, r);
+    ex->recorded += 2;
+    color_ev[color_n++] = (ColorEv){seq_now(), pipe, draw, ex->prog ? ex->prog->serial : 0, t->width, t->height};
+}
+
+static void color_before_draw(VkExec *ex, int pipe, int draw) {
+    if (!ex->in_pass || !color_wanted(ex) || color_n >= COLOR_MAX) return;
+    if (color_pass_first < 0) color_pass_first = color_n;
+    vkCmdEndRendering(ex->cb);
+    ex->in_pass = 0;
+    vk_exec_barrier(ex);
+    color_copy(ex, pipe, draw);
+    vk_exec_pass_begin(ex);
+}
+
+static void color_report(void) {
+    VkCtx *c = vk_ctx();
+    void *map = NULL;
+    char path[460];
+    snprintf(path, sizeof path, "%s/color-pick.txt", dir);
+    FILE *f = fopen(path, "w");
+    if (!f || !c || vmaMapMemory(c->vma, color_alloc, &map) != VK_SUCCESS) {
+        if (f) fclose(f);
+        return;
+    }
+    vmaInvalidateAllocation(c->vma, color_alloc, 0, VK_WHOLE_SIZE);
+    const uint32_t *v = map;
+    fprintf(f, "# R11G11B10 packed colour before each draw; a -> b names the draw that changed a sample\n");
+    for (int i = 1; i < color_n; i++) {
+        const ColorEv *a = &color_ev[i - 1], *b = &color_ev[i];
+        if (a->pass != b->pass || a->pipe < 0) continue;
+        for (int g = 0; g < COLOR_G; g++) {
+            uint32_t x = v[(size_t)(i - 1) * COLOR_G + g], y = v[(size_t)i * COLOR_G + g];
+            if (x == y) continue;
+            int px = color_x + (g % 3 - 1) * COLOR_STEP, py = color_y + (g / 3 - 1) * COLOR_STEP;
+            fprintf(f, "pass %04d pipe %d draw %d prog %llu at (%d,%d): %08x -> %08x\n",
+                    a->pass, a->pipe, a->draw, (unsigned long long)a->prog, px, py, x, y);
+        }
+    }
+    vmaUnmapMemory(c->vma, color_alloc);
+    fclose(f);
+    rt_log("vk_dump: wrote %s (%d colour samples)", path, color_n);
+}
+
 static int seq_now(void) { return seq; }
 
 // The dump pass number and the draw number in it (as pick.txt and passes.txt count them) of the draw being recorded.
@@ -835,6 +942,7 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
         if (ents[i].p == p && ents[i].th == th) {
             ents[i].draws++;
             pick_before_draw(ex, i, pass_draws);
+            color_before_draw(ex, i, pass_draws);
             goto out;
         }
     if (nents == MAX_ENTS) {
@@ -852,6 +960,7 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
     describe_bindings(&b, ex, info);
     ents[nents++] = (Ent){p, th, 1, b.s};
     pick_before_draw(ex, nents - 1, pass_draws);
+    color_before_draw(ex, nents - 1, pass_draws);
 out:
     plat_mutex_unlock(&rec_lock);
 }
@@ -894,7 +1003,8 @@ static uint64_t targets_sig(const VkExec *ex) {
 // Sets pass_skip for the pass or dispatch being logged and counts it when it copies.
 static void pass_decide(int same_targets) {
     if (frame_now() != dump_frame) copied = 0;
-    pass_skip = copied >= MAX_PASSES ? "pass cap" : same_targets ? "same targets as the previous pass" : NULL;
+    pass_skip = skip_images ? "images disabled" : copied >= MAX_PASSES ? "pass cap" :
+                same_targets ? "same targets as the previous pass" : NULL;
     if (!pass_skip) copied++;
 }
 
@@ -903,6 +1013,8 @@ void vk_dump_pass_end(VkExec *ex) {
     if (!active()) goto out;
     if (pick_pass_first >= 0 && pick_wanted(ex)) vk_exec_barrier(ex), pick_copy(ex, -1, pass_draws);
     pick_pass_first = -1;
+    if (color_pass_first >= 0 && color_wanted(ex)) vk_exec_barrier(ex), color_copy(ex, -1, pass_draws);
+    color_pass_first = -1;
     int n = seq++;
     uint64_t sig = targets_sig(ex);
     pass_decide(skip_runs && sig == last_targets);
@@ -1089,6 +1201,8 @@ void vk_dump_init(void) {
     if (lf && *lf) log_from = strtoull(lf, NULL, 10);
     const char *sr = cfg_get("TOTK_DUMP_SKIP_RUNS");
     skip_runs = sr && *sr && *sr != '0';
+    const char *si = cfg_get("MKW_DUMP_SKIP_IMAGES");
+    skip_images = si && *si && *si != '0';
     const char *du = cfg_get("TOTK_DUMP_UBO");
     dump_ubo = du && *du && *du != '0';
     const char *dl = cfg_get("TOTK_DUMP_LAYERS");
@@ -1125,6 +1239,7 @@ void vk_dump_present(uint64_t frame) {
     plat_mutex_unlock(&rec_lock);
     vk_sync_finish();   // the frame's copies are converted and written
     if (pick_on > 0 && pick_n && !pick_reported) pick_reported = 1, pick_report(NULL);
+    if (color_on > 0 && color_n && !color_reported) color_reported = 1, color_report();
     plat_mutex_lock(&img_lock);
     fclose(images_f);
     images_f = NULL;

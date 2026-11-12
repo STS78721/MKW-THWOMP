@@ -225,6 +225,9 @@ static uint64_t lifted_function(uintptr_t rip) {
     return lo ? fn_rev[lo - 1].guest : 0;
 }
 
+// skin write-watch (ov_system.c): the lifted function at a host code address
+uint64_t rt_lifted_function(uintptr_t rip) { return lifted_function(rip); }
+
 static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
 
 static void crash_handler(const PlatCrash *x) {
