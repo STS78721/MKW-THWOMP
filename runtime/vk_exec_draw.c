@@ -69,6 +69,7 @@ static const uint64_t *c0_tex, *c0_img;
 static uint8_t geometry_input;                              // normalized actual draw primitive; zero outside opt-in GS
 #define ONESHOT_WAIT_MS 1500u   // prepare_draw: capped to 1.5s to prevent Windows TDR (2s watchdog timeout) crashes
 
+int vk_dump_active(void);   // vk_dump.c: the replay is in the dump frame
 static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_lay = gfx_shader_c0_layout(cs);
     c0_push = ex->push[1];
@@ -1815,7 +1816,16 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
             // Bare+written: bind the guessed range without write-back, then stamp only the head (Hookshot).
             if (bare && wb) wb = 0;
         }
-        if (bind_range(ex, at, want, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO, may_write, wb, guarded, &bi)) {
+        int bound_ok = bind_range(ex, at, want, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO, may_write, wb, guarded, &bi);
+        if (vk_dump_armed && st == NVN_STAGE_CS && vk_dump_active()) {   // capture frame: what each compute binding got
+            static int nlog;
+            if (nlog++ < 4000)
+                rt_log("dbind cs %s handle %#x slot %d addr %#llx size %#llx lead %#llx want %#llx -> %s offset %#llx range %#llx",
+                       ubo ? "ubo" : "ssbo", r->handle * 4, slot, (unsigned long long)b->addr, (unsigned long long)b->size,
+                       (unsigned long long)lead, (unsigned long long)want, bound_ok ? "bound" : "FAILED",
+                       (unsigned long long)bi.offset, (unsigned long long)bi.range);
+        }
+        if (bound_ok) {
             if (real_write && bi.buffer != VK_NULL_HANDLE) {
                 uint64_t wb_n = bi.range;
                 if (mesh && bare) {
@@ -3437,38 +3447,47 @@ static int indirect_reset_draw(VkExec *ex, const p_draw *d) {
 
 
 
-// MKW_DUMP_INST=<NVN 2 vertex origin, hex> (default 1cdcc0fd9dee5df9, the Mario Circuit tree that turned into phantom
-// trunks): in the dump frame, every draw whose vertex stage has that origin is traced. At the end of its render pass
-// (inside the pass no copy is allowed; the draws do not change what they read) the GPU copies its indirect commands,
-// its draw count and the storage buffer of slot 5 (c0+0x160, the 80-byte per-instance records) into a readback buffer;
-// on completion the log gets "dinst" lines: the kind, the commands and the records the drawn instances read (the 3x4
-// transform's translation and row lengths, the phase word).
-enum { INST_CMDS = 8, INST_PENDING = 64, INST_REC = 80 };
+// MKW_DUMP_INST=<NVN 2 vertex origin, hex> | all (default 1cdcc0fd9dee5df9, the Mario Circuit tree that turned into
+// phantom trunks): in the dump frame, every draw whose vertex stage has that origin (all: every draw of a pass at least
+// 1000 wide that binds vertex storage slot 5) is traced. At the end of its render pass (inside the pass no copy is
+// allowed; the draws do not change what they read) the GPU copies its indirect commands and draw count, and once per
+// pass and buffer the storage buffer of slot 5 (c0+0x160, the 80-byte per-instance records), into readback buffers.
+// On completion the log gets "dinst" lines: the dump pass and draw number (as in pick.txt, MKW_DUMP_PICK=1), the vertex
+// origin, the commands and the records the drawn instances read (translation, row lengths, phase word).
+enum { INST_CMDS = 8, INST_PENDING = 1024, INST_REC = 80 };
+typedef struct {   // one slot-5 snapshot, shared by the traces of a pass that read the same range
+    VkBuffer b;
+    VmaAllocation a;
+    int refs;
+} InstSnap;
 typedef struct {
     int kind;                 // 0 direct, 1 indexed, 2 indirect, 3 indirect count
     uint32_t base, count;     // direct draws: base instance, instances
     uint32_t ncmd, stride, max;
     VkMemSpan args, cnt, sb;  // spans to copy (buffer 0: none)
-    uint64_t sb_size;
+    uint64_t sb_size, origin, ind_addr;
     uint32_t seq;
+    int pass, draw;
     VkBuffer rb;
     VmaAllocation ra;
-    uint64_t off_args, off_cnt, off_sb;
+    uint64_t off_args, off_cnt;
+    InstSnap *snap;
 } InstTrace;
 static InstTrace *inst_pending[INST_PENDING];
 static int inst_npending;
 
+enum { INST_ALL = 2 };
 static uint64_t inst_origin(void) {
     static uint64_t o = 1;
     if (o == 1) {
         const char *e = cfg_get("MKW_DUMP_INST");
-        o = e && *e ? strtoull(e, NULL, 16) : 0x1cdcc0fd9dee5df9ull;
+        o = e && !strcmp(e, "all") ? INST_ALL : e && *e ? strtoull(e, NULL, 16) : 0x1cdcc0fd9dee5df9ull;
     }
     return o;
 }
 
-static void inst_print(const InstTrace *t, const uint8_t *m, uint32_t first, uint32_t n) {
-    if (!t->sb.buffer) return;
+static void inst_print(const InstTrace *t, const uint8_t *sb, uint32_t first, uint32_t n) {
+    if (!sb) return;
     for (uint32_t k = 0; k < n && k < 6; k++) {
         uint64_t o = (uint64_t)(first + k) * INST_REC;
         if (o + INST_REC > t->sb_size) {
@@ -3476,7 +3495,7 @@ static void inst_print(const InstTrace *t, const uint8_t *m, uint32_t first, uin
                    (unsigned long long)t->sb_size);
             break;
         }
-        const float *r = (const float *)(m + t->off_sb + o);
+        const float *r = (const float *)(sb + o);
         float sx = sqrtf(r[0] * r[0] + r[4] * r[4] + r[8] * r[8]);
         float sy = sqrtf(r[1] * r[1] + r[5] * r[5] + r[9] * r[9]);
         float sz = sqrtf(r[2] * r[2] + r[6] * r[6] + r[10] * r[10]);
@@ -3485,51 +3504,176 @@ static void inst_print(const InstTrace *t, const uint8_t *m, uint32_t first, uin
     }
 }
 
-static void inst_cb(void *arg) {   // completion thread
+static void inst_cb(void *arg) {   // completion thread (callbacks run one at a time)
     InstTrace *t = arg;
     static const char *const kn[] = {"draw", "draw-idx", "indirect", "indirect-count"};
     VkCtx *c = vk_ctx();
-    void *map = NULL;
+    void *map = NULL, *smap = NULL;
     if (!c || vmaMapMemory(c->vma, t->ra, &map) != VK_SUCCESS) goto out;
     vmaInvalidateAllocation(c->vma, t->ra, 0, VK_WHOLE_SIZE);
-    const uint8_t *m = map;
+    if (t->snap && vmaMapMemory(c->vma, t->snap->a, &smap) == VK_SUCCESS)
+        vmaInvalidateAllocation(c->vma, t->snap->a, 0, VK_WHOLE_SIZE);
+    const uint8_t *m = map, *sb = smap;
     if (t->kind < 2) {
-        rt_log("dinst #%u %s base %u instances %u", t->seq, kn[t->kind], t->base, t->count);
-        inst_print(t, m, t->base, t->count);
+        rt_log("dinst #%u pass %04d draw %d vs %016llx %s base %u instances %u", t->seq, t->pass, t->draw,
+               (unsigned long long)t->origin, kn[t->kind], t->base, t->count);
+        inst_print(t, sb, t->base, t->count);
     } else {
         uint32_t n = t->kind == 3 ? *(const uint32_t *)(m + t->off_cnt) : 1;
-        rt_log("dinst #%u %s draws %u (max %u)", t->seq, kn[t->kind], n, t->max);
+        rt_log("dinst #%u pass %04d draw %d vs %016llx %s draws %u (max %u) args %#llx", t->seq, t->pass, t->draw,
+               (unsigned long long)t->origin, kn[t->kind], n, t->max, (unsigned long long)t->ind_addr);
         for (uint32_t i = 0; i < n && i < t->ncmd; i++) {
             const uint32_t *a = (const uint32_t *)(m + t->off_args + (uint64_t)i * t->stride);
             rt_log("dinst #%u   cmd %u: indices %u instances %u first index %u vertex offset %d first instance %u", t->seq,
                    i, a[0], a[1], a[2], (int32_t)a[3], a[4]);
-            inst_print(t, m, a[4], a[1]);
+            inst_print(t, sb, a[4], a[1]);
         }
     }
+    if (smap) vmaUnmapMemory(c->vma, t->snap->a);
     vmaUnmapMemory(c->vma, t->ra);
 out:
     if (c) vmaDestroyBuffer(c->vma, t->rb, t->ra);
+    if (t->snap && --t->snap->refs == 0) {
+        if (c) vmaDestroyBuffer(c->vma, t->snap->b, t->snap->a);
+        free(t->snap);
+    }
     free(t);
 }
 
 int vk_dump_active(void);
+void vk_dump_where(int *pass, int *draw);
 static void inst_trace(VkExec *ex, int kind, uint32_t base, uint32_t count, uint64_t ind, uint64_t cnt, uint32_t max,
                        uint32_t stride) {
-    if (!vk_dump_armed || !inst_origin() || inst_npending == INST_PENDING || !ex->prog || !vk_dump_active()) return;
+    uint64_t want = inst_origin();
+    if (!vk_dump_armed || !want || inst_npending == INST_PENDING || !ex->prog || !vk_dump_active()) return;
     const uint8_t *ctl, *code = NULL;
     uint32_t len;
-    if (!find_stage(ex->prog, NVN_STAGE_VS, &ctl, &code, &len) || nvn2_origin(code) != inst_origin()) return;
+    if (!find_stage(ex->prog, NVN_STAGE_VS, &ctl, &code, &len)) return;
+    uint64_t origin = nvn2_origin(code);
+    const p_bind_buf *b = &ex->ssbo[NVN_STAGE_VS][5];
+    if (want == INST_ALL ? ex->pass_w < 1000 || !b->addr : origin != want) return;
     static uint32_t seq;
     InstTrace *t = calloc(1, sizeof *t);
     if (!t) return;
     t->kind = kind, t->base = base, t->count = count, t->max = max, t->stride = stride, t->seq = ++seq;
+    t->origin = origin, t->ind_addr = ind;
+    vk_dump_where(&t->pass, &t->draw);
     t->ncmd = max < INST_CMDS ? max : INST_CMDS;
     if (ind && !vk_mem_resolve(ind, (uint64_t)stride * t->ncmd, &t->args)) t->args.buffer = VK_NULL_HANDLE;
     if (cnt && !vk_mem_resolve(cnt, 4, &t->cnt)) t->cnt.buffer = VK_NULL_HANDLE;
-    const p_bind_buf *b = &ex->ssbo[NVN_STAGE_VS][5];
     t->sb_size = b->size;
     if (!b->addr || !b->size || !vk_mem_resolve(b->addr, b->size, &t->sb)) t->sb.buffer = VK_NULL_HANDLE;
     inst_pending[inst_npending++] = t;
+}
+
+static int inst_buffer(VkCtx *c, uint64_t size, VkBuffer *b, VmaAllocation *a) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size ? size : 16,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT};
+    return c && vmaCreateBuffer(c->vma, &bi, &ai, b, a, NULL) == VK_SUCCESS;
+}
+
+// MKW_DUMP_CS=<NVN 2 compute origins, hex, comma separated> (default: MKW's object culling / LOD selection passes
+// c287454e752c5e54, 0050df6cc6c1b5ce, 14293e2831001e91): in the dump frame, right before each dispatch of those
+// programs, the c0 bank the dispatch binds and a GPU copy of every bound uniform and storage buffer (the state the
+// shader starts from) go to the dump folder as cs<n>_<origin>_c0.bin, _u<slot>_<addr>.bin and _s<slot>_<addr>.bin;
+// the log gets one "dcs" line per file. Used to recompute the LOD choice of each object offline.
+enum { CS_SNAP_MAX = 24, CS_SNAP_BYTES = 64u << 20 };
+typedef struct {
+    char name[200];
+    VkBuffer b;
+    VmaAllocation a;
+    uint64_t size;
+} CsFile;
+
+const char *vk_dump_dir(void);
+
+static int cs_snap_wanted(uint64_t origin) {
+    static uint64_t list[8];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char *e = cfg_get("MKW_DUMP_CS");
+        if (!e || !*e) e = "c287454e752c5e54,0050df6cc6c1b5ce,14293e2831001e91,104bd69caf1f4c09,e8dae91b1570941b";
+        while (*e && n < 8) {
+            char *end;
+            uint64_t v = strtoull(e, &end, 16);
+            if (end == e) break;
+            list[n++] = v;
+            e = *end == ',' ? end + 1 : end;
+        }
+    }
+    for (int i = 0; i < n; i++)
+        if (list[i] == origin) return 1;
+    return 0;
+}
+
+static void cs_file_cb(void *arg) {   // completion thread
+    CsFile *f = arg;
+    VkCtx *c = vk_ctx();
+    void *map = NULL;
+    if (c && vmaMapMemory(c->vma, f->a, &map) == VK_SUCCESS) {
+        vmaInvalidateAllocation(c->vma, f->a, 0, VK_WHOLE_SIZE);
+        FILE *o = fopen(f->name, "wb");
+        if (o) fwrite(map, 1, (size_t)f->size, o), fclose(o);
+        vmaUnmapMemory(c->vma, f->a);
+    }
+    if (c) vmaDestroyBuffer(c->vma, f->b, f->a);
+    free(f);
+}
+
+static void cs_snap_copy(VkExec *ex, const char *base, char kind, int slot, const p_bind_buf *bb) {
+    if (!bb->addr || !bb->size || bb->size > CS_SNAP_BYTES) return;
+    VkMemSpan sp;
+    if (!vk_mem_resolve(bb->addr, bb->size, &sp)) return;
+    CsFile *f = calloc(1, sizeof *f);
+    if (!f) return;
+    f->size = bb->size;
+    snprintf(f->name, sizeof f->name, "%s_%c%d_%llx.bin", base, kind, slot, (unsigned long long)bb->addr);
+    if (!inst_buffer(vk_ctx(), f->size, &f->b, &f->a)) {
+        free(f);
+        return;
+    }
+    VkBufferCopy cp = {sp.offset, 0, f->size};
+    vkCmdCopyBuffer(ex->cb, sp.buffer, f->b, 1, &cp);
+    ex->recorded++;
+    rt_log("dcs %s %c%d addr %#llx size %#llx", base, kind, slot, (unsigned long long)bb->addr, (unsigned long long)bb->size);
+    vk_completion_add(ex->fence, cs_file_cb, f);
+}
+
+// Before vkCmdDispatch / vkCmdDispatchIndirect, after bind_resources (outside any render pass); post: right after the
+// dispatch (files cs<n>_<origin>_post_*), the same buffers as the dispatch left them.
+static int cs_snap_n;
+static void cs_snap(VkExec *ex, int post) {
+    int done = cs_snap_n;
+    if (!vk_dump_armed || (post ? done - 1 : done) >= CS_SNAP_MAX || (post && !done) || !ex->prog || !vk_dump_active()) return;
+    const uint8_t *ctl, *code = NULL;
+    uint32_t len;
+    if (!find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) return;
+    uint64_t origin = nvn2_origin(code);
+    if (!cs_snap_wanted(origin)) return;
+    char base[160];
+    snprintf(base, sizeof base, "%s/cs%d_%016llx%s", vk_dump_dir(), post ? done - 1 : done, (unsigned long long)origin,
+             post ? "_post" : "");
+    if (!post) cs_snap_n++;
+    uint8_t bank[VK_C0_BYTES];
+    vk_c0_fill(bank, NVN_STAGE_CS, ex->ssbo[NVN_STAGE_CS], ex->ubo[NVN_STAGE_CS], c0_dim, c0_binst);
+    char path[200];
+    snprintf(path, sizeof path, "%s_c0.bin", base);
+    FILE *o = fopen(path, "wb");
+    if (o) fwrite(bank, 1, sizeof bank, o), fclose(o);
+    rt_log("dcs %s c0 (dispatch dims %u %u %u)", base, c0_dim[0], c0_dim[1], c0_dim[2]);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    for (int i = 0; i < 18; i++) cs_snap_copy(ex, base, 'u', i, &ex->ubo[NVN_STAGE_CS][i]);
+    for (int i = 0; i < 16; i++) cs_snap_copy(ex, base, 's', i, &ex->ssbo[NVN_STAGE_CS][i]);
+    vkCmdPipelineBarrier2(ex->cb, &di);   // the dispatch's own writes come after the copies
+    ex->recorded += 2;
 }
 
 // vk_exec_pass_end, after vkCmdEndRendering: the copies of the traced draws of this pass.
@@ -3537,17 +3681,31 @@ void vk_exec_inst_pass_end(VkExec *ex) {
     VkCtx *c = vk_ctx();
     for (int i = 0; i < inst_npending; i++) {
         InstTrace *t = inst_pending[i];
-        uint64_t sz = 0;
-        t->off_args = sz, sz += t->args.buffer ? (uint64_t)t->stride * t->ncmd : 0;
+        uint64_t sz = t->args.buffer ? (uint64_t)t->stride * t->ncmd : 0;
+        t->off_args = 0;
         sz = (sz + 15) & ~15ull, t->off_cnt = sz, sz += 16;
-        t->off_sb = sz, sz += t->sb.buffer ? t->sb_size : 0;
-        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sz,
-                                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT};
-        if (!c || vmaCreateBuffer(c->vma, &bi, &ai, &t->rb, &t->ra, NULL) != VK_SUCCESS) {
+        if (!inst_buffer(c, sz, &t->rb, &t->ra)) {
             free(t);
+            inst_pending[i] = NULL;
             continue;
+        }
+        if (t->sb.buffer) {   // share one snapshot per buffer range in this pass
+            for (int j = 0; j < i && !t->snap; j++) {
+                InstTrace *u = inst_pending[j];
+                if (u && u->snap && u->sb.buffer == t->sb.buffer && u->sb.offset == t->sb.offset && u->sb_size == t->sb_size)
+                    t->snap = u->snap, t->snap->refs++;
+            }
+            if (!t->snap) {
+                InstSnap *s = calloc(1, sizeof *s);
+                if (s && inst_buffer(c, t->sb_size, &s->b, &s->a)) {
+                    VkBufferCopy cp = {t->sb.offset, 0, t->sb_size};
+                    vkCmdCopyBuffer(ex->cb, t->sb.buffer, s->b, 1, &cp);
+                    ex->recorded++;
+                    s->refs = 1, t->snap = s;
+                } else {
+                    free(s);
+                }
+            }
         }
         if (t->args.buffer) {
             VkBufferCopy cp = {t->args.offset, t->off_args, (uint64_t)t->stride * t->ncmd};
@@ -3557,12 +3715,7 @@ void vk_exec_inst_pass_end(VkExec *ex) {
             VkBufferCopy cp = {t->cnt.offset, t->off_cnt, 4};
             vkCmdCopyBuffer(ex->cb, t->cnt.buffer, t->rb, 1, &cp);
         }
-        if (t->sb.buffer) {
-            VkBufferCopy cp = {t->sb.offset, t->off_sb, t->sb_size};
-            vkCmdCopyBuffer(ex->cb, t->sb.buffer, t->rb, 1, &cp);
-        }
-        ex->recorded += 3;
-        vk_completion_add(ex->fence, inst_cb, t);
+        ex->recorded += 2;
     }
     if (inst_npending) {
         VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -3571,6 +3724,8 @@ void vk_exec_inst_pass_end(VkExec *ex) {
         VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
         vkCmdPipelineBarrier2(ex->cb, &di);
         ex->recorded++;
+        for (int i = 0; i < inst_npending; i++)
+            if (inst_pending[i]) vk_completion_add(ex->fence, inst_cb, inst_pending[i]);
     }
     inst_npending = 0;
 }
@@ -3772,7 +3927,9 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
+    cs_snap(ex, 0);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    cs_snap(ex, 1);
     ex->recorded++;
     note_work(ex, 2, (uint64_t)d->x * (uint64_t)d->y * (uint64_t)d->z);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
@@ -3810,7 +3967,9 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         vk_exec_barrier(ex);
         B.c0_valid[2] = 0;   // the range no longer holds B.c0[2]
     }
+    cs_snap(ex, 0);
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
+    cs_snap(ex, 1);
     ex->recorded++;
     note_work(ex, 3, 0);
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));

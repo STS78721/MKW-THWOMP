@@ -177,3 +177,22 @@ Phase 2 fixes is needed; the mesh-shader rewrite is the largest piece if that is
      combined with `BC3 recompress` (`ASTC_BC` default on), even on a 16 GB RTX 5070 Ti.
    - `getMaxAllocatableSize` on streaming heap `0x283cb0440` returned `0` 20 times during boot/course load (`mkw.log`
      lines 2124–2149).
+
+## ROOT CAUSE FOUND (2026-11-12): phantom trees and blinking foliage
+
+Confirmed fixed by the user on Mario Circuit.
+
+- MKW culls and sorts its instanced objects on the GPU:
+  - `14293e2831001e91` counts visible objects per (type, LOD) slot;
+  - `104bd69caf1f4c09` turns the counts into each draw's first instance with a warp prefix sum, plus one global atomic
+    per warp for the warp's base;
+  - `e8dae91b1570941b` writes the 80-byte instance records at those offsets.
+- The warp total was summed with lane values masked by `ballot(true)`. The translator's AST optimizer propagated that
+  ballot into its uses inside the elected-lane branch, where only one lane is active. The total became one lane's count,
+  every warp's base came out 0 (the global counter stayed 0), and different object types' instance ranges overlapped:
+  - the giant tree mesh was drawn with the bushes' records (type 25, radius 0.7);
+  - objects overwrote each other's records in warp order (blinking foliage).
+- Fix: `tools/xlate/patches/0027-keep-warp-operations-in-place.patch` (no propagation of Ballot / Shuffle* / Vote*).
+  Verified: the counter ends at the total of the counts, and the per-type ranges are disjoint (`tools/cull_chain.py`).
+- Found with `MKW_DUMP_PICK` (depth grid per draw), `MKW_DUMP_INST=all` (instance commands and records), `MKW_DUMP_CS`
+  (before / after snapshots of the culling passes), `tools/lod_recompute.py` and `tools/cull_chain.py`.

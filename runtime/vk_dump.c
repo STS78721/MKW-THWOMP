@@ -808,6 +808,16 @@ static void pick_report(void *arg) {   // completion thread, once
 
 static int seq_now(void) { return seq; }
 
+// The dump pass number and the draw number in it (as pick.txt and passes.txt count them) of the draw being recorded.
+void vk_dump_where(int *pass, int *draw) {
+    plat_mutex_lock(&rec_lock);
+    *pass = seq, *draw = pass_draws;
+    plat_mutex_unlock(&rec_lock);
+}
+
+// The dump folder (vk_exec_draw.c MKW_DUMP_CS).
+const char *vk_dump_dir(void) { return dir; }
+
 // Whether the replay is in the dump frame (vk_exec_draw.c MKW_DUMP_INST).
 int vk_dump_active(void) {
     plat_mutex_lock(&rec_lock);

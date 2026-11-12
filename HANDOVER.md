@@ -89,7 +89,15 @@ A key missing from the known list in `runtime/cfg.c` still works but logs "unkno
 - Licence note: the user received a review of this repo from someone working on another MKW port ("MKWRecomp"),
   which is GPL-3. Take facts from it, never code.
 
-## 5. The open bug: phantom / exploding trees (top priority)
+## 5. Phantom / exploding trees and blinking foliage: FIXED 2026-11-12
+
+**Root cause:** the shader translator's AST optimizer copied a warp `ballot(true)` into a one-lane branch of MKW's
+instance-compaction compute shader (`104bd69caf1f4c09`). Each warp's instance offset became 0, so different object
+types' instance ranges overlapped. **Fix:** translator patch `0027-keep-warp-operations-in-place.patch`, confirmed
+by the user on Mario Circuit. Details: `research_notes/foliage-popin-plan.md`, last section. The history below is
+kept for reference. The base-instance rewrite was also needed and stays.
+
+### History of the investigation
 
 ### Symptom (Mario Circuit, user screenshots)
 
