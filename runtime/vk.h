@@ -45,7 +45,9 @@ typedef struct VkCtx {
         gpu_is_intel,
         gpu_is_intel_arc,
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
-        has_mesh_shader;                    // VK_EXT_mesh_shader (taskShader + meshShader)
+        has_mesh_shader,                    // VK_EXT_mesh_shader (taskShader + meshShader)
+        gfx_sparse_queue,                   // gfx_family supports VK_QUEUE_SPARSE_BINDING_BIT
+        has_sparse;                         // sparseBinding + sparseResidencyImage2D + sparseResidencyAliased on gfx_queue
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -315,10 +317,12 @@ enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
 int vk_astc_native(VkFormat astc_fmt);  // 1: images of this ASTC format are created as such and get the raw blocks
 int vk_astc_gpu(void);                  // 1: ASTC images decoded to RGBA8 by the compute decoder (vk_astc_record)
+VkFormat vk_astc_bc_format(int srgb);   // the encoded format: BC7 when the device samples it (MKW_ASTC_BC7), else BC3
 int vk_astc_bc(void);                   // 1: those images are BC3 instead, encoded after the decode (TOTK_ASTC_BC=1)
 // One image region decoded from raw blocks: tight rows of 16-byte blocks at byte src of the source buffer (slices one
-// after the other), w x h texels and slices deep, written at offset of level / layer.
-typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset3D offset; } VkAstcRegion;
+// after the other), w x h texels and slices deep, written at offset of level / layer. lw, lh (nonzero): destination
+// mip dimensions, so BC7 block-rounded copy extents clamp to the mip edge (VUID 00207/00208).
+typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer, lw, lh; VkOffset3D offset; } VkAstcRegion;
 // Records into cb, the open upload batch (between vk_upload_begin and vk_upload_end): src (TRANSFER_SRC, src_size
 // bytes of blocks) goes to a device-local scratch buffer, a dispatch per region decodes it, and the texels are copied
 // into img (VK_IMAGE_LAYOUT_GENERAL). The caller records its usual barriers around an image copy before and after the
@@ -366,7 +370,22 @@ typedef struct {
                                    // attach it in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT (vk_exec.c vk_exec_pass_begin)
     uint8_t host_mip0;             // guest mip skipped at the top so a huge ASTC array fits (CompactLayers): host level 0
                                    // is guest level host_mip0; width/height/levels describe the trimmed host image
+    uint8_t sparse;                // Vulkan sparse image backed by tile slots (vk_sparse.c)
 } VkTexImage;
+
+typedef struct { VkSemaphore wsem, ssem; uint64_t wait, signal; } VkSparseOrder;
+int vk_mem_virt_phys(uint64_t addr, uint64_t size, uint64_t *phys);
+int vk_sparse_on(void);
+int vk_sparse_create(const VkImageCreateInfo *ci0, const nvn_texdesc *d, uint64_t addr, uint64_t size, VkImage *out);
+uint64_t vk_sparse_destroy(VkImage img);
+int vk_sparse_is(VkImage img);
+void vk_sparse_remap(uint64_t lo, uint64_t size);
+void vk_sparse_written(VkImage img, uint32_t level, uint32_t layer0, uint32_t layers, int32_t x, int32_t y, uint32_t w, uint32_t h);
+VkSparseOrder vk_sparse_order(uint64_t fence, int binds);
+void vk_sparse_shutdown(void);
+int vk_texture_astc_copy(const tex_t *src, uint32_t level, uint32_t layer, uint32_t layers, uint32_t x, uint32_t y,
+                         uint32_t w, uint32_t h, const VkTexImage *dst, VkImageAspectFlags aspect, uint32_t dlevel,
+                         uint32_t dlayer, int32_t dx, int32_t dy, int bc);
 const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
 // A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c).
 const VkTexImage *vk_texture_by_id(const dpool_ref *pool, int id, view_t *view, int *has_view);

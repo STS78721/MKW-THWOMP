@@ -1,5 +1,6 @@
 // NVN2 DrawMeshTasks replay: Eden task/mesh SPIR-V + VK_EXT_mesh_shader.
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "eden_mesh.h"
@@ -128,21 +129,21 @@ static const GfxShader *translate_mesh_stage(const uint8_t *ctl, const uint8_t *
     return s;
 }
 
-// True when any component of generic g is enabled in an SPH omap_generic_vector (byte offset 24).
+// True when any component of generic g is enabled in an SPH omap_generic_vector (byte offset 54).
 static int sph_generic_any(const uint8_t *sph, int g) {
     if (!sph || g < 0 || g >= 32) return 0;
-    int data = sph[24 + (g >> 1)] >> ((g & 1) * 4);
+    int data = sph[54 + (g >> 1)] >> ((g & 1) * 4);
     return (data & 0xf) != 0;
 }
 
-// SPH usable for AddMeshLines generics: any omap_generic bit, or systemb (offset 23) bits AddMeshLines
-// understands. Word0 alone (type/version) is NOT enough — MKW's len=0 stage 0 often has that with an
-// empty omap, which left prim_sph=1 but still mout holes (n256).
+// SPH usable for AddMeshLines generics: any omap_generic bit (offset 54..69), or systemb (offset 53)
+// bits AddMeshLines understands. Word0 alone (type/version) is NOT enough — MKW's len=0 stage 0 often
+// has that with an empty omap, which left prim_sph=1 but still mout holes (n256).
 static int sph_has_mesh_outputs(const uint8_t *sph) {
     if (!sph) return 0;
-    if (sph[23]) return 1;
+    if (sph[53]) return 1;
     for (int i = 0; i < 16; i++)
-        if (sph[24 + i]) return 1;
+        if (sph[54 + i]) return 1;
     return 0;
 }
 
@@ -193,7 +194,7 @@ static const uint8_t *synth_prim_sph_from_mesh(const uint8_t *mcode, uint32_t ml
     uint32_t w0 = 2u | (4u << 5);
     memcpy(synth, &w0, 4);
     for (int g = 0; g < min_vert; g++)
-        synth[24 + (g >> 1)] = (uint8_t)(synth[24 + (g >> 1)] | (0xfu << ((g & 1) * 4)));
+        synth[54 + (g >> 1)] = (uint8_t)(synth[54 + (g >> 1)] | (0xfu << ((g & 1) * 4)));
     static int synth_log;
     if (synth_log++ < 6)
         rt_log("vk_mesh: synth MeshPrimitiveHeader generics 0..%d (mesh vertex min=%d)", min_vert - 1, min_vert);
@@ -314,8 +315,9 @@ static int mesh_empty_draw(void) {
 
 // NVN indirect mesh args are {count, first} (8 bytes). VK_EXT_mesh_shader wants {x,y,z}. Feeding the NVN
 // buffer as-is sets groupCountY = first (usually 0) → zero workgroups, silent empty draws (missing foliage /
-// props / terrain strips). Rewrite into a ring of {count, 1, 1} like Hookshot vk_draw.cpp mesh_args_ready.
-enum { MESH_ARGS = 1u << 14 };
+// props / terrain strips). Rewrite into a large ring of {count, 1, 1} so multi-frame in-flight draws never
+// overwrite earlier frames' slots or step past the end of mesh_args_buf.
+enum { MESH_ARGS = 1u << 18 };
 static VkBuffer mesh_args_buf;
 static VmaAllocation mesh_args_alloc;
 static uint32_t *mesh_args_map;
@@ -407,7 +409,8 @@ static void mesh_issue_draw(VkExec *ex, const p_draw_mesh *d, const VkPipeState 
             if (mesh_log_fail < 4) rt_log("vk_mesh: mesh args buffer unavailable"), mesh_log_fail++;
             return;
         }
-        uint32_t slot = mesh_args_next++ % MESH_ARGS;
+        if (mesh_args_next >= MESH_ARGS) mesh_args_next = 0;
+        uint32_t slot = mesh_args_next++;
         vk_exec_pass_end(ex);
         vk_exec_barrier(ex);
         VkBufferCopy cp = {.srcOffset = sp.offset, .dstOffset = (VkDeviceSize)slot * 12u, .size = 4};
@@ -439,15 +442,22 @@ static void mesh_issue_draw(VkExec *ex, const p_draw_mesh *d, const VkPipeState 
             if (mesh_log_fail < 4) rt_log("vk_mesh: mesh args buffer unavailable"), mesh_log_fail++;
             return;
         }
+        if (mesh_args_next + n > MESH_ARGS) mesh_args_next = 0;
         uint32_t slot = mesh_args_next;
-        mesh_args_next = (mesh_args_next + n) % (MESH_ARGS - n + 1);
+        mesh_args_next += n;
+        if (mesh_args_next >= MESH_ARGS) mesh_args_next = 0;
         vk_exec_pass_end(ex);
         vk_exec_barrier(ex);
         VK_MEM_USE(sp);
-        for (uint32_t i = 0; i < n; i++) {
-            VkBufferCopy one = {.srcOffset = sp.offset + (VkDeviceSize)i * stride,
-                                .dstOffset = (VkDeviceSize)(slot + i) * 12u, .size = 4};
-            vkCmdCopyBuffer(ex->cb, sp.buffer, mesh_args_buf, 1, &one);
+        VK_MEM_USE(cp);
+        VkBufferCopy stack_bcp[256];
+        VkBufferCopy *bcp = n <= 256 ? stack_bcp : malloc((size_t)n * sizeof *bcp);
+        if (bcp) {
+            for (uint32_t i = 0; i < n; i++)
+                bcp[i] = (VkBufferCopy){.srcOffset = sp.offset + (VkDeviceSize)i * stride,
+                                        .dstOffset = (VkDeviceSize)(slot + i) * 12u, .size = 4};
+            vkCmdCopyBuffer(ex->cb, sp.buffer, mesh_args_buf, n, bcp);
+            if (bcp != stack_bcp) free(bcp);
         }
         vk_exec_barrier(ex);
         vk_exec_pass_begin(ex);

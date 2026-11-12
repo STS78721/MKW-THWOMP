@@ -498,17 +498,43 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
             r->pt[first + k] = (VPage){ph, ph ? (uint64_t)rq[i].physical_offset + k * NVN_VPOOL_PAGE : 0};
     }
     plat_mutex_unlock(&pool_lock);
-    // CompactLayers host images sample the virtual address; remapping physical pages under them
-    // leaves stale GPU texels until the next upload (Eglantine RefreshSparseTiles). Done after the
-    // pool lock so texture re-upload marking cannot nest with pool_lock.
+    // Sparse images bind Vulkan sparse blocks to physical tile slots; CompactLayers host images
+    // re-upload on newly mapped pages. Both run after releasing pool_lock to avoid lock nesting.
     if (ok) {
         for (int i = 0; i < n; i++) {
-            if (!rq[i].physical_pool || !rq[i].size) continue;
-            vk_texture_sparse_pages_mapped((uint64_t)(uintptr_t)v->mem + (uint64_t)rq[i].virtual_offset, rq[i].size);
+            if (!rq[i].size) continue;
+            uint64_t va = (uint64_t)(uintptr_t)v->mem + (uint64_t)rq[i].virtual_offset;
+            vk_sparse_remap(va, rq[i].size);
+            if (rq[i].physical_pool) vk_texture_sparse_pages_mapped(va, rq[i].size);
         }
     } else {
         rt_log("vk: MapVirtual on pool %p failed", (void *)v->mem);
     }
+    return ok;
+}
+
+int vk_mem_virt_phys(uint64_t addr, uint64_t size, uint64_t *phys) {
+    if (!size || (addr % NVN_VPOOL_PAGE) || (size % NVN_VPOOL_PAGE)) return 0;
+    int ok = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    const pidx_ent *e = pidx_find(&pool_index, addr, 1);
+    const PoolRec *r = e ? e->buf : NULL;
+    if (r && r->kind == POOL_VIRT && addr >= r->lo && addr - r->lo + size <= r->size) {
+        uint64_t first = (addr - r->lo) / NVN_VPOOL_PAGE, count = size / NVN_VPOOL_PAGE;
+        if (first + count <= r->npages && r->pt[first].phys) {
+            const PoolRec *ph = r->pt[first].phys;
+            uint64_t off = r->pt[first].off;
+            ok = 1;
+            for (uint64_t k = 1; k < count; k++) {
+                if (r->pt[first + k].phys != ph || r->pt[first + k].off != off + k * NVN_VPOOL_PAGE) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (ok && phys) *phys = (ph->storage_serial << 36) | off;
+        }
+    }
+    plat_mutex_unlock_shared(&pool_lock);
     return ok;
 }
 
@@ -2306,9 +2332,18 @@ uint64_t vk_upload_flush(int wait) {
             vkCmdWriteTimestamp(open_b.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, up_pool, 2 * (uint32_t)open_b.ts + 1);
         vkEndCommandBuffer(open_b.cb);
         plat_inc64(&up_batches);
-        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &open_b.cb};
+        VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = open_b.cb};
         vk_queue_lock();
-        VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, open_b.fence);
+        VkSparseOrder so = vk_sparse_order(0, 0);
+        VkSemaphoreSubmitInfo wsem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = so.wsem, .value = so.wait,
+                                      .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        VkSemaphoreSubmitInfo ssem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = so.ssem, .value = so.signal,
+                                      .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                            .waitSemaphoreInfoCount = so.wsem && so.wait ? 1u : 0u, .pWaitSemaphoreInfos = &wsem,
+                            .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi,
+                            .signalSemaphoreInfoCount = so.ssem ? 1u : 0u, .pSignalSemaphoreInfos = &ssem};
+        VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, open_b.fence);
         vk_queue_unlock();
         if (r != VK_SUCCESS) {
             vk_device_fault_report(r);
@@ -2408,6 +2443,7 @@ void vk_mem_shutdown(void) {
     for (int i = 0; i < ndead; i++) dead[i].seq = 0, dead[i].tl = 0;   // the device is idle
     collect_locked(c);
     tl_protected = keep;
+    vk_sparse_shutdown();
     for (int i = 0; i < nspare; i++) {
         vkDestroyFence(c->device, spare[i].fence, NULL);
         free(spare[i].stg);

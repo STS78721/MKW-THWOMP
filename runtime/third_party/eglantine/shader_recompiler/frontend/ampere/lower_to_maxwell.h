@@ -2239,20 +2239,20 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                  (u64{insn.Bits(78, 2)} << 39));
             break;
         }
-        case 0x207: case 0x807: case 0xa07: { // Bitwise SEL
+        case 0x207: case 0x807: case 0xa07: case 0xc07: { // Bitwise SEL
             const u32 a = operand(0, false), b = operand(1, false);
             emit(base(0x5ca0000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
             break;
         }
-        case 0x208: case 0x808: case 0xa08: { // FSEL: the sources keep their .NEG/.ABS
+        case 0x208: case 0x808: case 0xa08: case 0xc08: { // FSEL: the sources keep their .NEG/.ABS
             const u32 a = operand(0), b = operand(1);
             emit(base(0x5ca0000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
             break;
         }
-        case 0x20a: case 0x80a: case 0xa0a: { // FSET.BF, combined with Pc (bits 87-90) by bits 74-75
-            if (insn.Bits(64, 8) || insn.Bits(74, 2) == 3 || insn.Bits(81, 6) || insn.Bits(91, 1))
+        case 0x20a: case 0x80a: case 0xa0a: case 0xc0a: { // FSET.BF, combined with Pc (bits 87-90) by bits 74-75
+            if (insn.Bits(64, 8) || insn.Bits(74, 2) == 3 || insn.Bits(81, 6) || (opcode != 0xc0a && insn.Bits(91, 1)))
                 return fail(index, "native floating comparison output mode");
             const u32 a = operand(0), b = operand(1);
             emit(base(0x5800000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
@@ -2260,10 +2260,12 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                  (u64{insn.Bits(76, 4)} << 48) | (u64{1} << 52) | (u64{insn.Bits(80, 1)} << 55));
             break;
         }
-        case 0x234: { // HSETP2, packed register sources and independent predicate outputs.
-            const auto a = half_source(0), b = half_source(1);
+        case 0x234: case 0x634: { // HSETP2, packed register or cbuf sources and independent predicate outputs.
+            const auto a = half_source(0), b = half_source(opcode == 0x234 ? 1 : 2);
             const u32 combine = insn.Bits(69, 2);
-            if (insn.Bits(16, 8) || (insn.words[1] & 0x0fffff00U) ||
+            if (insn.Bits(16, 8) ||
+                (opcode == 0x234 && (insn.words[1] & 0x0fffff00U)) ||
+                (opcode == 0x634 && (insn.words[1] & 0x3fU)) ||
                 insn.Bits(64, 5) || combine > 2 || insn.Bits(91, 1) ||
                 a.swizzle == 1 || b.swizzle == 1) {
                 return fail(index, "native packed half predicate mode");
@@ -2290,7 +2292,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                  (u64{insn.Bits(74, 2)} << 47) | (u64{insn.Bits(71, 1)} << 49));
             break;
         }
-        case 0x20b: case 0x80b: case 0xa0b: // FSETP
+        case 0x20b: case 0x80b: case 0xa0b: case 0xc0b: // FSETP
         case 0x20c: case 0x80c: case 0xa0c: case 0xc0c: { // ISETP
             const bool floating = (opcode & 0x1ff) == 0xb;
             const bool extended = !floating && insn.Bits(72, 1);

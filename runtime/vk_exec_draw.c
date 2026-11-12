@@ -55,6 +55,7 @@ static int control_is_header_only(const uint8_t *ctl, uint32_t flen_704) {
 // vk_c0_fill, set by the dispatch ops around bind_resources like c0_dim.
 static const Nvn2C0Layout *c0_lay;
 static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
+static const uint64_t *c0_tex, *c0_img;
 #define MAX_DESC 1024
 #define CHUNK_BYTES (4u << 20)
 #define ZERO_BYTES 1048576u   // 1 MiB dummy buffer (was 64 KiB) to safely absorb unbacked/out-of-bounds GPU buffer stores
@@ -71,6 +72,8 @@ static uint8_t geometry_input;                              // normalized actual
 static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_lay = gfx_shader_c0_layout(cs);
     c0_push = ex->push[1];
+    c0_tex = ex->tex[NVN_STAGE_CS];
+    c0_img = ex->img[NVN_STAGE_CS];
 }
 
 enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_FAULT_SKIP, W_FAULT_SKIP2, W_SKIP_VS, W_SKIP_FS, W_RESET, W_GEOMETRY, W_LIST_RESTART, W_COUNT };
@@ -150,7 +153,7 @@ static struct {
     VkDeviceSize c0_off[6];
     int c0_valid[6];
     struct { p_bind_buf ssbo[16], ubo[16]; uint32_t dim[3], binst; Nvn2C0Layout lay; uint8_t has_lay;
-             uint32_t roots[NVN2_ROOT_TABLES][NVN2_ROOT_WORDS]; } c0_in[6];
+             uint32_t roots[NVN2_ROOT_TABLES][NVN2_ROOT_WORDS]; uint64_t tex[128], img[32]; } c0_in[6];
     VkPipelineLayout ds_layout;          // graphics layout the sets below were last pushed or bound with
     VkDescriptorSet ds_bound[2];         // allocated set bound per set number (0: none or pushed since)
     VkDescriptorSet ds_last[2];          // last allocated and written set per set number, contents in DS
@@ -633,8 +636,15 @@ static VkFormat sampled_view_format(const VkTexImage *img, const view_t *v, int 
     if (hv && v->set_format && !img->block_views && (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         TexVkFormat vf;
         if (tex_vk_format(v->format, &vf) && !vf.depth && !vf.stencil && !vf.expand_rgb) {
-            if (vf.astc_bw && (fmt == VK_FORMAT_R8G8B8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_SRGB)) {
-                fmt = vf.vk;
+            if (vf.astc_bw) {
+                if (fmt == VK_FORMAT_R8G8B8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_SRGB)
+                    fmt = vf.astc_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+                else if (fmt == VK_FORMAT_BC7_UNORM_BLOCK || fmt == VK_FORMAT_BC7_SRGB_BLOCK)
+                    fmt = vf.astc_srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+                else if (fmt == VK_FORMAT_BC3_UNORM_BLOCK || fmt == VK_FORMAT_BC3_SRGB_BLOCK)
+                    fmt = vf.astc_srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+                else if (fmt == vf.vk)
+                    fmt = vf.vk;
             } else if (!vf.astc_bw && !vk_fmt_is_compressed(fmt) && !vk_fmt_is_compressed(vf.vk) &&
                        vk_fmt_bytes(fmt) && vk_fmt_bytes(fmt) == vk_fmt_bytes(vf.vk)) {
                 fmt = vf.vk;
@@ -1181,46 +1191,64 @@ static int ptr_exclude(uint64_t v, const p_bind_buf *bound[], int nbound) {
     return 0;
 }
 
-static void pointer_table_scan(const p_bind_buf ssbo[16], uint64_t *found, uint32_t *n_io,
-                               const p_bind_buf *bound[], int nbound) {
+static int ptr_candidate_ok(uint64_t v) {
+    // Guest VirtualAlloc pools in MKW span 0x110000000..0x3ffffffff+ (including 64 KiB-aligned bases where the low
+    // 16..32 bits are zero). Reject unaligned words and small packed 32-bit integer pairs like 0x100000003.
+    if ((v & 3) || v < 0x10000000ull || v >= (1ull << 47)) return 0;
+    if ((v >> 32) < 0x10ull && (v & 0xffffull) != 0 && (v & 0xffffffffull) < 0x10000ull) return 0;
+    return 1;
+}
+
+static void pointer_table_try_add(uint64_t v, int slot, uint64_t off, uint64_t *found, uint32_t *n_io,
+                                  const p_bind_buf *bound[], int nbound, int *scan_log) {
     uint32_t n = *n_io;
-    if (!ssbo) return;
+    if (n >= 48 || !ptr_candidate_ok(v) || ptr_exclude(v, bound, nbound)) return;
+    VkMemSpan hit;
+    if (!vk_mem_resolve(v, 1, &hit)) return;
+    for (uint32_t j = 0; j < n; j++)
+        if (found[j] == v) return;
+    if (scan_log && *scan_log < 64)
+        rt_log("vk: ptr-hit slot %d off=%llx -> %llx avail=%llx", slot, (unsigned long long)off,
+               (unsigned long long)v, (unsigned long long)hit.avail),
+            (*scan_log)++;
+    found[n] = v;
+    *n_io = n + 1;
+}
+
+static void pointer_table_scan_range(const p_bind_buf bufs[16], int first_slot, uint64_t min_sz, uint64_t max_sz,
+                                     uint64_t *found, uint32_t *n_io, const p_bind_buf *bound[], int nbound) {
+    if (!bufs) return;
     static int scan_log;
-    for (int i = 0; i < 16; i++) {
-        if (!ssbo[i].addr) continue;
+    for (int i = first_slot; i < 16 && *n_io < 48; i++) {
+        if (!bufs[i].addr) continue;
         VkMemSpan sp;
-        if (!vk_mem_resolve(ssbo[i].addr, 1, &sp)) {
+        if (!vk_mem_resolve(bufs[i].addr, 1, &sp)) {
             if (scan_log < 16)
                 rt_log("vk: ptr-scan slot %d addr=%llx size=%llx unresolved", i,
-                       (unsigned long long)ssbo[i].addr, (unsigned long long)ssbo[i].size),
+                       (unsigned long long)bufs[i].addr, (unsigned long long)bufs[i].size),
                     scan_log++;
             continue;
         }
-        if (sp.alloc && !plat_mem_readable(ssbo[i].addr, 8)) {
+        if (sp.alloc && !plat_mem_readable(bufs[i].addr, 8)) {
             if (scan_log < 16)
                 rt_log("vk: ptr-scan slot %d addr=%llx size=%llx device-local unreadable", i,
-                       (unsigned long long)ssbo[i].addr, (unsigned long long)ssbo[i].size),
+                       (unsigned long long)bufs[i].addr, (unsigned long long)bufs[i].size),
                     scan_log++;
             continue;
         }
-        uint64_t buf_sz = ssbo[i].size ? ssbo[i].size : 0x200ull;
+        uint64_t buf_sz = bufs[i].size ? bufs[i].size : 0x200ull;
         if (buf_sz > sp.avail) buf_sz = sp.avail;
-        if (buf_sz < 8) continue;
-        const uint64_t *base = (const uint64_t *)(uintptr_t)ssbo[i].addr;
-        uint32_t before = n;
+        if (buf_sz < 8 || buf_sz < min_sz || buf_sz > max_sz) continue;
+        const uint64_t *base = (const uint64_t *)(uintptr_t)bufs[i].addr;
+        uint32_t before = *n_io;
         uint32_t probed = 0;
-        // Dense head: full buffer when ≤4 KiB (pointer / cull lists); else first 1 KiB.
-        // Stride the rest of large SSBOs — n98's 0x571800 slot started with float 1.0 and hid
-        // instance bases past the old 0x200 head-only window.
+        // Dense head: full buffer when ≤4 KiB (UBO constants / pointer / cull lists); else first 1 KiB.
         uint64_t dense = buf_sz <= 0x1000ull ? buf_sz : 0x400ull;
         uint64_t stride_end = buf_sz;
         if (stride_end > (256ull << 10)) stride_end = 256ull << 10;
-        // Build the offset list: dense head, then stepped stride, then quarter samples in the tail.
         uint64_t offs[2048];
         uint32_t no = 0;
         for (uint64_t off = 0; off + 8 <= dense && no < 512; off += 8) offs[no++] = off;
-        // 32-byte stride through the first 64 KiB (instance / bone tables cluster early), then
-        // 128-byte stride out to 256 KiB so a 5 MiB SSBO still yields real external ptrs overnight.
         uint64_t mid = stride_end < (64ull << 10) ? stride_end : (64ull << 10);
         for (uint64_t off = dense; off + 8 <= mid && no < 1600; off += 0x20) offs[no++] = off;
         for (uint64_t off = mid; off + 8 <= stride_end && no < 2000; off += 0x80) offs[no++] = off;
@@ -1233,37 +1261,23 @@ static void pointer_table_scan(const p_bind_buf ssbo[16], uint64_t *found, uint3
             uint64_t tail = buf_sz > 8 ? (buf_sz - 8) & ~7ull : 0;
             if (tail >= stride_end && no < 2048) offs[no++] = tail;
         }
-        for (uint32_t oi = 0; oi < no && n < 48; oi++) {
+        for (uint32_t oi = 0; oi < no && *n_io < 48; oi++) {
             uint64_t off = offs[oi];
             uint64_t v = base[off / 8];
             probed++;
-            // Guest GPU heap on MKW sits around 0x2a… (SSBO logs: 0x2a658…). Reject:
-            // - packed counts like 0x300000004 (near-zero low half)
-            // - float-looking words that resolve into low pools (n61: 0x1e654bfc0 from size=0x493e00)
-            if ((v & 3) || v < 0x200000000ull || v >= (1ull << 40) || (v & 0xffffffffull) < 0x10000ull)
-                continue;
-            // Exclude every bound stage's SSBOs (n93 self-hit inside the scanned buffer;
-            // table4 must also drop VS/CS self-ptrs, not only TS/MS).
-            if (ptr_bound(ssbo, v) || ptr_exclude(v, bound, nbound)) continue;
-            VkMemSpan hit;
-            if (!vk_mem_resolve(v, 1, &hit)) continue;
-            int have = 0;
-            for (uint32_t j = 0; j < n; j++) have |= found[j] == v;
-            if (!have) {
-                if (scan_log < 64)
-                    rt_log("vk: ptr-hit slot %d off=%llx -> %llx avail=%llx", i, (unsigned long long)off,
-                           (unsigned long long)v, (unsigned long long)hit.avail),
-                        scan_log++;
-                found[n++] = v;
-            }
+            pointer_table_try_add(v, i, off, found, n_io, bound, nbound, &scan_log);
         }
-        if ((n > before && scan_log < 64) || (n == before && scan_log < 16))
+        if ((*n_io > before && scan_log < 64) || (*n_io == before && scan_log < 16))
             rt_log("vk: ptr-scan slot %d addr=%llx size=%llx probed=%u hit=%u w0=%llx w1=%llx", i,
-                   (unsigned long long)ssbo[i].addr, (unsigned long long)ssbo[i].size, probed, n - before,
+                   (unsigned long long)bufs[i].addr, (unsigned long long)bufs[i].size, probed, *n_io - before,
                    (unsigned long long)base[0], buf_sz >= 16 ? (unsigned long long)base[1] : 0ull),
                 scan_log++;
     }
-    *n_io = n;
+}
+
+static void pointer_table_scan(const p_bind_buf ssbo[16], uint64_t *found, uint32_t *n_io,
+                               const p_bind_buf *bound[], int nbound) {
+    pointer_table_scan_range(ssbo, 0, 8, ~0ull, found, n_io, bound, nbound);
 }
 
 static void pointer_table_finish(uint64_t *found, uint32_t n, const p_bind_buf *src[], int nsrc,
@@ -1408,10 +1422,26 @@ static void c0_pointer_table(uint8_t bank[VK_C0_BYTES], const p_bind_buf ssbo[16
     }
 }
 
-static void c0_pointer_table2(uint8_t bank[VK_C0_BYTES], const p_bind_buf a[16], const p_bind_buf b[16]) {
+static void c0_pointer_table_cs(uint8_t bank[VK_C0_BYTES], const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
+                                const Nvn2C0Layout *lay, const uint32_t push[NVN2_ROOT_TABLES][NVN2_ROOT_WORDS]) {
     if (VK_C0_BYTES < PTR_TABLE + 16u * PTR_ENTRIES) return;
     PtrEntry e[PTR_ENTRIES];
-    pointer_table2(a, b, e);
+    memset(e, 0, sizeof e);
+    uint64_t found[48];
+    uint32_t n = 0;
+    const p_bind_buf *bound[1] = {ssbo};
+    if (lay && push) {
+        for (unsigned r = 0; r < NVN2_ROOT_TABLES; r++) {
+            for (unsigned w = 0; w + 1 < lay->roots[r] && n < 48; w += 2) {
+                uint64_t v = (uint64_t)push[r][w] | ((uint64_t)push[r][w + 1] << 32);
+                pointer_table_try_add(v, 100 + (int)r, w * 4u, found, &n, bound, 1, NULL);
+            }
+        }
+    }
+    pointer_table_scan_range(ubo, 2, 8, ~0ull, found, &n, bound, 1);
+    pointer_table_scan_range(ssbo, 0, 8, 0x10000ull, found, &n, bound, 1);
+    pointer_table_scan_range(ssbo, 0, 0x10001ull, ~0ull, found, &n, bound, 1);
+    pointer_table_finish(found, n, bound, 1, e);
     for (uint32_t i = 0; i < PTR_ENTRIES; i++) {
         uint32_t off = PTR_TABLE + 16u * i, bytes = (uint32_t)e[i].size;
         memcpy(bank + off, &e[i].addr, 8);
@@ -1419,11 +1449,22 @@ static void c0_pointer_table2(uint8_t bank[VK_C0_BYTES], const p_bind_buf a[16],
     }
 }
 
-static void c0_pointer_table4(uint8_t bank[VK_C0_BYTES], const p_bind_buf a[16], const p_bind_buf b[16],
-                              const p_bind_buf c[16], const p_bind_buf d[16]) {
+static void c0_pointer_table_mesh(uint8_t bank[VK_C0_BYTES], const p_bind_buf ts_ubo[16], const p_bind_buf ms_ubo[16],
+                                  const p_bind_buf a[16], const p_bind_buf b[16], const p_bind_buf c[16],
+                                  const p_bind_buf d[16]) {
     if (VK_C0_BYTES < PTR_TABLE + 16u * PTR_ENTRIES) return;
     PtrEntry e[PTR_ENTRIES];
-    pointer_table4(a, b, c, d, e);
+    memset(e, 0, sizeof e);
+    uint64_t found[48];
+    uint32_t n = 0;
+    const p_bind_buf *src[4] = {a, b, c, d};
+    // Scan user constant buffers (c2..c15, e.g. c3/c4 meshlet & bone descriptors) and small SSBOs first so
+    // real pointer tables populate found[] ahead of multi-megabyte vertex/material SSBOs.
+    pointer_table_scan_range(ts_ubo, 2, 8, ~0ull, found, &n, src, 4);
+    pointer_table_scan_range(ms_ubo, 2, 8, ~0ull, found, &n, src, 4);
+    for (int i = 0; i < 4; i++) pointer_table_scan_range(src[i], 0, 8, 0x10000ull, found, &n, src, 4);
+    for (int i = 0; i < 4; i++) pointer_table_scan_range(src[i], 0, 0x10001ull, ~0ull, found, &n, src, 4);
+    pointer_table_finish(found, n, src, 4, e);
     for (uint32_t i = 0; i < PTR_ENTRIES; i++) {
         uint32_t off = PTR_TABLE + 16u * i, bytes = (uint32_t)e[i].size;
         memcpy(bank + off, &e[i].addr, 8);
@@ -1440,13 +1481,13 @@ static void c0_pointer_table4(uint8_t bank[VK_C0_BYTES], const p_bind_buf a[16],
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance) {
     if (stage == NVN_STAGE_CS && c0_lay) {
-        if (!nvn2_c0_pack(bank, VK_C0_BYTES, c0_lay, c0_push, ssbo, ubo))
+        if (!nvn2_c0_pack_handles(bank, VK_C0_BYTES, c0_lay, c0_push, ssbo, ubo, c0_tex, c0_img))
             rt_fatal("vk: invalid NVN 2 compute parameter-block layout");
-        // The dispatch's group counts at c0+0x0..0xb, below the parameter block (which starts at 0x10): NVN 2 compute
-        // programs read them there (seven MKW programs ran with zero counts). Indirect dispatches still read 0 here.
-        memcpy(bank, dispatch, 12);
-        // Layout ends before 0x880: same pointer table task/mesh get (Hookshot / EvilOOT culling passes).
-        if (nvn2_c0_part(c0_lay, 5) <= PTR_TABLE) c0_pointer_table(bank, ssbo);
+        // NVN 2 compute dispatch dimensions {X, Y, Z} live at c0+0x4..0xf, below the parameter block at 0x10
+        // (MKW compute culling / LOD shaders index workgroups as ctaid.y * c[0][0x4] + ctaid.x).
+        memcpy(bank + 0x4, dispatch, 12);
+        // Layout ends before 0x880: same pointer table task/mesh get (culling passes reading root/UBO/SSBO ptrs).
+        if (nvn2_c0_part(c0_lay, 5) <= PTR_TABLE) c0_pointer_table_cs(bank, ssbo, ubo, c0_lay, c0_push);
         return;
     }
     memset(bank, 0, VK_C0_BYTES);
@@ -1499,17 +1540,19 @@ static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
         in.lay = *c0_lay, in.has_lay = 1;
         for (unsigned i = 0; i < NVN2_ROOT_TABLES; i++)
             memcpy(in.roots[i], ex->push[1][i], 4u * c0_lay->roots[i]);
+        if (c0_lay->textures) memcpy(in.tex, ex->tex[NVN_STAGE_CS], 8u * c0_lay->textures);
+        if (c0_lay->images) memcpy(in.img, ex->img[NVN_STAGE_CS], 8u * c0_lay->images);
     }
-    if (B.c0_valid[k] && !memcmp(&in, &B.c0_in[k], sizeof in))
+    int is_mesh = st == NVN_STAGE_TS || st == NVN_STAGE_MS;
+    if (!is_mesh && B.c0_valid[k] && !memcmp(&in, &B.c0_in[k], sizeof in))
         return (VkDescriptorBufferInfo){B.c0_buf[k], B.c0_off[k], VK_C0_BYTES};
     B.c0_in[k] = in;
     uint8_t tmp[VK_C0_BYTES];
     vk_c0_fill(tmp, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst);
-    // Task/mesh GlobalToStorage: scan TS+MS+VS+CS — CS holds cull/instance lists Hookshot follows;
-    // FS rarely carries bone pools and its large material SSBOs polluted the 3-region table.
-    if (st == NVN_STAGE_TS || st == NVN_STAGE_MS)
-        c0_pointer_table4(tmp, ex->ssbo[NVN_STAGE_TS], ex->ssbo[NVN_STAGE_MS], ex->ssbo[NVN_STAGE_VS],
-                          ex->ssbo[NVN_STAGE_CS]);
+    // Task/mesh GlobalToStorage: scan TS+MS UBOs (c3/c4 meshlet & bone descriptors) and TS+MS+VS+CS SSBOs.
+    if (is_mesh)
+        c0_pointer_table_mesh(tmp, ex->ubo[NVN_STAGE_TS], ex->ubo[NVN_STAGE_MS], ex->ssbo[NVN_STAGE_TS],
+                              ex->ssbo[NVN_STAGE_MS], ex->ssbo[NVN_STAGE_VS], ex->ssbo[NVN_STAGE_CS]);
     if (!B.c0_valid[k] || memcmp(tmp, B.c0[k], VK_C0_BYTES)) {
         memcpy(scratch(ex, VK_C0_BYTES, &B.c0_buf[k], &B.c0_off[k]), tmp, VK_C0_BYTES);
         memcpy(B.c0[k], tmp, VK_C0_BYTES);
@@ -1528,29 +1571,41 @@ static void limits_init(void) {
     __atomic_store_n(&LIM.ubo_max, l->maxUniformBufferRange, __ATOMIC_RELEASE);
 }
 
-// Set while binding a mesh pipeline: Ampere c1 still holds guest pointers the CPU bind path must not chase.
-// c0 (slot 0) and NVN SSBOs at 0x670/0x770 are real Hookshot banks and stay enabled.
-static int mesh_bind_skip_c1;
-
 static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.ubo_max, align = LIM.ubo_align;
     VkDescriptorBufferInfo bi;
-    if (mesh_bind_skip_c1 && (st == NVN_STAGE_TS || st == NVN_STAGE_MS) && slot == 1) return zero_info(max);
     if (slot == 0 && c0_on()) return c0_info(ex, st);
     if (slot == 1 && ex->prog) {   // compiler constants stored after the shader code
-        const uint8_t *ctl, *code;
-        uint32_t len, c1;
-        if (find_stage(ex->prog, st, &ctl, &code, &len)) {
-            memcpy(&c1, ctl + 0x700, 4);
-            if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, VK_MUSE_UBO, 0, 0, 0, &bi))
+        const prog_t *p = ex->prog;
+        const uint8_t *ctl = NULL, *code = NULL;
+        uint32_t len = 0, c1 = 0, c1_bytes = 0;
+        int found = find_stage(p, st, &ctl, &code, &len);
+        // Mesh draws bind a [MeshPrimitiveHeader, task, mesh] program where host slot 1 is a header-only SPH,
+        // while the live fragment stage comes from vk_exec_fragment_prog(ex).
+        if (st == NVN_STAGE_FS && (!found || control_is_header_only(ctl, len))) {
+            const prog_t *fp = vk_exec_fragment_prog(ex);
+            if (fp && fp != p) found = find_stage(fp, st, &ctl, &code, &len);
+        }
+        if (found) {
+            if (gfx_shader_is_nvn2(ctl)) {   // raw NVN 2 / DKMESH control: c1_size at +0x3c, c1_off at +0x40, total at +0x44
+                uint32_t c1_size = 0, c1_off = 0, total = 0;
+                memcpy(&c1_size, ctl + 0x3c, 4);
+                memcpy(&c1_off, ctl + 0x40, 4);
+                memcpy(&total, ctl + 0x44, 4);
+                if (c1_size && c1_off <= total && c1_size <= total - c1_off) c1 = c1_off, c1_bytes = c1_size;
+            } else {
+                memcpy(&c1, ctl + 0x700, 4);
+                if (c1 < len) c1_bytes = len - c1;
+            }
+            if (c1_bytes && bind_range(ex, (uint64_t)(uintptr_t)code + c1, c1_bytes, align, max, VK_MUSE_UBO, 0, 0, 0, &bi))
                 return bi;
-            if (c1 < len && len - c1 <= max) {   // NVN 2 stages: the lowered code (nvn2_lower.cpp) is host memory
+            if (c1_bytes && c1_bytes <= max) {   // NVN 2 stages: the lowered code (nvn2_lower.cpp) is host memory
                 VkBuffer b;
                 VkDeviceSize o;
                 RS.volatile_ = 1;
-                memcpy(scratch(ex, len - c1, &b, &o), code + c1, len - c1);
-                return (VkDescriptorBufferInfo){b, o, len - c1};
+                memcpy(scratch(ex, c1_bytes, &b, &o), code + c1, c1_bytes);
+                return (VkDescriptorBufferInfo){b, o, c1_bytes};
             }
         }
     } else if (slot == 17 && st != NVN_STAGE_GS) {
@@ -1574,21 +1629,7 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         memcpy(scratch(ex, sizeof blk, &b, &o), &blk, sizeof blk);
         return (VkDescriptorBufferInfo){b, o, sizeof blk};
     } else if (slot >= 3 && slot - 3 < 18) {
-        int ui = slot - 3;
-        const p_bind_buf *b = &ex->ubo[st][ui];
-        // Task/mesh often leave c3/c4 empty while the same banks were bound on VS (title foliage
-        // cull constants). Fall back so EmitMeshTasksEXT sees a non-zero bit mask.
-        if ((!b->addr || !b->size) && (st == NVN_STAGE_TS || st == NVN_STAGE_MS)) {
-            static int ubo_fb;
-            const p_bind_buf *alt = &ex->ubo[NVN_STAGE_VS][ui];
-            if ((!alt->addr || !alt->size) && st == NVN_STAGE_TS) alt = &ex->ubo[NVN_STAGE_MS][ui];
-            if ((!alt->addr || !alt->size) && st == NVN_STAGE_MS) alt = &ex->ubo[NVN_STAGE_TS][ui];
-            if (alt->addr && alt->size) {
-                if (ubo_fb++ < 12)
-                    rt_log("vk: mesh UBO c%d filled from VS/sibling (stage %d slot %d)", slot, st, ui);
-                b = alt;
-            }
-        }
+        const p_bind_buf *b = &ex->ubo[st][slot - 3];
         if (b->size && vk_usnap_find(b->addr, b->size < max ? b->size : max, align, &bi)) {   // as of the submit call
             count_use(VK_MCLS_SCRATCH, VK_MUSE_UBO, bi.range);
             return bi;
@@ -1750,29 +1791,21 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
         uint64_t at = b->addr - lead;
         int bare = !b->size;
-        uint64_t want = bare ? 0 : b->size + lead;
-        // Task/mesh (Hookshot vk_draw.cpp storage bind):
-        // - Device-local pools bind live. Imported pools snapshot into scratch when written or when this is a normal
-        //   NVN slot (GPU stores would hit guest RAM). Pointer-table entries (slot -2) are search-only.
-        // - Write-back: never for the pointer table; for bare+written only the first 64 bytes (culling counts);
-        //   else the bound range when Eden is_written. Bare size: written → 1 MiB, else up to maxStorageBufferRange.
-        //   (Sized mesh binds must keep full write-back: capping them to 64 B left the CPU spinning on stale counts.)
         int mesh = st == NVN_STAGE_TS || st == NVN_STAGE_MS;
         int may_write = written && slot != -2;
         int real_write = may_write && (!guarded || guarded_is_declared_ssbo(st, r, b));
         int wb = real_write;
+        // Read-only SSBOs bind to the end of their backing (up to maxStorageBufferRange): NVN shaders index LDG.E
+        // past the nominal size in c0 (HUD glyph tables, MKW tree/instance/material records; adriadam10/mkw-recomp
+        // vk_exec_bind.c, MIT, Copyright (c) 2026 Adrià). UBOs, written SSBOs, guarded slots, and pointer-table
+        // entries keep their explicit size.
+        uint64_t want = (!ubo && !may_write && !guarded && slot != -2) ? 0 : (bare ? 0 : b->size + lead);
         if (mesh && at) {
             VkMemSpan sp;
             if (!vk_mem_resolve(at, 1, &sp)) return zero_info(max);
-            // Live bind like Hookshot (VK_MEM_USE picks a VRAM mirror when one exists). resolve leaves alloc NULL
-            // for every import, mirrored or not — a CPU snapshot here skipped the mirror and left GPU stores on
-            // scratch. Written imports stay at 1 MiB (store thrash). Read-only and pointer-table (-2) windows keep
-            // their sized/bare extent up to maxStorageBufferRange — re-capping those to 1 MiB hid culling / bone
-            // tables past the first MiB of a pool.
             const uint64_t import_cap = 1ull << 20;
-            const uint64_t bare_read = 8ull << 20;
             if (!want) {
-                uint64_t cap = written ? import_cap : bare_read;
+                uint64_t cap = written ? import_cap : max;
                 if (cap > max) cap = max;
                 want = sp.avail < cap ? sp.avail : cap;
             } else if (want > max) {
@@ -2639,34 +2672,6 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     uint64_t h = 0;
                     if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
-                    // Mesh draws: foliage albedo/alpha often land on FS (or VS) while task/mesh sample
-                    // their own stage slots. Empty → dummy → discarded leaves / black trees. Cross-fill
-                    // FS↔MS↔TS↔VS for any mesh-pipeline stage. Log misses so overnight can see empties.
-                    if (!h && !img && mesh_bind_skip_c1 && slot >= 0 && slot < 128 &&
-                        (st == NVN_STAGE_FS || st == NVN_STAGE_MS || st == NVN_STAGE_TS)) {
-                        if (!h && st != NVN_STAGE_FS) h = ex->tex[NVN_STAGE_FS][slot];
-                        if (!h && st != NVN_STAGE_MS) h = ex->tex[NVN_STAGE_MS][slot];
-                        if (!h && st != NVN_STAGE_TS) h = ex->tex[NVN_STAGE_TS][slot];
-                        if (!h) h = ex->tex[NVN_STAGE_VS][slot];
-                        static int fb_hit, fb_miss, fb_dump;
-                        if (h) {
-                            if (fb_hit++ < 12)
-                                rt_log("vk: mesh tex slot %d stage %d filled from sibling (foliage fallback)", slot,
-                                       st);
-                        } else if (fb_miss++ < 16) {
-                            rt_log("vk: mesh tex slot %d stage %d still empty after FS/MS/TS/VS fallback (dummy)",
-                                   slot, st);
-                            if (fb_dump++ < 2) {
-                                int nms = 0, nts = 0, nfs = 0;
-                                for (int i = 0; i < 32; i++) {
-                                    nms += ex->tex[NVN_STAGE_MS][i] != 0;
-                                    nts += ex->tex[NVN_STAGE_TS][i] != 0;
-                                    nfs += ex->tex[NVN_STAGE_FS][i] != 0;
-                                }
-                                rt_log("vk: mesh tex occupancy FS=%d MS=%d TS=%d (first 32 slots)", nfs, nms, nts);
-                            }
-                        }
-                    }
                     tex_info(ex, r, h, img, r->separate, &o[k].image);
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                 }
@@ -2968,7 +2973,10 @@ static int stage_diag_skip(const VkExec *ex, const GfxShader *vs) {
 
 static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const GfxShader *fs, int32_t count) {
     static int on = -1;
-    if (on < 0) on = !rt_game_version && cfg_bool("TOTK_FIX_VS_FAULT");   // 0: the NVN 2 reference title (all GPU vendors)
+    if (on < 0) {
+        const char *e = cfg_get("MKW_FIX_VS_FAULT");
+        on = e && *e == '1';
+    }
     if (!on || !vs) return 0;
     const uint8_t *ctl, *code = NULL;
     uint32_t len;
@@ -3795,8 +3803,8 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
-    if (B.c0_valid[2]) {   // copy GPU-written group counts into c0 (+0x0 on NVN 2, +0x200 on NVN 1)
-        VkBufferCopy cp = {ip.offset, B.c0_off[2] + (c0_lay ? 0 : 0x200), sizeof(VkDispatchIndirectCommand)};
+    if (B.c0_valid[2]) {   // copy GPU-written group counts into c0 (+0x4 on NVN 2, +0x200 on NVN 1)
+        VkBufferCopy cp = {ip.offset, B.c0_off[2] + (c0_lay ? 0x4 : 0x200), sizeof(VkDispatchIndirectCommand)};
         vkCmdCopyBuffer(ex->cb, ip.buffer, B.c0_buf[2], 1, &cp);
         ex->recorded++;
         vk_exec_barrier(ex);
@@ -4001,45 +4009,8 @@ void vk_exec_mesh_bind(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkP
     ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR | VK_EXEC_DIRTY_DEPTH_BIAS | VK_EXEC_DIRTY_BLEND_CONST |
                  VK_EXEC_DIRTY_STENCIL;
     record_fixed(ex);
-    // Task/mesh keep the NVN binds the game recorded into host slots 3/4 (st_host): c0 banks at
-    // 0x670/0x770 are filled from those tables. Skip only Ampere c1 (compiler constants with guest
-    // pointers the CPU descriptor path must not chase).
-    // Foliage: title often BindTextures on FS only. MS/TS may hold stale/wrong handles in the same
-    // slots (black leaf silhouettes with a non-empty bind). Always mirror FS (else VS) onto MS/TS.
-    {
-        static int seeded;
-        int filled = 0;
-        for (int i = 0; i < 128; i++) {
-            uint64_t h = ex->tex[NVN_STAGE_FS][i];
-            if (!h) h = ex->tex[NVN_STAGE_VS][i];
-            if (!h) continue;
-            if (ex->tex[NVN_STAGE_MS][i] != h) ex->tex[NVN_STAGE_MS][i] = h, filled++;
-            if (ex->tex[NVN_STAGE_TS][i] != h) ex->tex[NVN_STAGE_TS][i] = h, filled++;
-        }
-        if (filled && seeded++ < 8)
-            rt_log("vk_mesh: mirrored %d MS/TS tex slots from FS/VS", filled);
-        // Cull constants (c3/c4) + NVN SSBO tables for EmitMeshTasksEXT: dump once for overnight.
-        static int c3log;
-        if (c3log < 6) {
-            const p_bind_buf *b = &ex->ubo[NVN_STAGE_TS][0];
-            if ((!b->addr || !b->size)) b = &ex->ubo[NVN_STAGE_VS][0];
-            const p_bind_buf *b4 = &ex->ubo[NVN_STAGE_TS][1];
-            if ((!b4->addr || !b4->size)) b4 = &ex->ubo[NVN_STAGE_VS][1];
-            if (b->addr && b->size >= 300 && plat_mem_readable(b->addr, 300)) {
-                uint32_t w74 = 0, w0 = 0;
-                memcpy(&w0, (const void *)(uintptr_t)b->addr, 4);
-                memcpy(&w74, (const void *)(uintptr_t)(b->addr + 74u * 4u), 4);
-                rt_log("vk_mesh: c3 w0=%#x w74=%#x size=%#x c4_size=%#x ts_ssbo0=%#x ms_ssbo0=%#x", w0, w74,
-                       (unsigned)b->size, (unsigned)b4->size, (unsigned)ex->ssbo[NVN_STAGE_TS][0].size,
-                       (unsigned)ex->ssbo[NVN_STAGE_MS][0].size);
-                c3log++;
-            }
-        }
-    }
     B.res_valid = 0;
-    mesh_bind_skip_c1 = 1;
     bind_resources(ex, info);
-    mesh_bind_skip_c1 = 0;
     B.res_valid = 0;   // conventional draws must not reuse mesh descriptor sets
     vk_exec_oq_draw(ex);
 }

@@ -305,7 +305,8 @@ static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
             }
         }
     }
-    if (!bad && vk_astc_bc()) {
+    int is_bc7 = vk_astc_bc_format(0) == VK_FORMAT_BC7_UNORM_BLOCK;
+    if (!bad && vk_astc_bc() && !is_bc7) {
         size_t b0 = (size_t)((w0 + 3) / 4) * ((h0 + 3) / 4) * 16, b1 = (size_t)((w1 + 3) / 4) * ((h1 + 3) / 4) * 16;
         uint8_t *bc = malloc(b0 + b1);
         char what[2][48];
@@ -323,6 +324,73 @@ static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
     }
     g_blocks += n0 + n1, g_texels += t0 + t1;
     free(blk), free(want), free(rb), free(im);
+    return bad;
+}
+
+// BC7 re-encoding (MKW_ASTC_BC7): constant-colour (void extent) blocks of footprint bw x bh into a BC7 image, read back
+// through a GPU blit to RGBA8. A constant colour fits BC7 mode 6 within 1-2 per channel.
+static int bc7_case(VkCtx *c, uint32_t bw, uint32_t bh, uint32_t nx, uint32_t ny) {
+    uint32_t w0 = nx * bw - 1 - (bw > 5), h0 = ny * bh - 2, w1 = w0 >> 1, h1 = h0 >> 1;
+    size_t n0 = (size_t)((w0 + bw - 1) / bw) * ((h0 + bh - 1) / bh), n1 = (size_t)((w1 + bw - 1) / bw) * ((h1 + bh - 1) / bh);
+    uint8_t *blk = malloc((n0 + n1) * 16);
+    for (size_t k = 0; k < n0 + n1; k++) void_block(blk + 16 * k, 1);
+    size_t t0 = (size_t)w0 * h0, t1 = (size_t)w1 * h1;
+    uint8_t *want = malloc((t0 + t1) * 4);
+    astc_decode_ldr(blk, w0, h0, bw, bh, 0, want);
+    astc_decode_ldr(blk + n0 * 16, w1, h1, bw, bh, 0, want + t0 * 4);
+    Img bc, rgba;
+    int bad = 0;
+    if (!make_image(c, w0, h0, 2, VK_FORMAT_BC7_UNORM_BLOCK, &bc) ||
+        !make_image(c, w0, h0, 2, VK_FORMAT_R8G8B8A8_UNORM, &rgba)) {
+        printf("probe-astc: FAIL BC7 %ux%u: images\n", bw, bh);
+        free(blk), free(want);
+        return 1;
+    }
+    VkCommandBuffer cb = vk_upload_begin();
+    VkBuffer sb, ib;
+    VmaAllocation ia;
+    uint8_t *stg = vk_staging((n0 + n1) * 16, &sb, NULL), *imap = vk_staging((t0 + t1) * 4, &ib, &ia);
+    memcpy(stg, blk, (n0 + n1) * 16);
+    to_general(cb, bc.img), to_general(cb, rgba.img);
+    VkAstcRegion ar[2] = {{.src = 0, .w = w0, .h = h0, .slices = 1, .level = 0, .lw = w0, .lh = h0},
+                          {.src = n0 * 16, .w = w1, .h = h1, .slices = 1, .level = 1, .lw = w1, .lh = h1}};
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    if (!vk_astc_record(cb, sb, (n0 + n1) * 16, ar, 2, bw, bh, 0, 1, bc.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_NULL_HANDLE))
+        printf("probe-astc: FAIL BC7 %ux%u: not recorded\n", bw, bh), bad = 1;
+    barrier(cb, ALL_RW, ALL_RW);
+    for (uint32_t lv = 0; lv < 2; lv++) {
+        int32_t w = (int32_t)(lv ? w1 : w0), h = (int32_t)(lv ? h1 : h0);
+        VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1}, .srcOffsets = {{0, 0, 0}, {w, h, 1}},
+                          .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1}, .dstOffsets = {{0, 0, 0}, {w, h, 1}}};
+        vkCmdBlitImage(cb, bc.img, VK_IMAGE_LAYOUT_GENERAL, rgba.img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
+    }
+    barrier(cb, ALL_RW, ALL_RW);
+    VkBufferImageCopy cp[2] = {{.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w0, h0, 1}},
+                               {.bufferOffset = t0 * 4, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, .imageExtent = {w1, h1, 1}}};
+    vkCmdCopyImageToBuffer(cb, rgba.img, VK_IMAGE_LAYOUT_GENERAL, ib, 2, cp);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    vk_upload_end();
+    vk_upload_flush(1);
+    vmaInvalidateAllocation(c->vma, ia, 0, VK_WHOLE_SIZE);
+    int worst = 0;
+    size_t at = 0;
+    for (size_t i = 0; i < (t0 + t1) * 4 && !bad; i++) {
+        int d = abs((int)imap[i] - (int)want[i]);
+        if (d > worst) worst = d, at = i / 4;
+    }
+    if (!bad && worst > 2) {
+        size_t lv = at >= t0, i = lv ? at - t0 : at, w = lv ? w1 : w0;
+        const uint8_t *e = want + 4 * at, *g = imap + 4 * at;
+        printf("probe-astc: FAIL BC7 %ux%u level %zu texel (%zu,%zu): want %02x%02x%02x%02x got %02x%02x%02x%02x (error %d)\n",
+               bw, bh, lv, i % w, i / w, e[0], e[1], e[2], e[3], g[0], g[1], g[2], g[3], worst);
+        bad = 1;
+    }
+    if (!bad) printf("probe-astc: BC7 %ux%u %ux%u: largest channel error %d\n", bw, bh, w0, h0, worst);
+    g_bc_cases += !bad;
+    vmaDestroyBuffer(c->vma, ib, ia);
+    vk_defer_image(bc.img, bc.alloc), vk_defer_image(rgba.img, rgba.alloc);
+    vk_upload_flush(1);
+    free(blk), free(want);
     return bad;
 }
 
@@ -369,7 +437,14 @@ int probe_astc(void) {
         for (int s = 0; s < 2 && !bad; s++) bad = test_case(c, dims[i][0], dims[i][1], s);
     for (int b = 0; b < NB && !bad; b++)
         if (!g_bucket[b]) { printf("probe-astc: FAIL no valid %s block was generated\n", bucket_name[b]); bad = 1; }
-    if (!bad && !vk_astc_bc()) printf("probe-astc: BC3 encoder not available on this device: not checked\n");
+    if (!bad && vk_astc_bc() && vk_astc_bc_format(0) == VK_FORMAT_BC7_UNORM_BLOCK) {
+        // 4-aligned footprints (each 4x4 BC7 block lies inside one void-extent ASTC block), including 4800x2400 (>32 MiB chunk)
+        bad = bc7_case(c, 4, 4, 37, 23) || bc7_case(c, 8, 8, 37, 23) || bc7_case(c, 12, 12, 37, 23) ||
+              bc7_case(c, 8, 8, 600, 300);
+    }
+    if (!bad && !vk_astc_bc()) printf("probe-astc: BC encoder not available on this device: not checked\n");
+    else if (!bad && vk_astc_bc_format(0) == VK_FORMAT_BC7_UNORM_BLOCK)
+        printf("probe-astc: BC7 encode: %llu cases passed\n", (unsigned long long)g_bc_cases);
     else if (!bad) printf("probe-astc: BC3 encode: %llu cases within the bounds, lowest PSNR %.1f dB (floor %d)\n",
                           (unsigned long long)g_bc_cases, g_bc_db, BC_MIN_DB);
     if (!bad) {

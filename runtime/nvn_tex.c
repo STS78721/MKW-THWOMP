@@ -227,3 +227,39 @@ void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, 
     *tileD = adj_tile(L.tileD, 1, ld);
 }
 
+void nvn_sparse_tile_layout(const nvn_texdesc *d, int32_t out[4]) {
+    if (!out) return;
+    if (!d) { out[0] = 1; out[1] = 128; out[2] = 128; out[3] = 1; return; }
+    fmt_t t = fmt_of(d->format);
+    unsigned dpl; int layered; uint32_t w, h, z;
+    shape(d, &dpl, &layered, &w, &h, &z);
+    uint32_t sx, sy;
+    samples_xy(d->samples, &sx, &sy);
+    unsigned bpb = t.bpb ? t.bpb : 4;
+    uint32_t tw_tex = 128, th_tex = 128, td_tex = 1;
+    if (dpl == 3) {
+        tw_tex = 32 * t.bw;
+        th_tex = 32 * t.bh;
+        uint32_t d64k = 65536u / (32u * 32u * bpb);
+        td_tex = d64k ? d64k : 1;
+    } else {
+        uint32_t tw, th;
+        sparse_tile_blocks(bpb, &tw, &th);
+        tw_tex = (tw * t.bw) / sx;
+        th_tex = dpl >= 2 ? (th * t.bh) / sy : 1;
+        if (!tw_tex) tw_tex = 1;
+        if (!th_tex) th_tex = 1;
+    }
+    uint32_t levels = d->levels ? d->levels : 1;
+    int32_t nlev = 0;
+    for (uint32_t l = 0; l < levels; l++) {
+        uint32_t lw = mip(w, l), lh = dpl >= 2 ? mip(h, l) : 1, ld = dpl >= 3 ? mip(z, l) : 1;
+        if (lw < tw_tex || (dpl >= 2 && lh < th_tex) || (dpl >= 3 && ld < td_tex)) break;
+        nlev++;
+    }
+    out[0] = nlev;
+    out[1] = (int32_t)tw_tex;
+    out[2] = (int32_t)th_tex;
+    out[3] = (int32_t)td_tex;
+}
+

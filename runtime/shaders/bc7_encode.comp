@@ -1,0 +1,105 @@
+// Ported from adriadam10/mkw-recomp (MIT, Copyright (c) 2026 Adrià, commit 649bab1),
+// runtime/shaders/bc7_encode.comp. Same Params and bindings as bc3_encode.comp; vk_astc.c picks it over BC3\n// when the device samples BC7 (MKW_ASTC_BC7=0 keeps BC3). Compiled to runtime/bc7_encode_spv.h by tools/build_shaders.py.
+// RGBA8 texels -> BC7 blocks in mode 6 (one subset, RGBA 7.7.7.7 endpoints with a p-bit each, 4-bit indices). Used
+// after the ASTC compute decoder (vk_astc.c): a device without ASTC keeps the texture at 1 byte per texel instead of 4
+// (RGBA8), as Ryujinx does with EnableTextureRecompression (it encodes BC7 on the CPU). Endpoints: the block's
+// bounding segment along its principal axis (power iteration on the covariance), then the p-bit that fits best.
+// Bit layout: Khronos Data Format Specification 1.3, BC7 section (mode 6).
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Texels { uint px[]; };    // RGBA8, R in the low byte
+layout(std430, set = 0, binding = 1) writeonly buffer Blocks { uvec4 blk[]; };
+
+layout(push_constant) uniform Params {
+    uint in_base;    // first texel of the region (uint index)
+    uint out_base;   // first block of the region (uvec4 index)
+    uint width, height;
+    uint bx, bslice;   // blocks per row, blocks per slice
+};
+
+const uint W4[16] = uint[](0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64);
+
+uvec4 bits_;
+uint at_;
+
+void put(uint v, uint n) {   // n <= 8 bits, little-endian from bit 0 of the block
+    uint w = at_ >> 5, s = at_ & 31u;
+    bits_[w] |= v << s;
+    if (s + n > 32u) bits_[w + 1] |= v >> (32u - s);
+    at_ += n;
+}
+
+vec4 texel(uint x, uint y, uint z) {   // edge texels repeat past the image (blocks of a small mip)
+    x = min(x, width - 1u), y = min(y, height - 1u);
+    uint v = px[in_base + (z * height + y) * width + x];
+    return vec4(v & 255u, (v >> 8) & 255u, (v >> 16) & 255u, v >> 24);
+}
+
+// The 8-bit endpoint value nearest to e that has p as its lowest bit, and its 7-bit code.
+uint quant(float e, uint p) { return uint(clamp(round((e - float(p)) * 0.5), 0.0, 127.0)); }
+
+void main() {
+    uint bxi = gl_GlobalInvocationID.x, byi = gl_GlobalInvocationID.y, z = gl_GlobalInvocationID.z;
+    if (bxi >= bx || byi * bx >= bslice) return;
+    vec4 c[16];
+    vec4 mean = vec4(0.0);
+    for (uint i = 0u; i < 16u; i++) {
+        c[i] = texel(bxi * 4u + (i & 3u), byi * 4u + (i >> 2), z);
+        mean += c[i];
+    }
+    mean *= 1.0 / 16.0;
+    mat4 cov = mat4(0.0);
+    for (uint i = 0u; i < 16u; i++) {
+        vec4 d = c[i] - mean;
+        cov += outerProduct(d, d);
+    }
+    vec4 axis = vec4(1.0, 1.0, 1.0, 0.25);
+    for (int k = 0; k < 6; k++) {
+        axis = cov * axis;
+        float l = length(axis);
+        axis = l > 1e-6 ? axis / l : vec4(0.577, 0.577, 0.577, 0.0);
+    }
+    float tmin = 1e9, tmax = -1e9;
+    for (uint i = 0u; i < 16u; i++) {
+        float t = dot(c[i] - mean, axis);
+        tmin = min(tmin, t), tmax = max(tmax, t);
+    }
+    vec4 e[2] = vec4[](clamp(mean + axis * tmin, 0.0, 255.0), clamp(mean + axis * tmax, 0.0, 255.0));
+    uvec4 q[2];
+    uint p[2];
+    for (int j = 0; j < 2; j++) {   // the p-bit that puts the four channels nearest to the float endpoint
+        float best = 1e9;
+        for (uint pb = 0u; pb < 2u; pb++) {
+            uvec4 qq = uvec4(quant(e[j].r, pb), quant(e[j].g, pb), quant(e[j].b, pb), quant(e[j].a, pb));
+            vec4 v = vec4(qq * 2u + pb);
+            float err = dot(v - e[j], v - e[j]);
+            if (err < best) best = err, q[j] = qq, p[j] = pb;
+        }
+    }
+    vec4 v0 = vec4(q[0] * 2u + p[0]), v1 = vec4(q[1] * 2u + p[1]);
+    uint idx[16];
+    for (uint i = 0u; i < 16u; i++) {   // nearest of the 16 interpolated colours
+        float best = 1e9;
+        uint bi = 0u;
+        for (uint k = 0u; k < 16u; k++) {
+            vec4 v = floor((v0 * float(64u - W4[k]) + v1 * float(W4[k]) + 32.0) / 64.0);
+            float err = dot(v - c[i], v - c[i]);
+            if (err < best) best = err, bi = k;
+        }
+        idx[i] = bi;
+    }
+    if (idx[0] >= 8u) {   // the anchor index has an implicit top bit of 0: swap the endpoints
+        uvec4 tq = q[0]; q[0] = q[1]; q[1] = tq;
+        uint tp = p[0]; p[0] = p[1]; p[1] = tp;
+        for (uint i = 0u; i < 16u; i++) idx[i] = 15u - idx[i];
+    }
+    bits_ = uvec4(0u), at_ = 0u;
+    put(64u, 7u);   // mode 6: six 0 bits, then a 1
+    for (int ch = 0; ch < 4; ch++) put(q[0][ch], 7u), put(q[1][ch], 7u);
+    put(p[0], 1u), put(p[1], 1u);
+    put(idx[0], 3u);
+    for (uint i = 1u; i < 16u; i++) put(idx[i], 4u);
+    blk[out_base + z * bslice + byi * bx + bxi] = bits_;
+}

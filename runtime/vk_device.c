@@ -194,6 +194,7 @@ static int pick_device(void) {
     VkQueueFamilyProperties *qp = calloc(nq ? nq : 1, sizeof *qp);
     vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nq, qp);
     g_vk.gfx_family = find_gfx_family(g_vk.phys, qp, nq);
+    g_vk.gfx_sparse_queue = (qp[g_vk.gfx_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
     g_vk.xfer_family = g_vk.gfx_family;
     for (uint32_t i = 0; i < nq; i++)   // a family that does transfer only (async DMA engine)
         if ((qp[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && !(qp[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
@@ -368,8 +369,23 @@ static int create_device(void) {
            : "no: a list draw's restart index is fetched as a vertex");
     if (g_vk.has_address_binding_report && !c->abr.reportAddressBinding) g_vk.has_address_binding_report = 0;
     if (g_vk.has_pipeline_exec_info && !c->pei.pipelineExecutableInfo) g_vk.has_pipeline_exec_info = 0;
+    if (!g_vk.gfx_sparse_queue) {
+        c->f2.features.sparseBinding = VK_FALSE;
+        c->f2.features.sparseResidencyBuffer = VK_FALSE;
+        c->f2.features.sparseResidencyImage2D = VK_FALSE;
+        c->f2.features.sparseResidencyImage3D = VK_FALSE;
+        c->f2.features.sparseResidency2Samples = VK_FALSE;
+        c->f2.features.sparseResidency4Samples = VK_FALSE;
+        c->f2.features.sparseResidency8Samples = VK_FALSE;
+        c->f2.features.sparseResidency16Samples = VK_FALSE;
+        c->f2.features.sparseResidencyAliased = VK_FALSE;
+    }
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
+    g_vk.has_sparse = g_vk.gfx_sparse_queue && h->sparseBinding && h->sparseResidencyImage2D && h->sparseResidencyAliased;
+    rt_log("vk: sparse residency 2D: %s (queue=%d binding=%d residency2D=%d aliased=%d)",
+           g_vk.has_sparse ? "enabled" : "unavailable", g_vk.gfx_sparse_queue,
+           h->sparseBinding != 0, h->sparseResidencyImage2D != 0, h->sparseResidencyAliased != 0);
     {
         const char *e = cfg_get("TOTK_FEEDBACK");
         int layout_ok = has_fbl && has_lr && c->fbl.attachmentFeedbackLoopLayout && c->lr.dynamicRenderingLocalRead;
@@ -442,6 +458,7 @@ static void destroy_all(void) {
     if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
     if (g_vk.device) vk_clear_shutdown(g_vk.device);
     if (g_vk.device) vk_astc_release();
+    if (g_vk.device) vk_sparse_shutdown();
     if (g_vk.device) vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
     vk_headroom_stop();

@@ -57,6 +57,7 @@ typedef struct Tex {
     uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
                                   // storage binding); ReadTexels waits for it instead of draining the replay queue
     uint8_t listed;               // in owned[]
+    uint8_t sparse;               // Vulkan sparse image backed by tile slots (vk_sparse.c)
     uint8_t *snap;                // a texture that fills no page: its storage bytes when the GPU write was recorded
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
     struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
@@ -205,13 +206,24 @@ static uint64_t compact_astc_budget(uint64_t want) {
 // 2048 RGBA8×68 ≈ 1.45 GiB blew VRAM (n78: mirrors refused at 13/14.6 GiB, title lost all
 // background / foliage into a dark void). 1024 (~363 MiB) keeps room for mesh SSBO mirrors.
 enum { COMPACT_ASTC_HUGE_EDGE = 1024u };
+// MKW_COMPACT_HUGE_EDGE=1024|2048|4096 overrides. Unset: 2048 when the largest device-local heap is 12 GiB or more
+// (import memory mode keeps the pools in host memory, so the n78 mirror pressure above no longer applies), else 1024.
+// adriadam10/mkw-recomp keeps every terrain level (4 GiB budget, sparse tiles); 1024 is visibly blurry ground.
+static uint32_t huge_edge_default(void) {
+    const char *s = cfg_get("TOTK_COMPACT_HUGE_EDGE");
+    if (s && *s) {
+        uint32_t v = (uint32_t)atoi(s);
+        if (v == 512 || v == 1024 || v == 2048 || v == 4096) return v;
+    }
+    return COMPACT_ASTC_HUGE_EDGE;
+}
 static uint32_t huge_astc_host_edge(uint32_t guest_w, uint32_t guest_h, uint32_t guest_levels, uint32_t layers,
                                     uint32_t bpt) {
     static uint32_t locked;
     static int logged;
     (void)guest_w; (void)guest_h; (void)guest_levels; (void)layers; (void)bpt;
     if (locked) return locked;
-    locked = COMPACT_ASTC_HUGE_EDGE;
+    locked = huge_edge_default();
     if (!logged) {
         logged = 1;
         rt_log("vk: CompactLayers huge ASTC arrays locked to host edge %u (same for all)", locked);
@@ -219,10 +231,17 @@ static uint32_t huge_astc_host_edge(uint32_t guest_w, uint32_t guest_h, uint32_t
     return locked;
 }
 
+// Allocation-hint and usage flags that do not change guest byte layout on unified memory; create_tex already enables
+// storage usage on single-sample colour formats, so descriptors differing only in these flags share one VkImage.
+#define KEY_FREE_FLAGS \
+    (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_ADAPTIVE_ZCULL | \
+     NVN_TEXTURE_FLAGS_ZCULL_SUPPORT_STENCIL)
+
 static void make_key(const tex_t *t, TexKey *k) {
     memset(k, 0, sizeof *k);
     k->addr = (uintptr_t)t->mem;
     k->d = t->d;
+    k->d.flags &= ~KEY_FREE_FLAGS;
     k->has_layout = t->has_layout;
     memcpy(k->layout, t->layout, 8);
 }
@@ -297,11 +316,13 @@ static int format_compressed(VkFormat f) {   // vkCmdClearColorImage takes no bl
 }
 
 static int bind_pool_memory(VkCtx *c, Tex *e, VkImage img, uint64_t guest_size) {
+    // Decoded ASTC, RGB-expanded, and format-converted images never match guest byte layout in pool memory, and any
+    // image whose host memory requirement exceeds guest_size would overwrite adjacent pool allocations when written.
+    if (e->f.astc_bw || e->f.expand_rgb || e->f.vk != e->f.ideal) return 0;
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(c->device, img, &req);
-    if ((e->f.depth || e->f.stencil) && req.size > guest_size) return 0;
+    if (!req.size || req.size > guest_size) return 0;
     VkMemSpan sp;
-    if (!req.size) return 0;   // an image the device could not lay out (image_size)
     if (!vk_mem_resolve(e->pub.addr, req.size, &sp) || !sp.alloc || sp.alloc_offset % req.alignment) return 0;
     VmaAllocationInfo info;
     vmaGetAllocationInfo(c->vma, sp.alloc, &info);
@@ -350,7 +371,9 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
                                 .image = e->pub.image, .subresourceRange = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
     vkCmdPipelineBarrier2(cb, &di);
-    if (e->f.depth || e->f.stencil) {
+    if (e->sparse) {
+        // Sparse tiles get zeroed slot memory when bound; clearing the image would wipe shared physical pages.
+    } else if (e->f.depth || e->f.stencil) {
         VkClearDepthStencilValue zero = {0.0f, 0};
         VkImageSubresourceRange rg = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearDepthStencilImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
@@ -380,6 +403,13 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     if (!tex_vk_format(d->format, &f)) {
         log_limited(&n_unmapped, "texture format %#x has no Vulkan format: %s", d->format, f.reason);
         return NULL;
+    }
+    int sparse_cand = (d->flags & NVN_TEXTURE_FLAGS_SPARSE) && nvn_gpu_only(k->addr);
+    // Keep small ASTC textures (< 256x256) as lossless RGBA8: they are mostly LUTs / noise maps that lossy BC7
+    // degrades visibly, and they take negligible VRAM (adriadam10/mkw-recomp, MIT).
+    if (f.astc_bc && !sparse_cand && (uint64_t)d->width * d->height < 256u * 256u) {
+        f.astc_bc = 0;
+        f.vk = f.astc_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     }
     if (!tex_vk_format_supported(&f)) {
         log_limited(&n_unsupported, "texture format %#x: VkFormat %d lacks features %#x", d->format, (int)f.vk, (unsigned)f.need);
@@ -448,7 +478,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         rt_log("vk: 3D BC textures %s (TOTK_BLOCK_VIEWS_3D=%d)", bv3d ? "get block views (renderable)" : "have no block views",
                bv3d);
     }
-    if (!ds && samples == 1 && f.vk == f.ideal && nvn_fmt_bpb(d->format, &bw, &bh) && bw == 4 && bh == 4 &&
+    if (!ds && samples == 1 && !sparse_cand && f.vk == f.ideal && nvn_fmt_bpb(d->format, &bw, &bh) && bw == 4 && bh == 4 &&
         (type != VK_IMAGE_TYPE_3D || bv3d)) {
         VkImageCreateInfo bc = ci;   // BC formats: renderable through views of their blocks (block_views_ok)
         bc.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -473,11 +503,19 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
                    (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
     if (fb_usage) ci.usage = usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     uint32_t host_mip0 = 0, guest_w = w, guest_h = h, guest_levels = levels;
-    // CompactLayers (Eglantine PR #570): MKW's 8192x8192x68 ASTC terrain arrays do not fit as full RGBA8/BC3.
-    // Drop top guest mips until the host image is under COMPACT_ASTC_BUDGET (or 1024px), then create that size.
-    if (f.astc_bw && samples == 1 && type != VK_IMAGE_TYPE_3D) {
-        // Estimate with BC density when the global knob is on, but do not convert CompactLayers to BC:
-        // T2T folds from decoded staging need RGBA8 blits (BC CopyImage cannot scale → missing ground).
+    Tex *e = calloc(1, sizeof *e);
+    if (!e) rt_fatal("vk: out of memory for a texture");
+    e->key = *k;
+    e->t = *t;
+    e->f = f;
+    e->pub.addr = k->addr;
+    VkImage img = VK_NULL_HANDLE;
+    // Sparse residency first (vk_sparse.c): keeps full 8192x8192 resolution as BC7/BC6H/D16 without allocating unmapped pages!
+    if (sparse_cand && vk_sparse_create(&ci, d, k->addr, L.size, &img)) {
+        e->sparse = 1;
+    }
+    // CompactLayers fallback when sparse residency is disabled or unavailable for this format/shape.
+    if ((!vk_sparse_on() || sparse_cand) && !img && f.astc_bw && samples == 1 && type != VK_IMAGE_TYPE_3D) {
         uint32_t bpt_est = f.astc_bc || vk_astc_bc() ? 1u : 4u;
         uint64_t need = est_tex_bytes(w, h, depth, levels, layers, bpt_est);
         uint64_t budget = compact_astc_budget(need);
@@ -485,9 +523,6 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         if (huge || need > budget) {
             uint32_t edge_cap = huge ? huge_astc_host_edge(guest_w, guest_h, guest_levels, layers, bpt_est)
                                      : COMPACT_ASTC_MAX_EDGE;
-            // CompactLayers stay RGBA8 (4 B/texel) so folds blit; size the host for that density.
-            // Huge arrays: never trim below the locked edge for budget alone — n09 dropped 768→512
-            // under live VRAM pressure and soft-grounded the title. Create/retry still handles true OOM.
             uint32_t bpt = 4u;
             while (levels > 1) {
                 int over_edge = umax(w, h) > edge_cap;
@@ -499,7 +534,6 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
                 h = mip(guest_h, host_mip0);
                 levels = guest_levels > host_mip0 ? guest_levels - host_mip0 : 1;
             }
-            // Keep uncompressed host format even when TOTK_ASTC_BC=1.
             if (f.astc_bc) {
                 f.astc_bc = 0;
                 f.vk = f.astc_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
@@ -512,27 +546,11 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
                 rt_log("vk: CompactLayers ASTC %#x %ux%u x%u -> host %ux%u levels %u (skip %u guest mips, ~%.0f MiB, RGBA8 folds) addr %#llx",
                        d->format, guest_w, guest_h, layers, w, h, levels, host_mip0,
                        est_tex_bytes(w, h, depth, levels, layers, bpt) / 1048576.0, (unsigned long long)k->addr);
-        } else if (!f.astc_bc && vk_astc_bc()) {
-            // Large few-layer ASTC is the decoded staging the game blits into CompactLayers. BC3
-            // here left fmt BC3→RGBA8 folds skipped (8192 vs 0, empty ground). Keep RGBA8 so the
-            // scale-fold blit in copy_decoded_astc can run; BC stays for smaller / many-layer tex.
-            int fold_src = layers <= 4 && umax(guest_w, guest_h) >= 4096;
-            if (!fold_src) {
-                f.vk = f.astc_srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
-                f.astc_bc = 1;
-                ci.format = f.vk;
-            }
         }
+        e->f = f;
     }
-    Tex *e = calloc(1, sizeof *e);
-    if (!e) rt_fatal("vk: out of memory for a texture");
-    e->key = *k;
-    e->t = *t;
-    e->f = f;
-    e->pub.addr = k->addr;
-    VkImage img = VK_NULL_HANDLE;
     // Trimmed ASTC arrays are smaller than the guest pool allocation: always take own memory.
-    if (!host_mip0 && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
+    if (!img && !host_mip0 && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
         if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img, L.size)) {
             vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
@@ -554,14 +572,17 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         if (vk_mem_vram(&v_used, &v_budget, &v_exact) && v_budget && v_used > v_budget / 20 * 17) {
             if (rel_head) evict_vram_oom(0);
             int fold_src = layers <= 4 && umax(guest_w, guest_h) >= 4096;
-            if (!host_mip0 && !fold_src && f.astc_bw && !f.astc_bc && vk_astc_mode() == VK_ASTC_GPU &&
-                vk_mem_vram(&v_used, &v_budget, &v_exact) && v_used > v_budget / 20 * 17) {
-                f.vk = f.astc_srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+            if (!host_mip0 && !fold_src && f.astc_bw && !f.astc_bc && (uint64_t)w * h >= 256u * 256u &&
+                vk_astc_mode() == VK_ASTC_GPU && vk_mem_vram(&v_used, &v_budget, &v_exact) && v_used > v_budget / 20 * 17) {
+                f.vk = vk_astc_bc_format(f.astc_srgb);
                 f.astc_bc = 1;
                 ci.format = f.vk;
+                ci.usage &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                              VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+                if (!block_views) ci.flags &= ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
                 e->f = f;
                 log_limited(&n_oom_evict,
-                            "vk: VRAM usage %llu/%llu MiB (>85%%); compressing ASTC %ux%u to BC3",
+                            "vk: VRAM usage %llu/%llu MiB (>85%%); compressing ASTC %ux%u to BC",
                             (unsigned long long)(v_used >> 20), (unsigned long long)(v_budget >> 20), w, h);
             }
         }
@@ -578,13 +599,16 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
                             w, h, depth, d->format, n_evict);
         }
         if (r != VK_SUCCESS && f.astc_bw && !f.astc_bc) {
-            f.vk = f.astc_srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+            f.vk = vk_astc_bc_format(f.astc_srgb);
             f.astc_bc = 1;
             ci.format = f.vk;
+            ci.usage &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                          VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT);
+            if (!block_views) ci.flags &= ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
             r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
             if (r == VK_SUCCESS) {
                 e->f = f;
-                rt_log("vk: mega-texture %ux%ux%u layers %u fell back to BC3 (%s)", guest_w, guest_h, depth, layers,
+                rt_log("vk: mega-texture %ux%ux%u layers %u fell back to BC (%s)", guest_w, guest_h, depth, layers,
                        f.astc_srgb ? "SRGB" : "UNORM");
             }
         }
@@ -633,6 +657,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         p->swz[3] = NVN_TEXTURE_SWIZZLE_A;
     p->mirrored = (uint8_t)tex_mirrored(t);
     p->bound = e->bound_to != NULL;
+    p->sparse = e->sparse;
     p->block_views = (uint8_t)block_views;
     p->fb_usage = (uint8_t)fb_usage;
 
@@ -712,6 +737,8 @@ static void destroy_tex(Tex *e) {
     }
     if (e->released) nreleased--, rel_unlink(e);
     vk_exec_image_gone(e->pub.image);
+    uint64_t bf = e->sparse ? vk_sparse_destroy(e->pub.image) : 0;
+    if (bf) vk_mem_protect_until(bf);
     vk_defer_image(e->pub.image, e->alloc);
     free(e->snap);
     free(e);
@@ -1106,7 +1133,7 @@ static int img_block(const Tex *e, int *bw, int *bh) {
 // image formats of one block size.
 static int alias_compatible(const Tex *e, const Tex *src) {
     const VkTexImage *p = &e->pub, *q = &src->pub;
-    if (e->f.depth || e->f.stencil || src->f.depth || src->f.stencil || p->samples > 1 || q->samples > 1) return 0;
+    if (e->sparse || src->sparse || e->f.depth || e->f.stencil || src->f.depth || src->f.stencil || p->samples > 1 || q->samples > 1) return 0;
     if (p->type != q->type || p->width != q->width || p->height != q->height || p->depth != q->depth) return 0;
     if (e->t.L.size != src->t.L.size || nvn_tex_is_linear(&e->t.d) != nvn_tex_is_linear(&src->t.d)) return 0;
     int ew, eh, sw, sh, eb = img_block(e, &ew, &eh), sb = img_block(src, &sw, &sh);
@@ -1330,7 +1357,7 @@ void vk_texture_sparse_pages_mapped(uint64_t lo, uint64_t size) {
         if (a >= hi || b <= lo) continue;
         // Pool-aliased images keep their create-time physical bind; destroying them on every 64 KiB
         // MapVirtual would recreate the whole array per streamed tile. Real fix is sparse residency.
-        if (e->bound_to || (!e->uploaded && !e->pub.mirrored)) continue;
+        if (e->bound_to || e->sparse || (!e->uploaded && !e->pub.mirrored)) continue;
         // CompactLayers / own-memory arrays: re-upload only layers that overlap the mapped pages so
         // streamed tiles do not flash the whole 68-layer host (pop-in). Fall back to a full mark when
         // layer_size is unknown or the hit is not layered.
@@ -1656,15 +1683,17 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
         // A BC3 image takes whole 4x4 blocks, or a part that ends on the mip's edge; a region of a 5x5 or 6x6 footprint
         // may end inside a block (vk_astc_record checks the start corner). Host mip size, not guest.
         uint32_t mw = umax(e->pub.width >> host_level, 1), mh = umax(e->pub.height >> host_level, 1);
-        int bc_cut = e->f.astc_bc && (((w & 3) && (uint32_t)r->xoffset + w != mw) ||
-                                      ((h & 3) && (uint32_t)r->yoffset + h != mh));
+        int img_bc = e->f.astc_bc && e->pub.format != VK_FORMAT_R8G8B8A8_UNORM &&
+                     e->pub.format != VK_FORMAT_R8G8B8A8_SRGB;
+        int bc_cut = img_bc && (((w & 3) && (uint32_t)r->xoffset + w != mw) ||
+                                ((h & 3) && (uint32_t)r->yoffset + h != mh));
         if (agpu && !bc_cut) {   // bc_cut: nothing recorded, logged below as not decoded
             VkAstcRegion *ar = calloc((size_t)g->nz, sizeof *ar);
             for (int z = 0; z < g->nz; z++)
                 ar[z] = (VkAstcRegion){.src = slice * (size_t)z, .w = w, .h = h, .slices = 1, .level = rg[z].imageSubresource.mipLevel,
                                        .layer = rg[z].imageSubresource.baseArrayLayer, .offset = rg[z].imageOffset};
             uint64_t a0 = perf_begin();
-            done = vk_astc_record(cb, sb, slice * (size_t)g->nz, ar, g->nz, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->f.astc_bc,
+            done = vk_astc_record(cb, sb, slice * (size_t)g->nz, ar, g->nz, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, img_bc,
                                   e->pub.image, aspect, VK_NULL_HANDLE);
             perf_end(PERF_ASTC, a0);
             free(ar);
@@ -2195,6 +2224,47 @@ void vk_texture_free_for_vram(uint64_t need) {
         vk_mem_collect();
     }
     unlock();
+}
+
+int vk_texture_astc_copy(const tex_t *src, uint32_t level, uint32_t layer, uint32_t layers, uint32_t x, uint32_t y,
+                         uint32_t w, uint32_t h, const VkTexImage *dst, VkImageAspectFlags aspect, uint32_t dlevel,
+                         uint32_t dlayer, int32_t dx, int32_t dy, int bc) {
+    TexVkFormat f;
+    if (!src || !dst || !tex_vk_format(src->d.format, &f) || !f.astc_bw || !src->mem ||
+        x % f.astc_bw || y % f.astc_bh || (bc && (dx % 4 || dy % 4)))
+        return 0;
+    uint32_t rb = (w + f.astc_bw - 1) / f.astc_bw * 16, rows = (h + f.astc_bh - 1) / f.astc_bh;
+    size_t per = (size_t)rb * rows, total = per * layers;
+    if (!total) return 0;
+    VkAstcRegion *ar = calloc(layers, sizeof *ar);
+    if (!ar) return 0;
+    VkCommandBuffer cb = vk_upload_begin();
+    VkBuffer sb = VK_NULL_HANDLE;
+    uint8_t *stg = vk_staging(total, &sb, NULL);
+    int ok = stg != NULL;
+    uint32_t dlw = dst->width >> dlevel ? dst->width >> dlevel : 1;
+    uint32_t dlh = dst->height >> dlevel ? dst->height >> dlevel : 1;
+    for (uint32_t l = 0; l < layers && ok; l++) {
+        ok = !nvn_texels_box(&src->d, level, layer + l, x / f.astc_bw * 16, y / f.astc_bh, 0, rb, rows, src->mem,
+                             stg + l * per, rb, 1);
+        ar[l] = (VkAstcRegion){.src = l * per, .w = w, .h = h, .slices = 1, .level = dlevel, .layer = dlayer + l,
+                               .lw = dlw, .lh = dlh, .offset = {dx, dy, 0}};
+    }
+    if (ok) {
+        barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        ok = vk_astc_record(cb, sb, total, ar, (int)layers, f.astc_bw, f.astc_bh, f.astc_srgb, bc, dst->image, aspect,
+                            VK_NULL_HANDLE);
+        barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+    }
+    vk_upload_end();
+    if (total > (64ull << 20)) vk_upload_flush(1);
+    free(ar);
+    static volatile int32_t n_logged;
+    if (plat_inc32(&n_logged) <= 8)
+        rt_log("vk: ASTC %ux%u (fmt %#x) level %u layer %u x%u -> %s level %u layer %u at %d,%d: %s", w, h,
+               src->d.format, level, layer, layers, bc ? "BC" : "RGBA8", dlevel, dlayer, dx, dy,
+               ok ? "decoded" : "failed");
+    return ok;
 }
 
 void vk_texture_shutdown(void) {

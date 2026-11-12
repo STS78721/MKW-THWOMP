@@ -60,7 +60,7 @@ enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SP
        SPV_OP_CONSTANT_NULL = 46, SPV_OP_FUNCTION = 54, SPV_OP_VARIABLE = 59,
        SPV_OP_DECORATE = 71, SPV_DEC_BUILTIN = 11, SPV_DEC_LOCATION = 30, SPV_DEC_INDEX = 32, SPV_DEC_BINDING = 33, SPV_DEC_DESCRIPTOR_SET = 34,
        SPV_DEC_PER_PRIMITIVE = 5271, // PerPrimitiveEXT (SPV_EXT_mesh_shader)
-       SPV_SC_OUTPUT = 3 };
+       SPV_SC_INPUT = 1, SPV_SC_OUTPUT = 3, SPV_SC_PRIVATE = 6 };
 
 #define MAX_BINDINGS 128
 #define PIPE_BUCKETS 4096
@@ -693,67 +693,48 @@ static uint32_t *spirv_rebind(const uint32_t *w, uint64_t n, uint32_t off) {
     return o;
 }
 
-// Locations that already carry Decoration PerPrimitiveEXT (mesh per-primitive outputs).
+// Locations on Output variables that carry Decoration PerPrimitiveEXT (mesh per-primitive outputs).
 static uint32_t spirv_per_primitive_locs(const uint32_t *w, uint64_t n) {
-    uint8_t per_id[256];
-    uint32_t locs = 0, bound = n > 3 ? w[3] : 0;
-    memset(per_id, 0, sizeof per_id);
-    if (bound > sizeof per_id) bound = (uint32_t)sizeof per_id;
-    for (uint64_t i = 5; i < n;) {
-        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (!len || i + len > n) break;
-        if (op == SPV_OP_DECORATE && len >= 3 && w[i + 2] == SPV_DEC_PER_PRIMITIVE && w[i + 1] < bound)
-            per_id[w[i + 1]] = 1;
-        i += len;
+    uint32_t locs = 0, bound = n > 3 && w[3] < (1u << 20) ? w[3] : 0;
+    if (!bound) return 0;
+    uint8_t *per_id = calloc(bound, 1), *is_out = calloc(bound, 1);
+    if (!per_id || !is_out) {
+        free(per_id), free(is_out);
+        return 0;
     }
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) break;
+        if (op == SPV_OP_FUNCTION) break;
+        if (op == SPV_OP_DECORATE && len >= 3 && w[i + 2] == SPV_DEC_PER_PRIMITIVE && w[i + 1] < bound)
+            per_id[w[i + 1]] = 1;
+        else if (op == SPV_OP_VARIABLE && len >= 4 && w[i + 3] == SPV_SC_OUTPUT && w[i + 2] < bound)
+            is_out[w[i + 2]] = 1;
+        i += len;
+    }
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n || op == SPV_OP_FUNCTION) break;
         if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_LOCATION && w[i + 3] < 32 &&
-            w[i + 1] < bound && per_id[w[i + 1]])
+            w[i + 1] < bound && per_id[w[i + 1]] && is_out[w[i + 1]])
             locs |= 1u << w[i + 3];
         i += len;
     }
+    free(per_id), free(is_out);
     return locs;
 }
 
-// Mark FS input Locations in `locs` as PerPrimitiveEXT so they match mesh per-primitive outs (Hookshot
-// re-emits the FS with RuntimeInfo.per_primitive_generics; we only have the TotK FS module).
+// Mark FS Input variables at Locations in `locs` as PerPrimitiveEXT so they match mesh per-primitive outputs.
+// Must filter by SPV_SC_INPUT so Output variables (out_color0 at Location 0) are never decorated.
 static uint32_t *spirv_mark_per_primitive_locs(const uint32_t *w, uint64_t n, uint64_t *out_n, uint32_t locs) {
-    if (!locs || !out_n) return NULL;
-    uint32_t ids[32], n_ids = 0;
-    uint8_t have[32];
-    memset(have, 0, sizeof have);
-    for (uint64_t i = 5; i < n;) {
-        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (!len || i + len > n) break;
-        if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_LOCATION && w[i + 3] < 32 &&
-            (locs & (1u << w[i + 3])) && !have[w[i + 3]] && n_ids < 32) {
-            ids[n_ids++] = w[i + 1];
-            have[w[i + 3]] = 1;
-        }
-        i += len;
+    if (!locs || !out_n || n <= 5) return NULL;
+    uint32_t bound = w[3] < (1u << 20) ? w[3] : 0;
+    if (!bound) return NULL;
+    uint8_t *is_in = calloc(bound, 1), *already = calloc(bound, 1), *queued = calloc(bound, 1);
+    if (!is_in || !already || !queued) {
+        free(is_in), free(already), free(queued);
+        return NULL;
     }
-    if (!n_ids) return NULL;
-    // Skip ids that already carry PerPrimitiveEXT.
-    uint8_t already[256];
-    memset(already, 0, sizeof already);
-    uint32_t bound = n > 3 ? w[3] : 0;
-    if (bound > sizeof already) bound = (uint32_t)sizeof already;
-    for (uint64_t i = 5; i < n;) {
-        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (!len || i + len > n) break;
-        if (op == SPV_OP_DECORATE && len >= 3 && w[i + 2] == SPV_DEC_PER_PRIMITIVE && w[i + 1] < bound)
-            already[w[i + 1]] = 1;
-        i += len;
-    }
-    uint32_t add = 0;
-    for (uint32_t k = 0; k < n_ids; k++)
-        if (ids[k] >= bound || !already[ids[k]]) add++;
-    if (!add) return NULL;
-    uint32_t *o = malloc((n + (uint64_t)add * 3) * 4);
-    if (!o) return NULL;
-    // Insert new Decorate ops just before the first OpFunction (like spirv_dual_source).
     uint64_t at = n;
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
@@ -762,37 +743,236 @@ static uint32_t *spirv_mark_per_primitive_locs(const uint32_t *w, uint64_t n, ui
             at = i;
             break;
         }
+        if (op == SPV_OP_VARIABLE && len >= 4 && w[i + 3] == SPV_SC_INPUT && w[i + 2] < bound)
+            is_in[w[i + 2]] = 1;
+        else if (op == SPV_OP_DECORATE && len >= 3 && w[i + 2] == SPV_DEC_PER_PRIMITIVE && w[i + 1] < bound)
+            already[w[i + 1]] = 1;
         i += len;
     }
+    uint32_t ids[64], n_ids = 0;
+    for (uint64_t i = 5; i < at;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_LOCATION && w[i + 3] < 32 &&
+            (locs & (1u << w[i + 3])) && w[i + 1] < bound && is_in[w[i + 1]] && !already[w[i + 1]] &&
+            !queued[w[i + 1]] && n_ids < 64) {
+            ids[n_ids++] = w[i + 1];
+            queued[w[i + 1]] = 1;
+        }
+        i += len;
+    }
+    free(is_in), free(already), free(queued);
+    if (!n_ids || at == n) return NULL;
+    uint32_t *o = malloc((n + (uint64_t)n_ids * 3) * 4);
+    if (!o) return NULL;
     memcpy(o, w, at * 4);
     uint64_t d = at;
     for (uint32_t k = 0; k < n_ids; k++) {
-        if (ids[k] < bound && already[ids[k]]) continue;
         o[d++] = 3u << 16 | SPV_OP_DECORATE;
         o[d++] = ids[k];
         o[d++] = SPV_DEC_PER_PRIMITIVE;
     }
     memcpy(o + d, w + at, (n - at) * 4);
-    *out_n = n + (uint64_t)add * 3;
+    *out_n = n + (uint64_t)n_ids * 3;
     return o;
 }
 
-// Remap OpDecorate Location values: map[old]=new for old<32; 0xff leaves a Location unchanged.
-// Used to densify mesh↔FS generics onto a shared 0..N packing (n186: mesh SPH only enables
-// Generics 4+5 while the TotK FS imap wanted Locations 0-5 → black foliage silhouettes).
-static uint32_t *spirv_remap_locations(const uint32_t *w, uint64_t n, const uint8_t map[32]) {
-    uint32_t *o = malloc(n * 4);
-    if (!o) return NULL;
-    memcpy(o, w, n * 4);
+// Convert unwritten FS Input variables whose Location bit is in `unwritten_mask` into Private variables
+// initialized to Maxwell/Ampere's hardware default (0, 0, 0, 1) (1.0f bit pattern in component 3, 0 in 0..2).
+// Keeps the variable's SPIR-V ID intact and rewrites any OpAccessChain on it from Input pointer to Private pointer.
+static uint32_t *spirv_default_fs_inputs(const uint32_t *w, uint64_t n, uint32_t unwritten_mask, uint64_t *out_n) {
+    enum { OP_ACCESS_CHAIN = 65, OP_IN_BOUNDS_ACCESS_CHAIN = 66, OP_GROUP_DECORATE = 74, DEC_COMPONENT = 31 };
+    if (!unwritten_mask || !out_n || n < 5) return NULL;
+    uint32_t bound = w[3];
+    if (!bound || bound > (1u << 20)) return NULL;
+    uint8_t *loc_of = malloc(bound), *comp_off = calloc(bound, 1), *conv_var = calloc(bound, 1);
+    uint8_t *is_priv_ptr = calloc(bound, 1), *scalar_bits = calloc(bound, 1), *vec_cnt = calloc(bound, 1);
+    uint32_t *vec_comp = calloc(bound, 4), *ptr_sc = calloc(bound, 4), *ptr_elem = calloc(bound, 4);
+    uint32_t *o = NULL;
+    if (!loc_of || !comp_off || !conv_var || !is_priv_ptr || !scalar_bits || !vec_cnt || !vec_comp || !ptr_sc || !ptr_elem)
+        goto out;
+    memset(loc_of, 0xff, bound);
+    struct { uint32_t id, elem; } pptr[64];
+    struct { uint32_t type, bits, id; } sconst[32];
+    struct { uint32_t var_id, val_type, comp_type; uint8_t cnt, cstart, bits; } tgt[64];
+    int n_pptr = 0, n_sconst = 0, n_tgt = 0;
+    uint64_t ep_at = 0, fn_at = 0;
     for (uint64_t i = 5; i < n;) {
-        uint32_t op = o[i] & 0xffff, len = o[i] >> 16;
-        if (!len || i + len > n) break;
-        if (op == SPV_OP_DECORATE && len >= 4 && o[i + 2] == SPV_DEC_LOCATION && o[i + 3] < 32) {
-            uint8_t m = map[o[i + 3]];
-            if (m != 0xff) o[i + 3] = m;
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto out;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_FUNCTION) { fn_at = i; break; }
+        if (op == SPV_OP_ENTRY_POINT && !ep_at) ep_at = i;
+        else if (op == SPV_OP_DECORATE && len >= 4 && a[0] < bound) {
+            if (a[1] == SPV_DEC_LOCATION && a[2] < 32) loc_of[a[0]] = (uint8_t)a[2];
+            else if (a[1] == DEC_COMPONENT && a[2] < 4) comp_off[a[0]] = (uint8_t)a[2];
+        } else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[0] < bound) scalar_bits[a[0]] = (uint8_t)a[1];
+        else if (op == SPV_OP_TYPE_INT && len >= 4 && a[0] < bound) scalar_bits[a[0]] = (uint8_t)a[1];
+        else if (op == SPV_OP_TYPE_VECTOR && len >= 4 && a[0] < bound) vec_comp[a[0]] = a[1], vec_cnt[a[0]] = (uint8_t)a[2];
+        else if (op == SPV_OP_TYPE_POINTER && len >= 4 && a[0] < bound) {
+            ptr_sc[a[0]] = a[1], ptr_elem[a[0]] = a[2];
+            if (a[1] == SPV_SC_PRIVATE && n_pptr < 64) pptr[n_pptr].id = a[0], pptr[n_pptr++].elem = a[2];
         }
         i += len;
     }
+    if (!ep_at || !fn_at) goto out;
+    for (uint64_t i = 5; i < fn_at;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_VARIABLE && len >= 4 && a[2] == SPV_SC_INPUT && a[0] < bound && a[1] < bound) {
+            uint8_t loc = loc_of[a[1]];
+            if (loc < 32 && (unwritten_mask & (1u << loc))) {
+                uint32_t vt = ptr_elem[a[0]];
+                uint32_t ct = vt < bound && vec_cnt[vt] ? vec_comp[vt] : vt;
+                uint8_t cnt = vt < bound && vec_cnt[vt] ? vec_cnt[vt] : 1;
+                uint8_t bits = ct < bound ? scalar_bits[ct] : 0;
+                if (!vt || vt >= bound || (bits != 32 && bits != 16) || cnt < 1 || cnt > 4 || n_tgt >= 64) goto out;
+                tgt[n_tgt].var_id = a[1], tgt[n_tgt].val_type = vt, tgt[n_tgt].comp_type = ct;
+                tgt[n_tgt].cnt = cnt, tgt[n_tgt].cstart = comp_off[a[1]], tgt[n_tgt].bits = bits;
+                n_tgt++;
+                conv_var[a[1]] = 1, is_priv_ptr[a[1]] = 1;
+            }
+        }
+        i += len;
+    }
+    if (!n_tgt) goto out;
+    uint32_t new_bound = bound, extra[64 * 24], ne = 0;
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto out;
+        if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 && w[i + 3] < bound &&
+            is_priv_ptr[w[i + 3]]) {
+            uint32_t rt = w[i + 1], rid = w[i + 2];
+            if (rt >= bound || ptr_sc[rt] != SPV_SC_INPUT || !ptr_elem[rt]) goto out;
+            if (rid < bound) is_priv_ptr[rid] = 1;
+            uint32_t elem = ptr_elem[rt];
+            int k = 0;
+            while (k < n_pptr && pptr[k].elem != elem) k++;
+            if (k == n_pptr) {
+                if (n_pptr >= 64) goto out;
+                uint32_t pid = new_bound++;
+                pptr[n_pptr].id = pid, pptr[n_pptr++].elem = elem;
+                extra[ne++] = 4u << 16 | SPV_OP_TYPE_POINTER, extra[ne++] = pid, extra[ne++] = SPV_SC_PRIVATE, extra[ne++] = elem;
+            }
+        }
+        i += len;
+    }
+    for (int t = 0; t < n_tgt; t++) {
+        int pk = 0;
+        while (pk < n_pptr && pptr[pk].elem != tgt[t].val_type) pk++;
+        if (pk == n_pptr) {
+            if (n_pptr >= 64) goto out;
+            uint32_t pid = new_bound++;
+            pptr[n_pptr].id = pid, pptr[n_pptr++].elem = tgt[t].val_type;
+            extra[ne++] = 4u << 16 | SPV_OP_TYPE_POINTER, extra[ne++] = pid, extra[ne++] = SPV_SC_PRIVATE, extra[ne++] = tgt[t].val_type;
+        }
+        uint32_t vp_id = pptr[pk].id, init_id = 0;
+        int hit_w = tgt[t].cstart <= 3 && tgt[t].cstart + tgt[t].cnt > 3;
+        uint32_t one_bits = tgt[t].bits == 16 ? 0x3c00u : 0x3f800000u;
+        if (!hit_w) {
+            init_id = new_bound++;
+            extra[ne++] = 3u << 16 | SPV_OP_CONSTANT_NULL, extra[ne++] = tgt[t].val_type, extra[ne++] = init_id;
+        } else {
+            uint32_t c0 = 0, c1 = 0;
+            if (tgt[t].cnt > 1) {
+                int ck = 0;
+                while (ck < n_sconst && !(sconst[ck].type == tgt[t].comp_type && sconst[ck].bits == 0)) ck++;
+                if (ck == n_sconst) {
+                    if (n_sconst >= 32) goto out;
+                    uint32_t cid = new_bound++;
+                    sconst[n_sconst].type = tgt[t].comp_type, sconst[n_sconst].bits = 0, sconst[n_sconst++].id = cid;
+                    extra[ne++] = 4u << 16 | SPV_OP_CONSTANT, extra[ne++] = tgt[t].comp_type, extra[ne++] = cid, extra[ne++] = 0;
+                }
+                c0 = sconst[ck].id;
+            }
+            {
+                int ck = 0;
+                while (ck < n_sconst && !(sconst[ck].type == tgt[t].comp_type && sconst[ck].bits == one_bits)) ck++;
+                if (ck == n_sconst) {
+                    if (n_sconst >= 32) goto out;
+                    uint32_t cid = new_bound++;
+                    sconst[n_sconst].type = tgt[t].comp_type, sconst[n_sconst].bits = one_bits, sconst[n_sconst++].id = cid;
+                    extra[ne++] = 4u << 16 | SPV_OP_CONSTANT, extra[ne++] = tgt[t].comp_type, extra[ne++] = cid, extra[ne++] = one_bits;
+                }
+                c1 = sconst[ck].id;
+            }
+            if (tgt[t].cnt == 1) {
+                init_id = c1;
+            } else {
+                init_id = new_bound++;
+                extra[ne++] = (uint32_t)(3 + tgt[t].cnt) << 16 | SPV_OP_CONSTANT_COMPOSITE;
+                extra[ne++] = tgt[t].val_type, extra[ne++] = init_id;
+                for (uint8_t k = 0; k < tgt[t].cnt; k++)
+                    extra[ne++] = (tgt[t].cstart + k == 3) ? c1 : c0;
+            }
+        }
+        extra[ne++] = 5u << 16 | SPV_OP_VARIABLE, extra[ne++] = vp_id, extra[ne++] = tgt[t].var_id;
+        extra[ne++] = SPV_SC_PRIVATE, extra[ne++] = init_id;
+    }
+    o = malloc((n + ne) * 4);
+    if (!o) goto out;
+    memcpy(o, w, 5 * 4);
+    o[3] = new_bound;
+    uint64_t d = 5;
+    for (uint64_t i = 5; i < fn_at;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == SPV_OP_ENTRY_POINT && w[1] < 0x00010400u) {
+            uint64_t start = d;
+            uint32_t k = 3;
+            while (k < len) {
+                uint32_t u = w[i + k++];
+                if (!(u & 0xffu) || !((u >> 8) & 0xffu) || !((u >> 16) & 0xffu) || !((u >> 24) & 0xffu)) break;
+            }
+            memcpy(o + d, w + i, k * 4);
+            d += k;
+            for (; k < len; k++) {
+                uint32_t id = w[i + k];
+                if (id < bound && conv_var[id]) continue;
+                o[d++] = id;
+            }
+            o[start] = (uint32_t)(d - start) << 16 | SPV_OP_ENTRY_POINT;
+        } else if (op == SPV_OP_DECORATE && len >= 3 && w[i + 1] < bound && conv_var[w[i + 1]]) {
+            // Drop interface decorations on variables moved to Private storage.
+        } else if (op == OP_GROUP_DECORATE && len >= 2) {
+            uint64_t start = d;
+            o[d++] = w[i];
+            o[d++] = w[i + 1];
+            for (uint32_t k = 2; k < len; k++) {
+                uint32_t id = w[i + k];
+                if (id < bound && conv_var[id]) continue;
+                o[d++] = id;
+            }
+            if (d - start <= 2) d = start;
+            else o[start] = (uint32_t)(d - start) << 16 | OP_GROUP_DECORATE;
+        } else if (op == SPV_OP_VARIABLE && len >= 4 && w[i + 2] < bound && conv_var[w[i + 2]]) {
+            // Replaced by the Private OpVariable in extra[].
+        } else {
+            memcpy(o + d, w + i, len * 4);
+            d += len;
+        }
+        i += len;
+    }
+    memcpy(o + d, extra, ne * 4);
+    d += ne;
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        memcpy(o + d, w + i, len * 4);
+        if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && len >= 4 && w[i + 3] < bound &&
+            is_priv_ptr[w[i + 3]]) {
+            uint32_t elem = ptr_elem[w[i + 1]];
+            for (int pk = 0; pk < n_pptr; pk++) {
+                if (pptr[pk].elem == elem) {
+                    o[d + 1] = pptr[pk].id;
+                    break;
+                }
+            }
+        }
+        d += len, i += len;
+    }
+    *out_n = d;
+out:
+    free(loc_of), free(comp_off), free(conv_var), free(is_priv_ptr), free(scalar_bits), free(vec_cnt);
+    free(vec_comp), free(ptr_sc), free(ptr_elem);
     return o;
 }
 
@@ -3805,70 +3985,30 @@ static VkPipeline mesh_graphics_create(const VkPipeState *s, const GfxShader *ta
     uint32_t task_off = task ? binding_span(task) - 1 : 0;
     uint32_t mesh_off = task_off + (binding_span(mesh) - 1);
     uint32_t rebind_off[3] = {1u, 1u + task_off, mesh_off};
-    // Densify mesh↔FS Locations only when mesh outs do not already sit inside the FS mask at
-    // the same absolute indices (n186 absolute generic Locations). Packing every orphan FS
-    // input onto Location 31 made duplicate Locations and hung the NVIDIA driver mid-create
-    // (n189+: 1 mesh draw then stall; foliage never reached title). Skip when mout ⊆ fin.
-    uint8_t mesh_loc[32], fs_loc[32];
-    memset(mesh_loc, 0xff, sizeof mesh_loc);
-    memset(fs_loc, 0xff, sizeof fs_loc);
-    int do_densify = 0;
-    if (s->fs) {
-        uint32_t mout = gfx_shader_outputs(mesh, NULL), fin = gfx_shader_inputs(s->fs, NULL);
-        uint32_t both = mout & fin;
-        if (both != mout) {
-            // Mesh writes a Location the FS does not declare — pack the intersection to 0..N-1.
-            uint8_t dense = 0, orphan = 16;
-            for (int l = 0; l < 32 && dense < 32; l++) {
-                if (!(both & (1u << l))) continue;
-                mesh_loc[l] = dense;
-                fs_loc[l] = dense;
-                dense++;
-            }
-            for (int l = 0; l < 32; l++) {
-                if ((fin & (1u << l)) && fs_loc[l] == 0xff)
-                    fs_loc[l] = orphan < 32 ? orphan++ : 31; // unique orphan slots, never all-31
-                if ((mout & (1u << l)) && mesh_loc[l] == 0xff)
-                    mesh_loc[l] = dense < 32 ? dense++ : (orphan < 32 ? orphan++ : 31);
-            }
-            do_densify = 1;
-            static int densify_log;
-            if (densify_log < 6)
-                rt_log("vk_pipeline: mesh↔FS densify mout=%#x fin=%#x both=%#x dense=%u", mout, fin, both, dense),
-                    densify_log++;
-        } else if (fin & ~mout) {
-            // Mesh outs already sit inside the FS mask, but FS still declares holes (MKW foliage:
-            // mout=0x30 fin=0x3f). Without Geometry MeshPrimitiveHeader those holes stay undef →
-            // black silhouettes. Alias each hole onto a real mesh Location (cycle) so the FS reads
-            // live varyings; keep Locs that already match mesh (4+5) unchanged. Duplicate Location
-            // decorations on holes are imperfect but better than undef; Hookshot re-emits the FS.
-            uint8_t outs[32];
-            int n_out = 0;
-            for (int l = 0; l < 32; l++)
-                if (mout & (1u << l)) outs[n_out++] = (uint8_t)l;
-            if (n_out) {
-                int k = 0;
-                for (int l = 0; l < 32; l++) {
-                    if (!(fin & (1u << l))) continue;
-                    if (mout & (1u << l)) continue; // already matches — leave Location alone
-                    fs_loc[l] = outs[k++ % n_out];
-                }
-                do_densify = 1; // remap FS holes only; mesh_loc stays 0xff
-                static int alias_log;
-                if (alias_log < 6)
-                    rt_log("vk_pipeline: mesh↔FS alias holes mout=%#x fin=%#x holes=%#x → mesh Locs", mout, fin,
-                           fin & ~mout),
-                        alias_log++;
-            }
-        }
+    // Both Eden mesh shaders and fragment shaders use absolute generic indices (0..31) for Location.
+    // Extra mesh outputs (mout & ~fin) are ignored by Vulkan; unwritten FS inputs (fin & ~mout) read
+    // Maxwell/Ampere's hardware default (0, 0, 0, 1) via spirv_default_fs_inputs without scrambling
+    // Locations or touching FS color attachment Outputs.
+    uint32_t mout = gfx_shader_outputs(mesh, NULL);
+    uint32_t fin = s->fs ? gfx_shader_inputs(s->fs, NULL) : 0;
+    uint32_t fs_holes = fin & ~mout;
+    if (fs_holes) {
+        static int hole_log;
+        if (hole_log < 6)
+            rt_log("vk_pipeline: mesh↔FS defaulting unwritten FS inputs to (0,0,0,1) mout=%#x fin=%#x holes=%#x", mout,
+                   fin, fs_holes),
+                hole_log++;
     }
+    GKey k;
+    gkey_fill(s, &k);
     // Mesh per-primitive Locations (after synth MeshPrimitiveHeader) must decorate matching FS inputs
-    // with PerPrimitiveEXT — Hookshot re-emits the FS with RuntimeInfo.per_primitive_generics.
+    // with PerPrimitiveEXT — only on live Locations shared by mesh and FS.
     uint32_t mesh_per_prim = 0;
     {
         uint64_t mw = 0;
         const uint32_t *mc = gfx_shader_spirv(mesh, &mw);
-        if (mc) mesh_per_prim = spirv_per_primitive_locs(mc, mw);
+        uint32_t raw_pp = mc ? spirv_per_primitive_locs(mc, mw) : 0;
+        mesh_per_prim = raw_pp & fin & mout;
         if (mesh_per_prim) {
             static int pp_log;
             if (pp_log < 4) rt_log("vk_pipeline: mesh per-primitive Locations %#x → mark on FS", mesh_per_prim), pp_log++;
@@ -3883,22 +4023,40 @@ static VkPipeline mesh_graphics_create(const VkPipeState *s, const GfxShader *ta
             if (log_spirv < 4) rt_log("vk_pipeline: mesh stage %d has no SPIR-V", i), log_spirv++;
             goto out;
         }
-        uint32_t *loc_patched = NULL;
+        uint32_t *hole_patched = NULL;
         uint32_t *pp_patched = NULL;
-        uint64_t pp_n = sw;
+        uint32_t *at_patched = NULL;
+        uint32_t *ds_patched = NULL;
+        uint64_t cur_n = sw;
         int gst = gfx_shader_stage(stages[i]);
-        if (do_densify && gst == GFX_STAGE_MESH) loc_patched = spirv_remap_locations(code, sw, mesh_loc);
-        else if (do_densify && gst == GFX_STAGE_FS) loc_patched = spirv_remap_locations(code, sw, fs_loc);
-        const uint32_t *use = loc_patched ? loc_patched : code;
-        if (gst == GFX_STAGE_FS && mesh_per_prim) {
-            pp_patched = spirv_mark_per_primitive_locs(use, sw, &pp_n, mesh_per_prim);
-            if (pp_patched) use = pp_patched, sw = pp_n;
+        const uint32_t *use = code;
+        if (gst == GFX_STAGE_FS && fs_holes) {
+            uint64_t hn = cur_n;
+            hole_patched = spirv_default_fs_inputs(use, cur_n, fs_holes, &hn);
+            if (hole_patched) use = hole_patched, cur_n = hn;
         }
-        uint32_t *rebound = rebind_off[i] ? spirv_rebind(use, sw, rebind_off[i]) : NULL;
-        VkShaderModule m = make_module(stages[i], rebound ? rebound : use, sw);
+        if (gst == GFX_STAGE_FS && mesh_per_prim) {
+            uint64_t pp_n = cur_n;
+            pp_patched = spirv_mark_per_primitive_locs(use, cur_n, &pp_n, mesh_per_prim);
+            if (pp_patched) use = pp_patched, cur_n = pp_n;
+        }
+        if (gst == GFX_STAGE_FS && k.alpha) {
+            uint64_t at_n = 0;
+            at_patched = spirv_alpha_test(use, cur_n, k.alpha, k.alpha_ref, &at_n);
+            if (at_patched) use = at_patched, cur_n = at_n;
+        }
+        if (gst == GFX_STAGE_FS && k.dsb) {
+            uint64_t ds_n = 0;
+            ds_patched = spirv_dual_source(use, cur_n, &ds_n);
+            if (ds_patched) use = ds_patched, cur_n = ds_n;
+        }
+        uint32_t *rebound = rebind_off[i] ? spirv_rebind(use, cur_n, rebind_off[i]) : NULL;
+        VkShaderModule m = make_module(stages[i], rebound ? rebound : use, cur_n);
         free(rebound);
+        free(ds_patched);
+        free(at_patched);
         free(pp_patched);
-        free(loc_patched);
+        free(hole_patched);
         if (!m) {
             static int log_mod;
             if (log_mod < 4) rt_log("vk_pipeline: mesh stage %d vkCreateShaderModule failed", i), log_mod++;
@@ -3916,14 +4074,16 @@ static VkPipeline mesh_graphics_create(const VkPipeState *s, const GfxShader *ta
             pin_subgroup32(&st[nst], &rq[nst], code, sw);
         nst++;
     }
-    GKey k;
-    gkey_fill(s, &k);
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkPipelineViewportDepthClipControlCreateInfoEXT clip = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, .negativeOneToOne = k.minus_w};
     VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = &clip};
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pvs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+        .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT};
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .pNext = P.pv_last ? &pvs : NULL,
                                                  .depthClampEnable = k.clamp, .polygonMode = (VkPolygonMode)k.poly_mode,
                                                  .lineWidth = 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
@@ -3943,6 +4103,7 @@ static VkPipeline mesh_graphics_create(const VkPipeState *s, const GfxShader *ta
     }
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
                                               .logicOpEnable = k.logic_op != 0,
+                                              .logicOp = k.logic_op ? (VkLogicOp)(k.logic_op - 1) : VK_LOGIC_OP_COPY,
                                               .attachmentCount = k.n_color, .pAttachments = cba};
     // Mesh: keep the usual dynamic set except topology / restart / vertex input (not legal on mesh
     // pipelines). Every state we set after bind (vk_pipeline_set_dynamic_ex, record_fixed) must stay
@@ -3977,6 +4138,8 @@ static VkPipeline mesh_graphics_create(const VkPipeState *s, const GfxShader *ta
                                        .pColorBlendState = &cb,
                                        .pDynamicState = &dy,
                                        .layout = l->layout};
+    if (k.fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    if (k.fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     VkPipeline pipe = VK_NULL_HANDLE;
     VkResult vr = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
     if (vr != VK_SUCCESS) {
@@ -4008,7 +4171,7 @@ VkPipeline vk_pipeline_mesh_graphics(const VkPipeState *s, const GfxShader *task
     k.task_o = task ? gfx_shader_origin(task) : 0;
     k.mesh_o = mesh ? gfx_shader_origin(mesh) : 0;
     k.fs_o = gfx_shader_origin(s->fs);
-    k.densify_ver = 6; // n256+: synth MeshPrimitiveHeader → real per-prim Locs (less hole-alias)
+    k.densify_ver = 9; // exact absolute Locations + (0,0,0,1) Private FS defaults + Input-filtered PerPrimitiveEXT
     memcpy(k.pipe, &gk, sizeof gk);
     uint64_t h = key_hash(&k, sizeof k);
     plat_mutex_lock(&P.lock);

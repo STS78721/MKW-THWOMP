@@ -470,6 +470,18 @@ static VkExtent3D sub_extent(const Sub *s) {
     return (VkExtent3D){s->w, s->h, s->img->type == VK_IMAGE_TYPE_3D ? s->nz : 1};
 }
 
+// A compressed buffer copy covers whole blocks; Vulkan requires whole-block extents or reaching the mip edge (VUID 00207/00208).
+static VkExtent3D sub_extent_blocks(const Sub *s) {
+    VkExtent3D e = sub_extent(s);
+    if (s->f.astc_bw || (s->bw == 1 && s->bh == 1)) return e;
+    uint32_t bw = (uint32_t)s->bw, bh = (uint32_t)s->bh, rw = (s->w + bw - 1) / bw * bw, rh = (s->h + bh - 1) / bh * bh;
+    uint32_t lw = s->img->width >> s->level, lh = s->img->height >> s->level;
+    lw = lw ? lw : 1, lh = lh ? lh : 1;
+    e.width = rw < lw - (uint32_t)s->x ? rw : lw - (uint32_t)s->x;
+    e.height = rh < lh - (uint32_t)s->y ? rh : lh - (uint32_t)s->y;
+    return e;
+}
+
 // Buffer side of a texture <-> buffer copy: bytes covered, pitches, Vulkan buffer span (a VRAM mirror when the pool
 // has one).
 static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *size, VkBufferImageCopy *c,
@@ -493,7 +505,7 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
     *span = m;
     *c = (VkBufferImageCopy){.bufferOffset = m.offset, .bufferRowLength = (uint32_t)(row / (uint64_t)s->bpb) * (uint32_t)s->bw,
                              .bufferImageHeight = hb * (uint32_t)s->bh, .imageSubresource = sub_layers(s),
-                             .imageOffset = sub_offset(s), .imageExtent = sub_extent(s)};
+                             .imageOffset = sub_offset(s), .imageExtent = sub_extent_blocks(s)};
     return 1;
 }
 
@@ -537,6 +549,7 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
         if (!ar) return;
         uint64_t img_bytes = tight_row * (uint64_t)hb;
         int is3d = s.img->type == VK_IMAGE_TYPE_3D;
+        uint32_t dlw = max1(s.img->width >> s.level), dlh = max1(s.img->height >> s.level);
         for (uint32_t z = 0; z < s.nz; z++) {
             ar[z] = (VkAstcRegion){
                 .src = m.offset + z * img_bytes,
@@ -545,10 +558,14 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
                 .slices = 1,
                 .level = s.level,
                 .layer = is3d ? 0 : s.layer0 + (uint32_t)s.z + z,
+                .lw = dlw,
+                .lh = dlh,
                 .offset = (VkOffset3D){s.x, s.y, is3d ? s.z + (int32_t)z : 0}
             };
         }
-        written = vk_astc_record(ex->cb, m.buffer, size, ar, (int)s.nz, s.f.astc_bw, s.f.astc_bh, s.f.astc_srgb, s.f.astc_bc,
+        int img_bc = s.f.astc_bc && s.img->format != VK_FORMAT_R8G8B8A8_UNORM &&
+                     s.img->format != VK_FORMAT_R8G8B8A8_SRGB;
+        written = vk_astc_record(ex->cb, m.buffer, size, ar, (int)s.nz, s.f.astc_bw, s.f.astc_bh, s.f.astc_srgb, img_bc,
                                  s.img->image, s.aspect, VK_NULL_HANDLE);
         free(ar);
         if (!written) {
@@ -574,7 +591,11 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     }
     ex->recorded++;
     if (to_image) {
-        if (written) vk_texture_gpu_written(p->tex);
+        if (written) {
+            vk_texture_gpu_written(p->tex);
+            if (s.img->sparse)
+                vk_sparse_written(s.img->image, s.level, s.layer0 + (uint32_t)s.z, s.nz, s.x, s.y, s.w, s.h);
+        }
     } else {
         vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
     }
@@ -795,8 +816,12 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
             }
         }
     }
+    int si_rgba8 = decoded_astc_rgba8(si->format);
+    int di_rgba8 = decoded_astc_rgba8(di->format);
+    int di_bc = f.astc_bc && !di_rgba8;
     if (s.w != d.w || s.h != d.h) {
-        uint32_t bbw = f.astc_bc ? 4u : (uint32_t)f.astc_bw, bbh = f.astc_bc ? 4u : (uint32_t)f.astc_bh;
+        uint32_t bbw = di_bc ? 4u : (di_rgba8 ? 0u : (uint32_t)f.astc_bw);
+        uint32_t bbh = di_bc ? 4u : (di_rgba8 ? 0u : (uint32_t)f.astc_bh);
         uint32_t nw = s.w < d.w ? s.w : d.w, nh = s.h < d.h ? s.h : d.h;
         uint32_t aw = bbw ? nw / bbw * bbw : nw, ah = bbh ? nh / bbh * bbh : nh;
         uint32_t src_w = max1(si->width >> s.level), src_h = max1(si->height >> s.level);
@@ -809,7 +834,7 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
         int scale_fold = s.w >= d.w * 2 || s.h >= d.h * 2 || d.w >= s.w * 2 || d.h >= s.h * 2;
         if (scale_fold) {
             /* keep s/d extents; blit or skip below */
-        } else if (!f.astc_bc && nw && nh) {
+        } else if (!di_bc && nw && nh) {
             // Host is RGBA8 (no BC recompress): any matching intersection is legal.
             s.w = d.w = nw;
             s.h = d.h = nh;
@@ -840,16 +865,14 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
     }
     // Scale fold into CompactLayers: RGBA8 blit when formats allow. Prefer this over skipping when
     // ASTC_BC left a BC dest with no matching src mip (logged as 4092→512 holes / missing ground).
-    // A BC3-recompressed source (TOTK_ASTC_BC=1) into an RGBA8 dest (CompactLayers stay RGBA8): vkCmdCopyImage would
-    // move the raw 1-byte-per-texel BC3 blocks into the 4-byte RGBA8 texels (invalid usage; NVIDIA copies the bytes),
+    // A BC-recompressed source into an RGBA8 dest (CompactLayers or <256x256 RGBA8): vkCmdCopyImage would
+    // move the raw 1-byte-per-texel BC blocks into the 4-byte RGBA8 texels (invalid usage; NVIDIA copies the bytes),
     // which left every MKW terrain layer as a scrambled top quarter over black: black road / ground up close, rainbow
-    // cliffs. Blit instead: the GPU decodes BC3 on the read and writes real texels.
-    int si_rgba8 = si->format == VK_FORMAT_R8G8B8A8_UNORM || si->format == VK_FORMAT_R8G8B8A8_SRGB;
-    int di_rgba8 = di->format == VK_FORMAT_R8G8B8A8_UNORM || di->format == VK_FORMAT_R8G8B8A8_SRGB;
+    // cliffs. Blit instead: the GPU decodes BC on the read and writes real texels.
     int fmt_mismatch = si->format != di->format && !(si_rgba8 && di_rgba8);
     int src_blit = si_rgba8 || blit_src_ok(si->format);
     int rgba8_blit = (s.w != d.w || s.h != d.h || fmt_mismatch) && src_blit &&
-                     (di_rgba8 || (!f.astc_bc && (f.vk == VK_FORMAT_R8G8B8A8_UNORM || f.vk == VK_FORMAT_R8G8B8A8_SRGB)));
+                     (di_rgba8 || (!di_bc && (f.vk == VK_FORMAT_R8G8B8A8_UNORM || f.vk == VK_FORMAT_R8G8B8A8_SRGB)));
     if (fmt_mismatch)
         ctrace((uintptr_t)p->dst->mem | 1ull << 62, "t2t format mismatch src vk %d -> dst vk %d: %s",
                (int)si->format, (int)di->format, rgba8_blit ? "blit (decode)" : "no blit path");
@@ -876,8 +899,9 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
     if (s.w != d.w || s.h != d.h) {
         // Mip-edge partial src (4x3, 15x3, …) into an interior full-block dest (4x4, 16x4). CopyImage cannot
         // grow past the src mip, so shuttle the compressed blocks through a staging buffer sized for the
-        // rounded-up dest extent (BC3 = 16 bytes/block).
-        uint32_t bbw = f.astc_bc ? 4u : (uint32_t)f.astc_bw, bbh = f.astc_bc ? 4u : (uint32_t)f.astc_bh;
+        // rounded-up dest extent (BC = 16 bytes/block).
+        uint32_t bbw = di_bc ? 4u : (di_rgba8 ? 0u : (uint32_t)f.astc_bw);
+        uint32_t bbh = di_bc ? 4u : (di_rgba8 ? 0u : (uint32_t)f.astc_bh);
         uint32_t src_w = max1(si->width >> s.level), src_h = max1(si->height >> s.level);
         uint32_t dst_w = max1(di->width >> d.level), dst_h = max1(di->height >> d.level);
         uint32_t mw = s.w > d.w ? s.w : d.w, mh = s.h > d.h ? s.h : d.h;
@@ -886,9 +910,9 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
         int origins = (!bbw || (!(s.x % (int)bbw) && !(d.x % (int)bbw))) &&
                       (!bbh || (!(s.y % (int)bbh) && !(d.y % (int)bbh)));
         uint32_t nb = bbw && bbh ? (ew / bbw) * (eh / bbh) : 0;
-        // Cap: 256 KiB of BC3 blocks (16384×16) covers large streamed foliage/terrain tiles past the old 64-block pad.
+        // Cap: 256 KiB of BC blocks (16384×16) covers large streamed foliage/terrain tiles past the old 64-block pad.
         enum { ASTC_PAD_BLOCKS = 16384u };
-        if (f.astc_bc && bbw && bbh && origins && src_edge && s.nz == 1 && d.nz == 1 && nb && nb <= ASTC_PAD_BLOCKS &&
+        if (di_bc && !si_rgba8 && bbw && bbh && origins && src_edge && s.nz == 1 && d.nz == 1 && nb && nb <= ASTC_PAD_BLOCKS &&
             (uint32_t)d.x + ew <= dst_w && (uint32_t)d.y + eh <= dst_h) {
             // Persistent device-local pad (not vk_staging): exec CB must not allocate into the upload batch.
             static VkBuffer pad_buf;
@@ -934,6 +958,16 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
     vk_exec_pass_end(ex);
     vk_exec_barrier(ex);
     if (fmt_mismatch && !(si->format == di->format)) {
+        int to_bc = di->format == VK_FORMAT_BC7_SRGB_BLOCK || di->format == VK_FORMAT_BC7_UNORM_BLOCK ||
+                    di->format == VK_FORMAT_BC3_SRGB_BLOCK || di->format == VK_FORMAT_BC3_UNORM_BLOCK;
+        uint32_t dl0 = d.layer0 + (uint32_t)d.z;
+        if (to_bc && s.w == d.w && s.h == d.h && !si->host_mip0 && !di->host_mip0 &&
+            vk_texture_astc_copy(p->src, s.level, s.layer0 + (uint32_t)s.z, s.nz, (uint32_t)s.x, (uint32_t)s.y, s.w, s.h,
+                                 di, d.aspect, d.level, dl0, d.x, d.y, 1)) {
+            vk_texture_gpu_written(p->dst);
+            if (di->sparse) vk_sparse_written(di->image, d.level, dl0, s.nz, d.x, d.y, s.w, s.h);
+            return 1;
+        }
         warn_once(W_COPY, "decoded ASTC copy between incompatible formats %d -> %d without a blit: skipped", (int)si->format,
                   (int)di->format);
         return 1;
@@ -943,10 +977,53 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
     ex->recorded++;
     // CompactLayers: do not set gpu_owned — that freezes make_fresh and stops streamed tile re-uploads (AV / holes).
     if (!di->host_mip0) vk_texture_gpu_written(p->dst);
+    if (di->sparse) vk_sparse_written(di->image, d.level, d.layer0 + (uint32_t)d.z, s.nz, d.x, d.y, s.w, s.h);
+    return 1;
+}
+
+// An ASTC texture copied into a sparse texture re-encoded as BC7/BC3: MKW fills each layer of its 8192x8192x68 terrain
+// arrays, level by level, from an 8192x8192 ASTC staging texture (and small ASTC textures for coarse mips). Decoding
+// directly from p->src->mem into the sparse array avoids allocating redundant 85+ MiB staging VkImages in VRAM
+// (adriadam10/mkw-recomp, MIT).
+static int astc_into_sparse(const p_copy_t2t *p) {
+    TexVkFormat fs, fd;
+    if (!p->src || !p->dst || !(p->dst->d.flags & NVN_TEXTURE_FLAGS_SPARSE) || !tex_vk_format(p->src->d.format, &fs) ||
+        !fs.astc_bw || !tex_vk_format(p->dst->d.format, &fd) || fd.astc_bw != fs.astc_bw || fd.astc_bh != fs.astc_bh ||
+        p->src->d.target == NVN_TEXTURE_TARGET_3D)
+        return 0;
+    Sub d;
+    if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, 1, &d) || !d.img->sparse ||
+        (d.img->format != VK_FORMAT_BC7_SRGB_BLOCK && d.img->format != VK_FORMAT_BC7_UNORM_BLOCK &&
+         d.img->format != VK_FORMAT_BC3_SRGB_BLOCK && d.img->format != VK_FORMAT_BC3_UNORM_BLOCK))
+        return 0;
+    uint32_t level = p->has_sv && p->sv.set_levels ? p->sv.base_level : 0;
+    uint32_t layer = (p->has_sv && p->sv.set_layers ? p->sv.min_layer : 0) + (uint32_t)p->sr.zoffset;
+    uint32_t lw = max1(p->src->d.width >> level), lh = max1(p->src->d.height >> level);
+    uint32_t x = (uint32_t)p->sr.xoffset, y = (uint32_t)p->sr.yoffset;
+    uint32_t w = p->sr.width > 0 ? (uint32_t)p->sr.width : lw - x, h = p->sr.height > 0 ? (uint32_t)p->sr.height : lh - y;
+    uint32_t n = p->sr.depth > 0 ? (uint32_t)p->sr.depth : 1, dl0 = d.layer0 + (uint32_t)d.z;
+    if (level >= p->src->d.levels || x + w > lw || y + h > lh || w != d.w || h != d.h) return 0;
+    if (!vk_texture_astc_copy(p->src, level, layer, n, x, y, w, h, d.img, d.aspect, d.level, dl0, d.x, d.y, 1))
+        return 0;
+    vk_texture_gpu_written(p->dst);
+    vk_sparse_written(d.img->image, d.level, dl0, n, d.x, d.y, w, h);
     return 1;
 }
 
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
+    static int trace = -1;
+    static volatile int32_t ntrace;
+    if (trace < 0) trace = cfg_get("MKW_SPARSE_TRACE") != NULL;
+    if (trace && p->src && p->dst && ((p->src->d.flags | p->dst->d.flags) & NVN_TEXTURE_FLAGS_SPARSE) &&
+        plat_inc32(&ntrace) <= 8192)
+        rt_log("sparse: copy %ux%ux%u fmt %#x flags %#x lv%u [%d,%d,%d %dx%dx%d] -> %#llx %ux%ux%u fmt %#x [%d,%d,%d "
+               "%dx%dx%d] level %d layer %d", p->src->d.width, p->src->d.height, p->src->d.depth, p->src->d.format,
+               p->src->d.flags, p->src->d.levels, p->sr.xoffset, p->sr.yoffset, p->sr.zoffset, p->sr.width,
+               p->sr.height, p->sr.depth, (unsigned long long)(uintptr_t)p->dst->mem, p->dst->d.width,
+               p->dst->d.height, p->dst->d.depth, p->dst->d.format, p->dr.xoffset, p->dr.yoffset, p->dr.zoffset,
+               p->dr.width, p->dr.height, p->dr.depth, p->has_dv && p->dv.set_levels ? p->dv.base_level : -1,
+               p->has_dv && p->dv.set_layers ? p->dv.min_layer : -1);
+    if (astc_into_sparse(p)) return;
     if (copy_decoded_astc(ex, p)) return;
     Sub s, d;
     if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, 2, &s)) return;
@@ -963,44 +1040,56 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
         return;
     }
     VkImageSubresourceLayers sl = sub_layers(&s), dl = sub_layers(&d);
+    // Between a 2D array and a 3D image, the layers of one side are the depth slices of the other (VUID 01790..01792),
+    // which fills all 32 slices of MKW's 32x32x32 race colour-grading LUTs (adriadam10/mkw-recomp, MIT).
+    int s3d = s.img->type == VK_IMAGE_TYPE_3D, d3d = d.img->type == VK_IMAGE_TYPE_3D;
+    VkExtent3D ext = {s.w, s.h, s3d || d3d ? s.nz : 1};
     vk_exec_pass_end(ex);
     vk_exec_barrier(ex);
     if (s.img->samples > 1 && d.img->samples == 1) {
-        VkImageResolve rv = {sl, sub_offset(&s), dl, sub_offset(&d), sub_extent(&s)};
+        VkImageResolve rv = {sl, sub_offset(&s), dl, sub_offset(&d), ext};
         vkCmdResolveImage(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, d.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rv);
     } else if (same_size && same_format) {
-        VkImageCopy cp = {sl, sub_offset(&s), dl, sub_offset(&d), sub_extent(&s)};
+        VkImageCopy cp = {sl, sub_offset(&s), dl, sub_offset(&d), ext};
         vkCmdCopyImage(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, d.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     } else {   // scaled or converting copy: nearest, or linear when asked for (colour only)
-        int is3d = s.img->type == VK_IMAGE_TYPE_3D;
-        VkImageBlit bl[2];
-        uint32_t nbl = 0;
+        int linear = (p->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && s.aspect == VK_IMAGE_ASPECT_COLOR_BIT;
         if (s.aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+            VkImageBlit bl[2];
             static const VkImageAspectFlags kAsp[2] = {VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT};
             for (int i = 0; i < 2; i++) {
                 VkImageSubresourceLayers sla = sl, dla = dl;
                 sla.aspectMask = dla.aspectMask = kAsp[i];
                 bl[i] = (VkImageBlit){.srcSubresource = sla, .dstSubresource = dla};
                 bl[i].srcOffsets[0] = sub_offset(&s);
-                bl[i].srcOffsets[1] = (VkOffset3D){s.x + (int32_t)s.w, s.y + (int32_t)s.h, is3d ? s.z + (int32_t)s.nz : 1};
+                bl[i].srcOffsets[1] = (VkOffset3D){s.x + (int32_t)s.w, s.y + (int32_t)s.h, s3d ? s.z + (int32_t)s.nz : 1};
                 bl[i].dstOffsets[0] = sub_offset(&d);
-                bl[i].dstOffsets[1] = (VkOffset3D){d.x + (int32_t)d.w, d.y + (int32_t)d.h, is3d ? d.z + (int32_t)d.nz : 1};
+                bl[i].dstOffsets[1] = (VkOffset3D){d.x + (int32_t)d.w, d.y + (int32_t)d.h, d3d ? d.z + (int32_t)d.nz : 1};
             }
-            nbl = 2;
+            vkCmdBlitImage(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, d.img->image, VK_IMAGE_LAYOUT_GENERAL, 2, bl,
+                           VK_FILTER_NEAREST);
         } else {
-            bl[0] = (VkImageBlit){.srcSubresource = sl, .dstSubresource = dl};
-            bl[0].srcOffsets[0] = sub_offset(&s);
-            bl[0].srcOffsets[1] = (VkOffset3D){s.x + (int32_t)s.w, s.y + (int32_t)s.h, is3d ? s.z + (int32_t)s.nz : 1};
-            bl[0].dstOffsets[0] = sub_offset(&d);
-            bl[0].dstOffsets[1] = (VkOffset3D){d.x + (int32_t)d.w, d.y + (int32_t)d.h, is3d ? d.z + (int32_t)d.nz : 1};
-            nbl = 1;
+            uint32_t n = s3d != d3d ? s.nz : 1;
+            for (uint32_t k = 0; k < n; k++) {
+                VkImageBlit bl = {.srcSubresource = sl, .dstSubresource = dl};
+                int32_t sz = s.z + (int32_t)k, dz = d.z + (int32_t)k, depth = n > 1 ? 1 : (int32_t)s.nz;
+                if (n > 1) {
+                    if (!s3d) bl.srcSubresource.baseArrayLayer = s.layer0 + (uint32_t)sz, bl.srcSubresource.layerCount = 1;
+                    if (!d3d) bl.dstSubresource.baseArrayLayer = d.layer0 + (uint32_t)dz, bl.dstSubresource.layerCount = 1;
+                }
+                bl.srcOffsets[0] = (VkOffset3D){s.x, s.y, s3d ? sz : 0};
+                bl.srcOffsets[1] = (VkOffset3D){s.x + (int32_t)s.w, s.y + (int32_t)s.h, s3d ? sz + depth : 1};
+                bl.dstOffsets[0] = (VkOffset3D){d.x, d.y, d3d ? dz : 0};
+                bl.dstOffsets[1] = (VkOffset3D){d.x + (int32_t)d.w, d.y + (int32_t)d.h, d3d ? dz + depth : 1};
+                vkCmdBlitImage(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, d.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+                               linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+            }
         }
-        int linear = (p->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && s.aspect == VK_IMAGE_ASPECT_COLOR_BIT;
-        vkCmdBlitImage(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, d.img->image, VK_IMAGE_LAYOUT_GENERAL, nbl, bl,
-                       linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     ex->recorded++;
     vk_texture_gpu_written(p->dst);
+    if (d.img->sparse)
+        vk_sparse_written(d.img->image, d.level, d.layer0 + (d3d ? 0 : (uint32_t)d.z), d3d ? 1 : d.nz, d.x, d.y, d.w, d.h);
 }
 
 // ---- buffer to buffer

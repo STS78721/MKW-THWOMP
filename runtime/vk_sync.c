@@ -416,13 +416,23 @@ static VkCommandBuffer split_impl(int wait) {
     VkCommandBuffer cb = slots[cur_slot].cb;
     ts_end(cb, cur_fence);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of the part is in cb, ended by its recorder
+    vk_queue_lock();
+    vk_sparse_order(cur_fence, 2);   // issue queued sparse binds before the upload batch's copies land in them
+    vk_queue_unlock();
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
     VkCommandBuffer pro = prologue(c, cur_fence);
     VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
                                         {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb}};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
-                        .pCommandBufferInfos = pro ? cbi : cbi + 1};
     vk_queue_lock();
+    VkSparseOrder so = vk_sparse_order(cur_fence, 1);
+    VkSemaphoreSubmitInfo wsem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = so.wsem, .value = so.wait,
+                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSemaphoreSubmitInfo ssem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = so.ssem, .value = so.signal,
+                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                        .waitSemaphoreInfoCount = so.wsem && (so.wait || !so.ssem) ? 1u : 0u, .pWaitSemaphoreInfos = &wsem,
+                        .commandBufferInfoCount = pro ? 2 : 1, .pCommandBufferInfos = pro ? cbi : cbi + 1,
+                        .signalSemaphoreInfoCount = so.ssem ? 1u : 0u, .pSignalSemaphoreInfos = &ssem};
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, prefix);
     vk_queue_unlock();
     if (r != VK_SUCCESS) {
@@ -493,19 +503,28 @@ uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t su
     // The recorder is done with the part: the end-of-submission crumb, then the end, by the recorder when it records.
     if (!rec_end_cb(s->cb, VK_CRUMB_SUBMIT_END, fence)) vkEndCommandBuffer(s->cb);
     perf_replay(t0);
-    // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
+    // After the recording: issue sparse binds before flushing uploads so copies into sparse tiles land in bound memory.
+    vk_queue_lock();
+    vk_sparse_order(fence, 2);
+    vk_queue_unlock();
     vk_upload_flush(0);
     VkCommandBuffer pro = prologue(c, fence);
     s = &slots[cur_slot];
     VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
                                         {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb}};
-    VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = c->timeline,
-                                 .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-                        .commandBufferInfoCount = (pro ? 1u : 0u) + (recorded ? 1u : 0u),
-                        .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = 1,
-                        .pSignalSemaphoreInfos = &sig};
     vk_queue_lock();
+    VkSparseOrder so = vk_sparse_order(fence, 1);
+    VkSemaphoreSubmitInfo wsem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = so.wsem, .value = so.wait,
+                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSemaphoreSubmitInfo sigs[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = c->timeline,
+                                      .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
+                                     {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = so.ssem,
+                                      .value = so.signal, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                        .waitSemaphoreInfoCount = so.wsem && (so.wait || !so.ssem) ? 1u : 0u, .pWaitSemaphoreInfos = &wsem,
+                        .commandBufferInfoCount = (pro ? 1u : 0u) + (recorded ? 1u : 0u),
+                        .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = so.ssem ? 2u : 1u,
+                        .pSignalSemaphoreInfos = sigs};
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
     if (r != VK_SUCCESS) {

@@ -127,7 +127,7 @@ int tex_vk_format(int nvn_format, TexVkFormat *o) {
         o->astc_srgb = (uint8_t)srgb;
         o->note = "no native ASTC: decoded to RGBA8 (vk_astc.c compute decoder, or tex_astc.c with TOTK_ASTC=cpu)";
         if (vk_astc_bc()) {
-            o->vk = srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+            o->vk = vk_astc_bc_format(srgb);
             o->astc_bc = 1;
             o->note = "no native ASTC: decoded and encoded to BC3 on the GPU (vk_astc.c, TOTK_ASTC_BC)";
         }

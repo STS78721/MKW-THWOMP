@@ -21,6 +21,7 @@
 
 #include "astc_decode_spv.h"
 #include "bc3_encode_spv.h"
+#include "bc7_encode_spv.h"   // adriadam10/mkw-recomp (MIT): mode 6 BC7, better quality than BC3 at the same size
 #include "cfg.h"
 #include "host.h"
 #include "tex.h"
@@ -106,6 +107,7 @@ static struct {
     VkPipeline pipe;
     VkPipeline bc_pipe;           // the BC3 encoder (TOTK_ASTC_BC): the decoder's layout, bindings 0 and 1
     int bc;                       // 1: ASTC images are BC3 (vk_astc_bc)
+    int bc7;                      // 1: bc_pipe is the BC7 encoder and those images are BC7 (vk_astc_bc_format)
     PFN_vkCmdPushDescriptorSetKHR push;
     VkBuffer tab;                 // device-local copy of the tables
     VmaAllocation tab_alloc;
@@ -300,14 +302,27 @@ static int create_pipeline(VkCtx *c) {
 // TOTK_ASTC_BC=1: the BC3 encoder, when the device samples BC3 (every desktop GPU does); 0 leaves ASTC as RGBA8.
 static int create_bc_pipeline(VkCtx *c) {
     VkFormatProperties p;
-    vkGetPhysicalDeviceFormatProperties(c->phys, VK_FORMAT_BC3_SRGB_BLOCK, &p);
     VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    if ((p.optimalTilingFeatures & need) != need) {
-        rt_log("vk: the device does not sample BC3; BC3 encoder disabled");
-        return 0;
+    // BC7 (mode 6, adriadam10/mkw-recomp, MIT) when the device samples it: the same 16 bytes per block as BC3 with
+    // far less blockiness. MKW_ASTC_BC7=0 keeps the BC3 encoder.
+    const char *e7 = cfg_get("TOTK_ASTC_BC7");
+    int try7 = !(e7 && *e7 && !strcmp(e7, "0"));
+    if (try7) {
+        VkFormatProperties p7, p7u;
+        vkGetPhysicalDeviceFormatProperties(c->phys, VK_FORMAT_BC7_SRGB_BLOCK, &p7);
+        vkGetPhysicalDeviceFormatProperties(c->phys, VK_FORMAT_BC7_UNORM_BLOCK, &p7u);
+        try7 = (p7.optimalTilingFeatures & need) == need && (p7u.optimalTilingFeatures & need) == need;
     }
-    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof bc3_encode_spv,
-                                   .pCode = bc3_encode_spv};
+    if (!try7) {
+        vkGetPhysicalDeviceFormatProperties(c->phys, VK_FORMAT_BC3_SRGB_BLOCK, &p);
+        if ((p.optimalTilingFeatures & need) != need) {
+            rt_log("vk: the device does not sample BC3; BC3 encoder disabled");
+            return 0;
+        }
+    }
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                   .codeSize = try7 ? sizeof bc7_encode_spv : sizeof bc3_encode_spv,
+                                   .pCode = try7 ? bc7_encode_spv : bc3_encode_spv};
     VkShaderModule m = VK_NULL_HANDLE;
     if (vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS) return 0;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -318,10 +333,23 @@ static int create_bc_pipeline(VkCtx *c) {
     vkDestroyShaderModule(c->device, m, NULL);
     if (r != VK_SUCCESS) {
         G.bc_pipe = VK_NULL_HANDLE;
-        rt_log("vk: the BC3 encoder pipeline failed (%d)", (int)r);
+        rt_log("vk: the %s encoder pipeline failed (%d)", try7 ? "BC7" : "BC3", (int)r);
         return 0;
     }
+    G.bc7 = try7;
     return 1;
+}
+
+VkFormat vk_astc_bc_format(int srgb) {
+    VkCtx *c = vk_ctx();
+    int bc7 = 0;
+    if (c) {
+        plat_mutex_lock_shared(&g_lock);
+        bc7 = G.dev == c->device && G.bc_pipe && G.bc7;
+        plat_mutex_unlock_shared(&g_lock);
+    }
+    if (bc7) return srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+    return srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
 }
 
 static int native_device(VkCtx *c) { return c->has_astc_ldr; }
@@ -381,7 +409,7 @@ int vk_astc_mode(void) {
         G.bc = want_bc;
         G.mode = m;
         rt_log("vk: ASTC textures: %s%s (textureCompressionASTC_LDR %d)", mode_name(m),
-               G.bc ? ", BC3 recompress" : "", native_device(c));
+               G.bc ? (G.bc7 ? ", BC7 recompress" : ", BC3 recompress") : "", native_device(c));
     }
     m = G.mode;
     plat_mutex_unlock(&g_lock);
@@ -425,9 +453,16 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessF
     vkCmdPipelineBarrier2(cb, &di);
 }
 
-// Scratch per vk_astc_record: texels of at most this many bytes at a time (or one region, when larger), so a large
-// texture array (169 M texels, 677 MB as RGBA8, on monsters2) does not need its whole RGBA8 copy as scratch.
+// Persistent 64 MiB device-local scratch buffer reused across ASTC decode + BC7 re-encode calls (ported from
+// adriadam10/mkw-recomp, MIT, Copyright (c) 2026 Adrià). Callers serialize through the graphics/upload queue, and a
+// full memory barrier precedes each reuse; calls that exceed FIXED_SCRATCH or take a readback allocate a per-call buffer.
+#define FIXED_SCRATCH (64ull << 20)
 #define CHUNK_OUT (32ull << 20)
+static PlatMutex fx_lock = PLAT_MUTEX_INIT;
+static VkBuffer fx_buf;
+static VmaAllocation fx_alloc;
+static VkDevice fx_dev;
+static int fx_tried;
 
 static VkDeviceSize region_out(const VkAstcRegion *r) { return (VkDeviceSize)r->w * r->h * r->slices * 4; }
 static VkDeviceSize region_in(const VkAstcRegion *r, uint32_t bw, uint32_t bh) {
@@ -447,14 +482,16 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     VkPipeline pipe = G.dev == c->device ? G.pipe : VK_NULL_HANDLE, bc_pipe = G.dev == c->device ? G.bc_pipe : VK_NULL_HANDLE;
     plat_mutex_unlock_shared(&g_lock);
     if (!pipe || (bc && !bc_pipe)) return 0;
-    // Split regions whose RGBA8 footprint exceeds CHUNK_OUT into block-aligned height strips so scratch stays bounded
-    // (MKW's 8K terrain layers were ~268 MiB as one region and failed to allocate). Cap estimate at one strip per
-    // block-row so the strip loop cannot overrun the buffer.
+    // Split regions whose RGBA8 footprint exceeds CHUNK_OUT into bands of whole rows of ASTC and BC (4x4) blocks so
+    // scratch stays bounded without breaking 4x4 BC7 block alignment between strips.
+    uint32_t step = bh % 4 == 0 ? bh : bh % 2 == 0 ? bh * 2 : bh * 4;   // multiple of both bh and 4
     int need_split = 0, n_est = 0;
     for (int i = 0; i < n0; i++) {
         if (region_out(&rg0[i]) > CHUNK_OUT) {
             need_split = 1;
-            n_est += (int)((rg0[i].h + bh - 1) / bh);   // worst case: one strip per block row
+            uint64_t row_bytes = (uint64_t)rg0[i].w * 4, band = CHUNK_OUT / (row_bytes ? row_bytes : 1) / step * step;
+            if (!band) band = step;
+            n_est += (int)((size_t)rg0[i].slices * ((rg0[i].h + band - 1) / band));
         } else {
             n_est++;
         }
@@ -465,26 +502,25 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     if (rg_split) {
         int k = 0;
         for (int i = 0; i < n0; i++) {
-            VkDeviceSize o = region_out(&rg0[i]);
-            if (o <= CHUNK_OUT) {
-                rg_split[k++] = rg0[i];
+            const VkAstcRegion *r = &rg0[i];
+            if (region_out(r) <= CHUNK_OUT) {
+                rg_split[k++] = *r;
                 continue;
             }
-            uint32_t row_bytes = rg0[i].w * 4, max_h = (uint32_t)(CHUNK_OUT / (row_bytes ? row_bytes : 1));
-            if (max_h < bh) max_h = bh;
-            max_h = max_h / bh * bh;
-            if (!max_h) max_h = bh;
-            uint32_t y = 0, bx = (rg0[i].w + bw - 1) / bw;
-            while (y < rg0[i].h && k < n_est) {
-                uint32_t h = rg0[i].h - y < max_h ? rg0[i].h - y : max_h;
-                h = h / bh * bh;
-                if (!h) h = rg0[i].h - y < bh ? rg0[i].h - y : bh;
-                VkAstcRegion s = rg0[i];
-                s.h = h;
-                s.offset.y = rg0[i].offset.y + (int32_t)y;
-                s.src = rg0[i].src + (VkDeviceSize)(y / bh) * bx * 16 * rg0[i].slices;
-                rg_split[k++] = s;
-                y += h;
+            uint64_t row_bytes = (uint64_t)r->w * 4, band = CHUNK_OUT / (row_bytes ? row_bytes : 1) / step * step;
+            if (!band) band = step;
+            VkDeviceSize bx = (r->w + bw - 1) / bw;
+            VkDeviceSize slice = region_in(&(VkAstcRegion){.w = r->w, .h = r->h, .slices = 1}, bw, bh);
+            for (uint32_t sl = 0; sl < r->slices; sl++) {
+                for (uint32_t y = 0; y < r->h && k < n_est; y += (uint32_t)band) {
+                    VkAstcRegion s = *r;
+                    s.slices = 1;
+                    s.h = r->h - y < band ? r->h - y : (uint32_t)band;
+                    s.src = r->src + sl * slice + (VkDeviceSize)(y / bh) * bx * 16;
+                    s.offset.y += (int32_t)y;
+                    s.offset.z += (int32_t)sl;
+                    rg_split[k++] = s;
+                }
             }
         }
         rg = rg_split;
@@ -536,9 +572,30 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    VkBuffer sb;
-    VmaAllocation sa;
-    if (vmaCreateBuffer(c->vma, &bi, &aci, &sb, &sa, NULL) != VK_SUCCESS) {
+    VkBuffer sb = VK_NULL_HANDLE;
+    VmaAllocation sa = NULL;
+    int fixed = 0;
+    if (bi.size <= FIXED_SCRATCH && !readback) {
+        plat_mutex_lock(&fx_lock);
+        if (fx_dev != c->device) {
+            fx_buf = VK_NULL_HANDLE, fx_alloc = NULL, fx_dev = c->device, fx_tried = 0;
+        }
+        if (!fx_tried) {
+            VkBufferCreateInfo fi = bi;
+            fi.size = FIXED_SCRATCH;
+            fx_tried = 1;
+            if (vmaCreateBuffer(c->vma, &fi, &aci, &fx_buf, &fx_alloc, NULL) != VK_SUCCESS) fx_buf = VK_NULL_HANDLE;
+            rt_log("vk: ASTC fixed scratch of %llu MiB: %s", (unsigned long long)(FIXED_SCRATCH >> 20),
+                   fx_buf ? "made" : "failed, one buffer per call");
+        }
+        if (fx_buf) sb = fx_buf, fixed = 1;
+        plat_mutex_unlock(&fx_lock);
+        if (fixed)
+            mem_barrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    }
+    if (!fixed && vmaCreateBuffer(c->vma, &bi, &aci, &sb, &sa, NULL) != VK_SUCCESS) {
         if (plat_inc32(&n_fail) <= 16)
             rt_log("vk: ASTC scratch buffer of %llu bytes failed: texture left undecoded",
                    (unsigned long long)(cap_in + cap_out));
@@ -648,6 +705,12 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
                 vkCmdDispatch(cb, (bx4 + 7) / 8, (by4 + 7) / 8, r->slices);
                 VkBufferImageCopy *cp = &copies[i - i0];
                 cp->bufferOffset = cap_in + cap_out + bo, cp->bufferRowLength = bx4 * 4, cp->bufferImageHeight = by4 * 4;
+                if (r->lw && r->lh) {
+                    uint32_t mw = r->lw > (uint32_t)r->offset.x ? r->lw - (uint32_t)r->offset.x : 1;
+                    uint32_t mh = r->lh > (uint32_t)r->offset.y ? r->lh - (uint32_t)r->offset.y : 1;
+                    cp->imageExtent.width = bx4 * 4 < mw ? bx4 * 4 : mw;
+                    cp->imageExtent.height = by4 * 4 < mh ? by4 * 4 : mh;
+                }
                 to += region_out(r), bo += region_bc(r);
             }
         }
@@ -678,13 +741,17 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     n_dispatch += (uint64_t)n;
     free(copies), free(bcp);
     free(rg_split);
-    vk_defer_buffer(sb, sa);
+    if (!fixed) vk_defer_buffer(sb, sa);
     return 1;
 }
 
 void vk_astc_release(void) {
     VkCtx *c = vk_ctx();
     vk_astc_time_summary();
+    plat_mutex_lock(&fx_lock);
+    if (c && fx_buf && fx_dev == c->device) vmaDestroyBuffer(c->vma, fx_buf, fx_alloc);
+    fx_buf = VK_NULL_HANDLE, fx_alloc = NULL, fx_dev = VK_NULL_HANDLE, fx_tried = 0;
+    plat_mutex_unlock(&fx_lock);
     plat_mutex_lock(&t_lock);
     if (c && t_pool && t_dev == c->device) vkDestroyQueryPool(c->device, t_pool, NULL);
     t_pool = VK_NULL_HANDLE, t_dev = VK_NULL_HANDLE;

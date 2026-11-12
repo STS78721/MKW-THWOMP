@@ -39,9 +39,10 @@ static inline int nvn2_c0_valid(const Nvn2C0Layout *l, size_t capacity) {
 // Shader control +0xa9..+0xb0 supplies the root counts. SDK 5ebbb0 writes these root words, padded to 16 bytes,
 // before its uniform/storage tables; shader 02c2ed10e8623721 reads root table 0 at c0+0x10..0x2c. The roots are
 // command-stream state, not dimensions inferred from the bound images. Unwritten root state starts at zero.
-static inline int nvn2_c0_pack(uint8_t *bank, size_t capacity, const Nvn2C0Layout *l,
-                               const uint32_t roots[NVN2_ROOT_TABLES][NVN2_ROOT_WORDS],
-                               const p_bind_buf ssbo[16], const p_bind_buf ubo[16]) {
+static inline int nvn2_c0_pack_handles(uint8_t *bank, size_t capacity, const Nvn2C0Layout *l,
+                                       const uint32_t roots[NVN2_ROOT_TABLES][NVN2_ROOT_WORDS],
+                                       const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
+                                       const uint64_t *tex, const uint64_t *img) {
     if (!nvn2_c0_valid(l, capacity)) return 0;
     memset(bank, 0, capacity);
     size_t at = nvn2_c0_part(l, 0);
@@ -58,5 +59,14 @@ static inline int nvn2_c0_pack(uint8_t *bank, size_t capacity, const Nvn2C0Layou
             memcpy(bank + at + 8, &bytes, 4);
         }
     }
-    return 1;   // handles stay zero: the translator resolves their declarations to host descriptor slots
+    if (tex && l->textures) memcpy(bank + at, tex, 8u * l->textures);
+    at += 8u * l->textures;
+    if (img && l->images) memcpy(bank + at, img, 8u * l->images);
+    return 1;
+}
+
+static inline int nvn2_c0_pack(uint8_t *bank, size_t capacity, const Nvn2C0Layout *l,
+                               const uint32_t roots[NVN2_ROOT_TABLES][NVN2_ROOT_WORDS],
+                               const p_bind_buf ssbo[16], const p_bind_buf ubo[16]) {
+    return nvn2_c0_pack_handles(bank, capacity, l, roots, ssbo, ubo, NULL, NULL);
 }
