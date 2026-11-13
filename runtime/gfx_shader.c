@@ -1807,6 +1807,17 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
                                       const GfxShaderAnswers *a, int *pending);
 
 static int known_failed(const uint8_t key[32]);
+static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, const uint8_t *code, const Req *r,
+                     const GfxShaderAnswers *a);
+// A disk-cache hit stores its inputs too. Only translations did, so a shader whose SPIR-V predates the input store (or
+// came from a seed) had no <cache>/in file: the boot prewarm and library prebuild could never load it ("not
+// available", "not in the shader cache"), and its libraries were built in play while its draws were skipped (pop-in).
+static GfxShader *disk_hit(GfxShader *s, const Req *r, int stage, const uint8_t *control, const uint8_t *code,
+                           const GfxShaderAnswers *a) {
+    in_store(s->iid, stage, control, code, r, a);
+    plat_inc64(&n_hits);
+    return mem_insert(s);
+}
 static void note_failed(const uint8_t key[32]);
 
 // The synchronous path (compute dispatches, awaited stages) remembers failures as the background one does
@@ -1818,7 +1829,7 @@ static const GfxShader *get_one(const Req *r, int stage, const uint8_t *control,
     if (known_failed(r->key)) return NULL;
     paths();
     if (!cache_dir[0]) return fail("no cache directory", NULL);
-    if (r->final && (s = request_disk_load(r, r->key, r->iid))) return plat_inc64(&n_hits), mem_insert(s);
+    if (r->final && (s = request_disk_load(r, r->key, r->iid))) return disk_hit(s, r, stage, control, code, a);
     const GfxShader *t = translate(r, stage, control, code, a);
     if (!t) note_failed(r->key);
     return t;
@@ -2027,7 +2038,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     if (!r->final && use_find(r->code_hash, &m)) build_key(r->code_hash, a, &m, mk, miid), look = mk, look_iid = miid;
     if (look && (s = mem_find(look)))
         return shader_matches_request(s, r) ? (plat_inc64(&n_hits), s) : fail("cached stage contract differs from request", NULL);
-    if (look && (s = request_disk_load(r, look, look_iid))) return plat_inc64(&n_hits), mem_insert(s);
+    if (look && (s = request_disk_load(r, look, look_iid))) return disk_hit(s, r, stage, control, code, a);
 
     uint64_t skip = stage == GFX_STAGE_CS ? 0 : CODE_SKIP;
     char hex[65], code_path[PATH_CAP + 80], spv_path[PATH_CAP + 80], res_path[PATH_CAP + 80];
@@ -2183,7 +2194,7 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
     if (w) return *pending = !failed, NULL;
     paths();
     if (!cache_dir[0]) return fail("no cache directory", NULL);
-    if (r.final && (s = request_disk_load(&r, r.key, r.iid))) return plat_inc64(&n_hits), mem_insert(s);
+    if (r.final && (s = request_disk_load(&r, r.key, r.iid))) return disk_hit(s, &r, stage, control, code, a);
 
     XJob *j = calloc(1, sizeof *j);
     XWait *e = calloc(1, sizeof *e);

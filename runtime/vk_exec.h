@@ -142,6 +142,8 @@ void vk_exec_inline_end(int reopen);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
+void vk_exec_draw_split_cb(void);         // a 64-draw split: bindings reset, pointer-table cache kept
+void vk_exec_draw_new_submission(void);   // a new guest submission: pointer-table cache lifetime ends
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
 // vk_exec.c: the stand-in a 3D BC render target is drawn through goes with its image (vk_exec_image_gone).
 void vk_exec_bc_gone(VkImage image);

@@ -236,14 +236,19 @@ static void cb_done(void *arg) {   // completion thread
     free(r->written), free(r->written_slot), free(r->pools), free(r->chunks), free(r);
 }
 
-// Pointer-table result cache lifetime. Bumped on a new command buffer so soft guest writes that do not
-// move pool/usnap gens cannot reuse a prior CB's regions across menu/submit boundaries.
+// Pointer-table result cache lifetime, so soft guest writes that do not move the pool generation cannot reuse a prior
+// submission's regions across menu/submit boundaries. Bumped at every submission (vk_exec_draw_new_submission) and at host command-buffer breaks that may let guest
+// memory move (stencil clears, ASTC copies, ordered reads). The plain 64-draw split (vk_exec_draw_split_cb) keeps it:
+// the replay of one submission runs on this thread and nothing the scans read changes there, so bumping it made the
+// cache forget every 64 draws (race hit rate 40%).
 static uint64_t ptr_cb_epoch = 1;
 
 void vk_exec_draw_new_cb(void) {
     memset(&B, 0, sizeof B);
     ptr_cb_epoch++;
 }
+void vk_exec_draw_split_cb(void) { memset(&B, 0, sizeof B); }
+void vk_exec_draw_new_submission(void) { ptr_cb_epoch++; }
 
 static CbRes *cb_res(VkExec *ex) {
     if (cur && cur_fence == ex->fence) return cur;
@@ -1264,7 +1269,9 @@ static uint64_t ptr_mix(uint64_t h, uint64_t v) {
 }
 
 static uint64_t ptr_result_life(void) {
-    return vk_mem_gen() + vk_usnap_gen() + ptr_cb_epoch * UINT64_C(0x100000001b3);
+    // Not vk_usnap_gen: the scans read guest memory, never the uniform snapshot, and its per-submission bumps are
+    // covered by ptr_cb_epoch; its mid-replay drops are GPU writes, which reach guest memory only after the fence.
+    return vk_mem_gen() + ptr_cb_epoch * UINT64_C(0x100000001b3);
 }
 
 static uint64_t ptr_bufs_src_key(const p_bind_buf bufs[16], int first_slot, uint64_t min_sz, uint64_t max_sz,
@@ -1410,7 +1417,8 @@ static void pointer_table_scan_range(const p_bind_buf bufs[16], int first_slot, 
 #define PTR_PROBE(offset_) do { \
             uint64_t v = base[(offset_) / 8]; \
             no++; \
-            pointer_table_try_add(v, found, n_io, seen, miss, bound); \
+            /* most words are not pointer-shaped: test before the call (its 8-register prologue was half its time) */ \
+            if (ptr_candidate_ok(v)) pointer_table_try_add(v, found, n_io, seen, miss, bound); \
         } while (0)
         for (uint64_t off = 0; off + 8 <= dense && no < 512 && *n_io < 48; off += 8) PTR_PROBE(off);
         uint64_t mid = stride_end < (64ull << 10) ? stride_end : (64ull << 10);

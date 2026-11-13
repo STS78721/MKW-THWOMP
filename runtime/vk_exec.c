@@ -831,7 +831,7 @@ static void maybe_split(VkExec *ex) {
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
     ex->dirty = VK_EXEC_DIRTY_ALL;
-    vk_exec_draw_new_cb();
+    vk_exec_draw_split_cb();
     n_parts++;
 }
 
@@ -993,6 +993,7 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     part_t0 = kern_now_ns();
     x_here = 1;
     int memory = n || work;
+    vk_exec_draw_new_submission();
     if (memory) vk_mem_mirror_begin(), vk_usnap_begin(handles, n, fence);
     if (work) work(ex, context);
     else {

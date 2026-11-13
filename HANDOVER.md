@@ -137,6 +137,37 @@ The user's Boo race is 40–50. That is a different scene from pass5: 2560×1440
 
 `MEMORY=import` stays. Mirror write-back is ~20 MiB/frame and corrupts guest SSBOs.
 
+### 7a. Race frame rate pass (Claude, 2026-11-13 afternoon; not committed yet)
+
+Headless only (`MKW_SEED=1 ./mkw.exe --seconds 50`, the title-screen free-roam demo at the user's 2160-line setting). The demo course changes run to run, so fps between two runs is noise: compare replay cost per draw.
+
+Two changes, both in `vk_exec_draw.c` / `vk_exec.c`:
+- Pointer-scan filter at the probe: `PTR_PROBE` tests `ptr_candidate_ok(v)` before calling `pointer_table_try_add`. Same results. The call's 8-register prologue and epilogue were half of `try_add`'s samples, because most words are not pointer-shaped.
+- Pointer-cache lifetime: `ptr_result_life` no longer adds `vk_usnap_gen()`. `ptr_cb_epoch` now bumps once per guest submission (`vk_exec_draw_new_submission`, record_impl) and at the host breaks that already bumped it (stencil clear, ASTC copy, `vk_exec_read_buffer`), but not at the plain 64-draw split (`vk_exec_draw_split_cb`). The epoch is kept: §6 still holds. Hit rate went from 40% to 44%.
+
+Result: replay went from 6.2–7.0 µs per draw to 4.6–5.1 µs (about −28%, A/B in one exe with a temporary toggle, since removed). Seven race screenshots looked right, and 50 s runs had no faults.
+
+What limits the race (measured with a temporary timeline log, since removed):
+- Each frame the game calls `nvnSyncWait` on the previous frame's big submission, then builds and replays the next one. The frame is roughly the GPU tail of N−1, plus game work and small submissions, plus the replay of N. Interval ≈ replay + ~12 ms.
+- GPU per frame is ~11–15 ms, and it is the same at `MKW_RESOLUTION=1080` as at 2160. So it is not pixel-bound. Big parts are a ~4.4 ms part with ~700 draws, a ~2 ms part with ~490 draws, and a ~2.7 ms part of 49 dispatches. Suspects: GPU reads of imported host memory (storage ranges are ~7 GiB per frame of bound windows), and the full `ALL_COMMANDS` barriers at pass edges. A GPU profiler (Nsight) is the next tool. CPU work alone will not reach 60.
+- No effect: `MKW_REPLAY_ASYNC=1` (frame unchanged, drain 12%), `MKW_VK_PRESENT=immediate`, `MKW_SPLIT_DRAWS=16 MKW_SPLIT_US=200` (more parts, same frame).
+- Core waits are ~1.5 ms per frame in total (`MKW_CORE_DIAG=1`). `MKW_FREE_CORES=1` breaks the game (null AVs).
+- `MKW_TRACE=perf` costs ~9 ms per frame of write-watch queries (`vk_mem_dirty_submit` census). Do not judge fps with it on.
+
+GPU follow-up (same day, later):
+- The per-part GPU timestamps (TOP_OF_PIPE/BOTTOM_OF_PIPE) are not a clean GPU cost. The same scene sums to ~20 ms per frame with 64-draw parts but ~6 ms with per-pass parts. Treat the "12 ms GPU" above as an upper bound, not a measurement. There is no Nsight on this machine (RTX 5070 Ti).
+- To compare settings, alternate them inside one run, every 2–8 s, and tally frame time per setting. Separate runs land on different demo scenes. A temporary harness did this and resolved ~1 ms differences.
+  - Default splits (64 draws / 1 ms) beat per-pass splits by ~1.5 ms per frame.
+  - `MKW_GPU_TIME=zero` did not change draws per frame, so no sign the game sheds detail by GPU time.
+
+Pop-in (user report: trees/world take 1–2 s to appear while driving):
+- The user's `logs/mkw.log` shows ~40–150 draws per interval finding their shader libraries missing ("left to a worker"). Fragment-library builds average 15 ms (max 304 ms), and with `PIPE_SKIP=fullscreen` those draws are skipped until the build finishes.
+- At boot, 2494 of ~5800 pipeline keys are dropped as "shader neither cached nor stored" (2501 shaders "not available").
+- Cause: `<cache>/in/*.in` was written only by `translate_one`. A shader loaded from an existing `.spv` (disk-cache hit) never got its input stored, so boot prewarm and library prebuild could never load it.
+- Fix (uncommitted): `disk_hit` in `gfx_shader.c` calls `in_store` on the three disk-hit paths. It takes effect over sessions: the user's next play stores the inputs it meets, and later boots prewarm those pipelines. The headless demo meets only ~8 such shaders, so it cannot show this.
+- Not it: mesh/task shaders (none have `.in`, but only a handful of programs exist) and disk I/O (romfs reads are mostly under 1 ms).
+- `MKW_LIB_PREBUILD_KEEP=4000` (env) prebuilt 875 libraries at idle priority in 0.3 s. The other 3276 were "not in the shader cache" for the same reason.
+
 Console spam is capped: `vk_mesh.c` DrawMeshTasks logs stop at `mesh_log_ok < 4`. Pointer-table "found" / fallback logs are gone. Unlimited logs made a 60 fps run look frozen in a terminal.
 
 ## 8. Device lost on launch (intermittent, not this bug)
