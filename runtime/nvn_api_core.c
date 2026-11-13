@@ -56,10 +56,13 @@ void nvn_guest_written(uint64_t addr, uint64_t size) {
 // memcpy of pool storage the GPU rendered into must copy what the GPU wrote: TotK moves its generated grass maps
 // between pools with memcpy. Copies below 1 KiB skip the check; the copy itself is memmove, as overlapping
 // arguments are undefined for memcpy anyway.
+_Thread_local uint64_t rt_memcpy_lr, rt_memcpy_src;   // MKW_ANIM_CHECK (ov_system.c apw_veh): the guest call in progress
 static void ov_memcpy(Cpu *c) {
     uint64_t dst = arg_x(c, 0), src = arg_x(c, 1), n = arg_x(c, 2);
     if (n >= 1024) gfx_backend()->guest_read(src, n);
+    rt_memcpy_lr = c->x[30], rt_memcpy_src = src;
     memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
+    rt_memcpy_lr = 0;
     ret_x(c, dst);
 }
 HOST_OVERRIDE("memcpy", ov_memcpy);
@@ -268,6 +271,7 @@ NVN_API(nvnDeviceSetDepthMode) {
 NVN_API(nvnDeviceFinalizeCommandHandle) { (void)c; }
 
 // ---------- Memory pools
+void rt_anim_pool_note(int fini, uint64_t pool, uint64_t mem, uint64_t size, uint32_t flags, Cpu *c);   // ov_system.c
 // void nvnMemoryPoolBuilderSetDefaults(NVNmemoryPoolBuilder *b)
 NVN_API(nvnMemoryPoolBuilderSetDefaults) { memset(arg_p(c, 0), 0, sizeof(pool_builder_t)); }
 // void nvnMemoryPoolBuilderSetDevice(NVNmemoryPoolBuilder *b, NVNdevice *d)
@@ -305,6 +309,7 @@ NVN_API(nvnMemoryPoolInitialize) {
         ok = 0;
     }
     if (ok && pool_gpu_visible(o)) index_add(o);
+    if (ok) rt_anim_pool_note(0, (uintptr_t)o, (uintptr_t)o->game_mem, o->size, o->flags, c);   // MKW_ANIM_CHECK
     if (!ok) {
         if (nvn_gpu_only((uintptr_t)o->mem)) gva_free((uintptr_t)o->mem);
         o->magic = 0;
@@ -318,6 +323,7 @@ NVN_API(nvnMemoryPoolFinalize) {
     NVN_BLOCKING();   // as nvnMemoryPoolInitialize
     pool_t *o = arg_p(c, 0);
     if (o->magic != NVN_POOL_MAGIC) return;
+    rt_anim_pool_note(1, (uintptr_t)o, (uintptr_t)o->game_mem, o->size, o->flags, c);   // MKW_ANIM_CHECK
     if (pool_gpu_visible(o)) index_del(o);
     gfx_backend()->pool_fini(o);
     if (nvn_gpu_only((uintptr_t)o->mem)) gva_free((uintptr_t)o->mem);

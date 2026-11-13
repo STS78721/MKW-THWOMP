@@ -1272,11 +1272,22 @@ const VkTexImage *vk_texture_get(const tex_t *t) {
 // Small render targets the CPU reads without NVN's invalidate (vk_texture_write_back_small); small_pending: one may be
 // dirty. wb_limit is the largest target (bytes) that goes back when the CPU waits for a fence: TOTK_WB_FENCE_LIMIT,
 // read once. wb_trace: TOTK_TRACE=gfx, read together with it.
-enum { WB_SMALL_DEFAULT = 64 << 10 };
+// A target in a CPU-cached pool goes back up to WB_CACHED_LIMIT instead: such a pool is there for the CPU to read.
+// MKW bakes each skeletal animation on the GPU into an RGBA16F texture (bones x frames, 150-200 KiB for the Crown
+// City pedestrians) in a CPU-cached pool, and its animation code (f_700042bea0) reads the keyframes from the pool once
+// the fence passed. With the 64 KiB limit those bakes never reached the pool: the pedestrians read zeros (invisible,
+// still solid) or stale heap bytes (huge bone matrices: the full-screen blue sheets).
+enum { WB_SMALL_DEFAULT = 64 << 10, WB_CACHED_LIMIT = 4 << 20 };
 static int small_pending;
 static uint64_t wb_limit = WB_SMALL_DEFAULT;
 static int wb_trace;
 static int wb_cfg_read;
+
+static uint64_t wb_limit_of(const Tex *e) {
+    const pool_t *p = e->t.pool;
+    if (wb_limit && wb_limit < WB_CACHED_LIMIT && p && (p->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED)) return WB_CACHED_LIMIT;
+    return wb_limit;
+}
 
 static void wb_cfg_init(void) {
     if (wb_cfg_read) return;
@@ -1307,7 +1318,7 @@ void vk_texture_gpu_written(const tex_t *t) {
             e->gpu_seq = ++gpu_writes;
             e->gpu_fence = vk_exec_recording_fence();
             wb_cfg_init();
-            if (e->t.L.size <= wb_limit) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
+            if (e->t.L.size <= wb_limit_of(e)) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
             own_add(e);
         }
     }
@@ -1926,7 +1937,7 @@ static void wb_note(const Tex *e, int skipped) {
            skipped ? "skipped-for-size" : "over-default", (unsigned long long)e->pub.addr, e->t.d.width, e->t.d.height,
            e->t.d.format, (unsigned long long)e->t.L.size,
            !p ? "none" : (fl & NVN_MEMORY_POOL_FLAGS_CPU_CACHED) ? "cpu-cached" : (fl & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) ? "cpu-uncached" : "other",
-           (unsigned long long)wb_limit);
+           (unsigned long long)wb_limit_of(e));
 }
 
 void vk_texture_write_back_small(uint64_t fence) {
@@ -1935,14 +1946,14 @@ void vk_texture_write_back_small(uint64_t fence) {
     __atomic_store_n(&small_pending, 0, __ATOMIC_RELAXED);
     plat_mutex_lock_shared(&owned_lock);
     int n = 0, later = 0;
-    for (int i = 0; i < nowned; i++) n += owned[i]->gpu_dirty && owned[i]->t.L.size <= wb_limit;
+    for (int i = 0; i < nowned; i++) n += owned[i]->gpu_dirty && owned[i]->t.L.size <= wb_limit_of(owned[i]);
     Tex **hit = n ? malloc(sizeof *hit * (size_t)n) : NULL;
     if (n && !hit) rt_fatal("vk: out of memory for a texture write-back");
     n = 0;
     for (int i = 0; i < nowned; i++) {
         Tex *e = owned[i];
         if (!e->gpu_dirty) continue;
-        if (e->t.L.size > wb_limit) {
+        if (e->t.L.size > wb_limit_of(e)) {
             if (wb_trace && e->gpu_fence <= fence) {
                 wb_note(e, 1);
                 perf_count(PERF_CNT_WB_SKIP);

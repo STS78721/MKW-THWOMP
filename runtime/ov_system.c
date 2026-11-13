@@ -1468,6 +1468,12 @@ static int heap_legacy(void) {
     return on;
 }
 
+// MKW_ANIM_CHECK heap tracker (defined at the end of this file): every ExpHeap alloc/free/resize is recorded so the
+// events touching an animation keyframe buffer can be reported.
+enum { AHT_ALLOC, AHT_FREE, AHT_RESIZE_FRONT, AHT_RESIZE_BACK };
+static int anim_on(void);
+static void aht_event(int kind, uint64_t heap, uint64_t ptr, uint64_t size, uint64_t res, Cpu *c, uint64_t lr);
+
 static int heap_trace(void) {
     static int on = -1;
     if (on < 0) {
@@ -1555,6 +1561,7 @@ void __wrap_f_70003f24c0(Cpu *c) {
         rt_log("htrace alloc heap %#llx size %#llx align %lld -> %#llx (lr %#llx)", (unsigned long long)heap,
                (unsigned long long)size, (long long)raw_align, (unsigned long long)c->x[0], (unsigned long long)lr);
     if (c->x[0] != 0) {
+        if (anim_on()) aht_event(AHT_ALLOC, heap, c->x[0], size, 0, c, lr);
         return; // Normal guest allocation succeeded
     }
     if (!heap_legacy()) {
@@ -2074,12 +2081,16 @@ void __wrap_f_700259aac0(Cpu *c) {
 
 // MKW_HEAP_TRACE=1: logging pass-throughs on the ExpHeap vtable slots around alloc (sead Heap order): adjust (-1),
 // free (+1), resizeFront (+2), resizeBack (+3). They call the game's own function and log heap, arguments and result.
-static uint64_t ht_orig[4];
+static uint64_t ht_orig[4], ht_hook[4];
+static const int ht_slot[4] = {-1, 1, 2, 3};
 static const char *const ht_name[4] = {"adjust", "free", "resizeFront", "resizeBack"};
 static void ht_call(Cpu *c, int k) {
     uint64_t heap = c->x[0], a1 = c->x[1], a2 = c->x[2], lr = c->x[30];
     GuestFn orig = rt_dispatch_lookup(ht_orig[k]);
     if (orig) orig(c);
+    if (k && anim_on())
+        aht_event(k == 1 ? AHT_FREE : k == 2 ? AHT_RESIZE_FRONT : AHT_RESIZE_BACK, heap, a1, a2, c->x[0], c, lr);
+    if (!heap_trace()) return;
     static volatile int32_t n;
     // free is frequent: log only the large ones (a pointer into a heap header region is a heap being freed)
     int big = k != 1;
@@ -2099,14 +2110,13 @@ void ov_system_post_load(void) {
         s_expheap_hook_addr = hostfn_register("sead__ExpHeap__alloc", ov_expheap_alloc_hook);
         uint64_t *vtable1 = (uint64_t *)(uintptr_t)0x700363a330ull;
         uint64_t *vtable2 = (uint64_t *)(uintptr_t)0x70036e1e18ull;
-        if (heap_trace()) {
-            static const int slot[4] = {-1, 1, 2, 3};
+        if (heap_trace() || anim_on()) {
             static const GuestFn fn[4] = {ht_adjust, ht_free, ht_resize_front, ht_resize_back};
             for (int k = 0; k < 4; k++) {
-                ht_orig[k] = vtable1[slot[k]];
-                uint64_t h = hostfn_register(ht_name[k], fn[k]);
-                if (vtable1[slot[k]] == ht_orig[k]) vtable1[slot[k]] = h;
-                if (vtable2[slot[k]] == ht_orig[k]) vtable2[slot[k]] = h;
+                ht_orig[k] = vtable1[ht_slot[k]];
+                uint64_t h = ht_hook[k] = hostfn_register(ht_name[k], fn[k]);
+                if (vtable1[ht_slot[k]] == ht_orig[k]) vtable1[ht_slot[k]] = h;
+                if (vtable2[ht_slot[k]] == ht_orig[k]) vtable2[ht_slot[k]] = h;
                 rt_log("htrace hooked ExpHeap %s (%#llx)", ht_name[k], (unsigned long long)ht_orig[k]);
             }
         }
@@ -2133,6 +2143,15 @@ void ov_system_on_inits_done(void) {
         }
         if (s_obj_dispose_hook_addr) {
             *(uint64_t *)(uintptr_t)0x70036b6a18ull = s_obj_dispose_hook_addr;
+        }
+        // the heap-trace pass-throughs again, in case the tables were rewritten since post_load
+        for (int k = 0; k < 4; k++) {
+            uint64_t *vt[2] = {(uint64_t *)(uintptr_t)0x700363a330ull, (uint64_t *)(uintptr_t)0x70036e1e18ull};
+            for (int v = 0; v < 2 && ht_hook[k]; v++)
+                if (vt[v][ht_slot[k]] == ht_orig[k]) {
+                    vt[v][ht_slot[k]] = ht_hook[k];
+                    rt_log("htrace re-hooked ExpHeap %s in table %d", ht_name[k], v);
+                }
         }
         *(uint32_t *)(uintptr_t)0x70052db828ull = 1;
         rt_log("gs: set 0x70052db828 = 1 in ov_system_on_inits_done");
@@ -2451,7 +2470,319 @@ static _Thread_local float anim_base, anim_off;
 static _Thread_local uint64_t anim_hdr;
 static _Thread_local uint64_t anim_entry;
 static _Thread_local int anim_path;
-static struct { uint64_t hdr; float good_max, good_min; uint64_t good, bad; int dumped; } anim_h[128];
+static struct {
+    uint64_t hdr;
+    float good_max, good_min;
+    uint64_t good, bad, calls;
+    int dumped, ndump, nsample, ndiff;
+    uint64_t base, size, res;   // the keyframe buffer, resolved at first sight
+    uint8_t *copy;              // its contents at first sight
+    uint64_t diff_sig;          // hash of the live contents at the last reported difference
+} anim_h[128];
+
+// The keyframe buffer of a curve header: base = [[[hdr+0x40]+0x10]+0x100] + [hdr+0x28], size = [hdr+0x98]
+// (= frames (u16 at hdr+0x8a) x stride (u32 at hdr+0x10c) in every header seen so far).
+static int anim_buf(uint64_t hdr, uint64_t *base, uint64_t *size, uint64_t *res) {
+    uint64_t a, b, x11, off;
+    uint32_t sz, stride;
+    uint16_t frames;
+    if (!plat_mem_readable(hdr, 0x130)) return 0;
+    memcpy(&a, (const void *)(uintptr_t)(hdr + 0x40), 8);
+    memcpy(&off, (const void *)(uintptr_t)(hdr + 0x28), 8);
+    memcpy(&sz, (const void *)(uintptr_t)(hdr + 0x98), 4);
+    memcpy(&stride, (const void *)(uintptr_t)(hdr + 0x10c), 4);
+    memcpy(&frames, (const void *)(uintptr_t)(hdr + 0x8a), 2);
+    if (!sz) sz = (uint32_t)frames * stride;
+    if (!a || !plat_mem_readable(a + 0x10, 8)) return 0;
+    memcpy(&b, (const void *)(uintptr_t)(a + 0x10), 8);
+    if (!b || !plat_mem_readable(b, 0x108)) return 0;
+    memcpy(&x11, (const void *)(uintptr_t)(b + 0x100), 8);
+    if (!x11 || !sz || sz > (64u << 20) || !plat_mem_readable(x11 + off, sz)) return 0;
+    *base = x11 + off, *size = sz, *res = b;
+    return 1;
+}
+static uint64_t anim_hash(const uint8_t *p, uint64_t n) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001b3ull;
+    }
+    return h;
+}
+
+// ---- heap tracker for MKW_ANIM_CHECK. aht_event sees every sead ExpHeap alloc (the __wrap_f_70003f24c0 hook) and
+// free / resizeFront / resizeBack (the ht_* vtable pass-throughs). Events go into a ring; allocations of at least
+// AHT_BIG_MIN bytes are also kept in a table until freed. aht_watch registers a keyframe buffer: it reports the big
+// allocations overlapping it and the ring's past events touching it, and from then on every event touching it is
+// logged as it happens ("daht"), with the guest return addresses up the frame-pointer chain.
+typedef struct {
+    uint64_t ptr, size, heap, res, old, lr[4];
+    uint32_t seq, kind;
+} AhtEv;
+enum { AHT_RING = 1 << 19, AHT_BIG = 1 << 17, AHT_RANGES = 16, AHT_BIG_MIN = 0x8000, AHT_LIVE_LOGS = 300, AHT_PAST_LOGS = 60 };
+static AhtEv aht_ring[AHT_RING];
+static uint32_t aht_seq;
+static struct { uint64_t ptr, size, lr[4]; uint32_t seq; } aht_big[AHT_BIG];   // open addressing: ptr 0 empty, 1 deleted
+static SRWLOCK aht_lock = SRWLOCK_INIT;
+static struct { uint64_t lo, hi, hdr; } aht_rng[AHT_RANGES];
+static volatile LONG aht_nrng;
+static long aht_live_logs, aht_count[4];
+static const char *const aht_kind[4] = {"alloc", "free", "resizeFront", "resizeBack"};
+
+static uint32_t aht_slot(uint64_t ptr) { return (uint32_t)(((ptr >> 4) * 0x9E3779B97F4A7C15ull) >> 47) & (AHT_BIG - 1); }
+static int aht_big_find(uint64_t ptr) {   // index or -1; the caller holds aht_lock
+    for (uint32_t i = aht_slot(ptr), n = 0; n < AHT_BIG; i = (i + 1) & (AHT_BIG - 1), n++) {
+        if (aht_big[i].ptr == ptr) return (int)i;
+        if (!aht_big[i].ptr) return -1;
+    }
+    return -1;
+}
+static void aht_big_put(const AhtEv *e) {   // the caller holds aht_lock exclusively
+    int at = -1;
+    for (uint32_t i = aht_slot(e->ptr), n = 0; n < AHT_BIG; i = (i + 1) & (AHT_BIG - 1), n++) {
+        if (aht_big[i].ptr == e->ptr) { at = (int)i; break; }
+        if (aht_big[i].ptr == 1 && at < 0) at = (int)i;
+        if (!aht_big[i].ptr) {
+            if (at < 0) at = (int)i;
+            break;
+        }
+    }
+    if (at < 0) return;
+    aht_big[at].ptr = e->ptr, aht_big[at].size = e->size, aht_big[at].seq = e->seq;
+    memcpy(aht_big[at].lr, e->lr, sizeof e->lr);
+}
+static int aht_hit_range(const AhtEv *e, int r) {
+    uint64_t lo = aht_rng[r].lo, hi = aht_rng[r].hi;
+    if (e->kind == AHT_ALLOC || e->kind == AHT_FREE) return e->ptr < hi && e->ptr + (e->size ? e->size : 1) > lo;
+    // a resize: the block starts at ptr; its old extent is known only for big blocks
+    return e->ptr < hi && e->ptr + (e->old ? e->old : (16ull << 20)) > lo;
+}
+static void aht_print(const AhtEv *e, const char *when, int r) {
+    uint64_t lo = aht_rng[r].lo;
+    rt_log("daht %s #%u %s heap %#llx ptr %#llx size %#llx (old %#llx) -> %#llx | callers %#llx %#llx %#llx %#llx | "
+           "keyframe buffer of hdr %#llx [%#llx, %#llx): event at %s%#llx",
+           when, e->seq, aht_kind[e->kind & 3], (unsigned long long)e->heap, (unsigned long long)e->ptr,
+           (unsigned long long)e->size, (unsigned long long)e->old, (unsigned long long)e->res, (unsigned long long)e->lr[0],
+           (unsigned long long)e->lr[1], (unsigned long long)e->lr[2], (unsigned long long)e->lr[3],
+           (unsigned long long)aht_rng[r].hdr, (unsigned long long)lo, (unsigned long long)aht_rng[r].hi,
+           e->ptr >= lo ? "+" : "-", (unsigned long long)(e->ptr >= lo ? e->ptr - lo : lo - e->ptr));
+}
+static void aht_event(int kind, uint64_t heap, uint64_t ptr, uint64_t size, uint64_t res, Cpu *c, uint64_t lr) {
+    AhtEv e = {.ptr = ptr, .size = size, .heap = heap, .res = res, .kind = (uint32_t)kind};
+    e.seq = __atomic_add_fetch(&aht_seq, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&aht_count[kind & 3], 1, __ATOMIC_RELAXED);
+    e.lr[0] = lr;
+    // the guest frame-pointer chain, kept to frames above sp on this stack
+    uint64_t sp = c->sp, fp = c->x[29];
+    for (int i = 1; i < 4 && fp >= sp && fp < sp + 0x80000 && !(fp & 7); i++) {
+        e.lr[i] = *(const uint64_t *)(uintptr_t)(fp + 8);
+        uint64_t up = *(const uint64_t *)(uintptr_t)fp;
+        if (up <= fp) break;
+        fp = up;
+    }
+    if (kind == AHT_ALLOC) {
+        if (size >= AHT_BIG_MIN) {
+            AcquireSRWLockExclusive(&aht_lock);
+            aht_big_put(&e);
+            ReleaseSRWLockExclusive(&aht_lock);
+        }
+    } else {
+        AcquireSRWLockShared(&aht_lock);
+        int i = aht_big_find(ptr);
+        ReleaseSRWLockShared(&aht_lock);
+        if (i >= 0) {
+            AcquireSRWLockExclusive(&aht_lock);
+            i = aht_big_find(ptr);
+            if (i >= 0) {
+                e.old = aht_big[i].size;
+                if (kind == AHT_FREE) e.size = aht_big[i].size, aht_big[i].ptr = 1;
+                else if (kind == AHT_RESIZE_BACK && res) aht_big[i].size = size;
+            }
+            ReleaseSRWLockExclusive(&aht_lock);
+        }
+    }
+    aht_ring[e.seq & (AHT_RING - 1)] = e;
+    int n = aht_nrng;
+    for (int r = 0; r < n; r++)
+        if (aht_hit_range(&e, r)) {
+            if (__atomic_add_fetch(&aht_live_logs, 1, __ATOMIC_RELAXED) <= AHT_LIVE_LOGS) aht_print(&e, "live", r);
+            break;
+        }
+}
+// Registers a keyframe buffer: what overlaps it now, what touched it before, and from here on live reports.
+static void aht_watch(uint64_t hdr, uint64_t lo, uint64_t hi) {
+    AcquireSRWLockExclusive(&aht_lock);
+    int r = aht_nrng;
+    if (r >= AHT_RANGES) {
+        ReleaseSRWLockExclusive(&aht_lock);
+        return;
+    }
+    aht_rng[r].lo = lo, aht_rng[r].hi = hi, aht_rng[r].hdr = hdr;
+    int found = 0;
+    for (uint32_t i = 0; i < AHT_BIG; i++)
+        if (aht_big[i].ptr > 1 && aht_big[i].ptr < hi && aht_big[i].ptr + aht_big[i].size > lo) {
+            found++;
+            rt_log("daht hdr %#llx buffer [%#llx, %#llx): overlaps live big allocation #%u ptr %#llx size %#llx (ends %#llx; "
+                   "buffer starts at %s%#llx of it) callers %#llx %#llx %#llx %#llx",
+                   (unsigned long long)hdr, (unsigned long long)lo, (unsigned long long)hi, aht_big[i].seq,
+                   (unsigned long long)aht_big[i].ptr, (unsigned long long)aht_big[i].size,
+                   (unsigned long long)(aht_big[i].ptr + aht_big[i].size), lo >= aht_big[i].ptr ? "+" : "-",
+                   (unsigned long long)(lo >= aht_big[i].ptr ? lo - aht_big[i].ptr : aht_big[i].ptr - lo),
+                   (unsigned long long)aht_big[i].lr[0], (unsigned long long)aht_big[i].lr[1],
+                   (unsigned long long)aht_big[i].lr[2], (unsigned long long)aht_big[i].lr[3]);
+        }
+    if (!found)
+        rt_log("daht hdr %#llx buffer [%#llx, %#llx): no live tracked ExpHeap allocation of %#x bytes or more overlaps it",
+               (unsigned long long)hdr, (unsigned long long)lo, (unsigned long long)hi, AHT_BIG_MIN);
+    uint32_t now = __atomic_load_n(&aht_seq, __ATOMIC_RELAXED), span = now < AHT_RING ? now : AHT_RING - 1;
+    int hits = 0;
+    for (uint32_t s = now - span + 1; s != now + 1; s++) {
+        AhtEv e = aht_ring[s & (AHT_RING - 1)];
+        if (e.seq != s || !aht_hit_range(&e, r)) continue;
+        if (hits++ < AHT_PAST_LOGS) aht_print(&e, "past", r);
+    }
+    rt_log("daht hdr %#llx: %d past heap events touch its buffer (ring holds the last %u of %u events; so far %ld allocs, "
+           "%ld frees, %ld resizeFront, %ld resizeBack)", (unsigned long long)hdr, hits, span, now, aht_count[0], aht_count[1],
+           aht_count[2], aht_count[3]);
+    aht_nrng = r + 1;
+    ReleaseSRWLockExclusive(&aht_lock);
+}
+
+static void apl_report(uint64_t hdr, uint64_t pool, uint64_t lo, uint64_t hi);   // below
+static void apw_report(uint64_t hdr, uint64_t pool);
+static void apw_add(uint64_t pool, uint64_t mem, uint64_t size);
+static void apw_retire(uint64_t pool);
+
+// First sample from a curve header: resolve its keyframe buffer, keep a copy, and have the heap tracker watch it.
+static void anim_first_sight(int h) {
+    uint64_t hdr = anim_h[h].hdr, base, size, res;
+    if (!anim_buf(hdr, &base, &size, &res)) {
+        rt_log("danim: hdr %#llx: keyframe buffer not resolved", (unsigned long long)hdr);
+        return;
+    }
+    anim_h[h].base = base, anim_h[h].size = size, anim_h[h].res = res;
+    anim_h[h].copy = malloc(size);
+    if (anim_h[h].copy) memcpy(anim_h[h].copy, (const void *)(uintptr_t)base, size);
+    uint32_t stride;
+    uint16_t frames, bones;
+    uint8_t cs;
+    memcpy(&stride, (const void *)(uintptr_t)(hdr + 0x10c), 4);
+    memcpy(&frames, (const void *)(uintptr_t)(hdr + 0x8a), 2);
+    memcpy(&bones, (const void *)(uintptr_t)(hdr + 0x88), 2);
+    memcpy(&cs, (const void *)(uintptr_t)(hdr + 0x129), 1);
+    rt_log("danim first sight: hdr %#llx keyframe buffer [%#llx, %#llx) size %#llx (%u frames x stride %u = %#x; word +0x88 %u; "
+           "%u bytes per bone) resource %#llx, at heap event #%u",
+           (unsigned long long)hdr, (unsigned long long)base, (unsigned long long)(base + size), (unsigned long long)size,
+           frames, stride, frames * stride, bones, cs, (unsigned long long)res, __atomic_load_n(&aht_seq, __ATOMIC_RELAXED));
+    aht_watch(hdr, base, base + size);
+    apl_report(hdr, res, base, base + size);
+    apw_report(hdr, res);
+}
+static void anim_write(const char *name, const void *p, uint64_t n) {
+    FILE *f = fopen(name, "wb");
+    if (!f) return;
+    fwrite(p, 1, n, f);
+    fclose(f);
+}
+// Every 512 samples of a header: has its keyframe buffer changed since first sight? Reports the changed byte ranges
+// once per distinct state (up to 12 states).
+static void anim_diff(int h) {
+    if (!anim_h[h].copy || anim_h[h].ndiff >= 12) return;
+    const uint8_t *live = (const uint8_t *)(uintptr_t)anim_h[h].base, *copy = anim_h[h].copy;
+    uint64_t size = anim_h[h].size;
+    if (!memcmp(live, copy, size)) return;
+    uint64_t sig = anim_hash(live, size);
+    if (sig == anim_h[h].diff_sig) return;
+    anim_h[h].diff_sig = sig;
+    char s[1600];
+    int o = 0, nr = 0;
+    uint64_t changed = 0, first = 0, last_end = 0;
+    for (uint64_t i = 0; i < size;) {
+        if (live[i] == copy[i]) {
+            i++;
+            continue;
+        }
+        uint64_t j = i, last = i;
+        for (; j < size && j - last < 64; j++)
+            if (live[j] != copy[j]) last = j;
+        uint64_t len = last - i + 1;
+        if (!nr) first = i;
+        last_end = last + 1;
+        changed += len;
+        if (nr < 10 && o < (int)sizeof s - 120) {
+            o += snprintf(s + o, sizeof s - o, " | +%#llx len %#llx:", (unsigned long long)i, (unsigned long long)len);
+            for (uint64_t k = i; k < i + 8 && k < size; k++) o += snprintf(s + o, sizeof s - o, " %02x", copy[k]);
+            o += snprintf(s + o, sizeof s - o, " ->");
+            for (uint64_t k = i; k < i + 8 && k < size; k++) o += snprintf(s + o, sizeof s - o, " %02x", live[k]);
+        }
+        nr++;
+        i = last + 1;
+    }
+    rt_log("danim buffer CHANGED since first sight: hdr %#llx base %#llx, state %d at heap event #%u: %d ranges, %llu bytes, "
+           "spanning +%#llx..+%#llx of %#llx%s",
+           (unsigned long long)anim_h[h].hdr, (unsigned long long)anim_h[h].base, anim_h[h].ndiff,
+           __atomic_load_n(&aht_seq, __ATOMIC_RELAXED), nr, (unsigned long long)changed, (unsigned long long)first,
+           (unsigned long long)last_end, (unsigned long long)size, s);
+    if (anim_h[h].ndiff < 3) {
+        char name[160];
+        CreateDirectoryA("anim-dump", NULL);
+        snprintf(name, sizeof name, "anim-dump/h%llx_changed%d.bin", (unsigned long long)anim_h[h].hdr, anim_h[h].ndiff);
+        anim_write(name, live, size);
+    }
+    anim_h[h].ndiff++;
+}
+// First bad rotation of a header: the live keyframe buffer with up to 0x2000 bytes either side, the first-sight
+// copy, the resource object and the header, in anim-dump/.
+static void anim_dump(int h, const char *why) {
+    anim_h[h].ndump++;
+    if (!anim_h[h].copy) return;
+    uint64_t hdr = anim_h[h].hdr, base = anim_h[h].base, size = anim_h[h].size, lo = base, hi = base + size;
+    if (plat_mem_readable(base - 0x2000, 0x2000)) lo = base - 0x2000;
+    if (plat_mem_readable(hi, 0x2000)) hi += 0x2000;
+    char name[160];
+    CreateDirectoryA("anim-dump", NULL);
+    snprintf(name, sizeof name, "anim-dump/h%llx_live_from%llx.bin", (unsigned long long)hdr, (unsigned long long)lo);
+    anim_write(name, (const void *)(uintptr_t)lo, hi - lo);
+    snprintf(name, sizeof name, "anim-dump/h%llx_first_from%llx.bin", (unsigned long long)hdr, (unsigned long long)base);
+    anim_write(name, anim_h[h].copy, size);
+    if (plat_mem_readable(anim_h[h].res, 0x400)) {
+        snprintf(name, sizeof name, "anim-dump/h%llx_res%llx.bin", (unsigned long long)hdr, (unsigned long long)anim_h[h].res);
+        anim_write(name, (const void *)(uintptr_t)anim_h[h].res, 0x400);
+    }
+    if (plat_mem_readable(hdr - 0x100, 0x500)) {
+        snprintf(name, sizeof name, "anim-dump/h%llx_hdr_from%llx.bin", (unsigned long long)hdr, (unsigned long long)(hdr - 0x100));
+        anim_write(name, (const void *)(uintptr_t)(hdr - 0x100), 0x500);
+    }
+    rt_log("danim dump (%s): hdr %#llx buffer [%#llx, %#llx) written from %#llx to %#llx; live %s the first-sight copy",
+           why, (unsigned long long)hdr, (unsigned long long)base, (unsigned long long)(base + size), (unsigned long long)lo,
+           (unsigned long long)hi, memcmp((const void *)(uintptr_t)base, anim_h[h].copy, size) ? "DIFFERS from" : "equals");
+}
+// A bad rotation's sample: where in the keyframe buffer it was read, the bytes there now and at first sight.
+static void anim_sample(int h, uint64_t bone, float t) {
+    anim_h[h].nsample++;
+    if (!anim_h[h].copy) return;
+    uint64_t hdr = anim_h[h].hdr, base = anim_h[h].base, size = anim_h[h].size;
+    uint32_t stride;
+    uint8_t cs;
+    memcpy(&stride, (const void *)(uintptr_t)(hdr + 0x10c), 4);
+    memcpy(&cs, (const void *)(uintptr_t)(hdr + 0x129), 1);
+    int64_t idx = (int64_t)t;
+    if ((float)idx != t && t < 0) idx--;
+    uint32_t off = (uint32_t)(stride * (uint32_t)idx + (uint32_t)bone * cs);
+    if ((uint64_t)off + 16 > size) {
+        rt_log("danim sample: hdr %#llx frame %lld bone %llu: offset %#x is OUTSIDE the buffer (size %#llx)",
+               (unsigned long long)hdr, (long long)idx, (unsigned long long)bone, off, (unsigned long long)size);
+        return;
+    }
+    const uint8_t *live = (const uint8_t *)(uintptr_t)(base + off), *copy = anim_h[h].copy + off;
+    char a[64], b[64];
+    int oa = 0, ob = 0;
+    for (int k = 0; k < 16; k++) oa += snprintf(a + oa, sizeof a - oa, "%02x%s", live[k], k == 7 ? " " : ""), ob += snprintf(b + ob, sizeof b - ob, "%02x%s", copy[k], k == 7 ? " " : "");
+    rt_log("danim sample: hdr %#llx frame %lld bone %llu at %#llx = buffer +%#x (%u%% in): now %s | first sight %s | %s",
+           (unsigned long long)hdr, (long long)idx, (unsigned long long)bone, (unsigned long long)(base + off), off,
+           (unsigned)(100ull * off / size), a, b, memcmp(live, copy, 16) ? "CHANGED since first sight" : "same as at first sight");
+}
 static SRWLOCK anim_lock = SRWLOCK_INIT;
 static int anim_on(void) {
     static int on = -1;
@@ -2500,8 +2831,14 @@ void rt_anim_q(Cpu *c, uint64_t fp, uint64_t entry) {
     int h = 128;
     if (source_valid)
         for (h = 0; h < 128 && anim_h[h].hdr && anim_h[h].hdr != anim_hdr; h++) {}
-    if (h < 128 && !anim_h[h].hdr) anim_h[h].hdr = anim_hdr, anim_h[h].good_max = -1e30f, anim_h[h].good_min = 1e30f;
+    if (h < 128 && !anim_h[h].hdr) {
+        anim_h[h].hdr = anim_hdr, anim_h[h].good_max = -1e30f, anim_h[h].good_min = 1e30f;
+        anim_first_sight(h);
+    }
     if (h < 128) {
+        if (!(++anim_h[h].calls & 511)) anim_diff(h);
+        if (bad && !anim_h[h].ndump) anim_dump(h, "first bad rotation");
+        if (bad && anim_h[h].nsample < 12) anim_sample(h, c->x[19], t);
         if (!bad) {
             anim_h[h].good++;
             if (t > anim_h[h].good_max) anim_h[h].good_max = t;
@@ -2555,3 +2892,266 @@ void rt_anim_q(Cpu *c, uint64_t fp, uint64_t entry) {
                              k, __atomic_load_n(&bads, __ATOMIC_RELAXED));
     ReleaseSRWLockExclusive(&anim_lock);
 }
+
+// ---- MKW_ANIM_CHECK: NVN memory pools (nvn_api_core.c calls rt_anim_pool_note at nvnMemoryPoolInitialize and
+// nvnMemoryPoolFinalize). Each pool of at most APL_HASH_MAX bytes keeps the hash and first 32 bytes of its storage at
+// initialization, and the guest return addresses of the call; anim_first_sight reports the record of the keyframe
+// buffer's pool and earlier finalized pools over the same storage ("dapool").
+enum { APL_N = 1 << 16, APL_HASH_MAX = 8u << 20 };
+static struct {
+    uint64_t pool, mem, size, hash, lr[4], fini_lr[4];
+    uint32_t flags, seq, fini_seq;
+    uint8_t head[32];
+    uint8_t used, fini;
+} apl[APL_N];
+static uint32_t apl_next;
+static SRWLOCK apl_lock = SRWLOCK_INIT;
+static void apl_chain(Cpu *c, uint64_t lr[4]) {
+    lr[0] = c->x[30];
+    uint64_t sp = c->sp, fp = c->x[29];
+    for (int i = 1; i < 4; i++) lr[i] = 0;
+    for (int i = 1; i < 4 && fp >= sp && fp < sp + 0x80000 && !(fp & 7); i++) {
+        lr[i] = *(const uint64_t *)(uintptr_t)(fp + 8);
+        uint64_t up = *(const uint64_t *)(uintptr_t)fp;
+        if (up <= fp) break;
+        fp = up;
+    }
+}
+void rt_anim_pool_note(int fini, uint64_t pool, uint64_t mem, uint64_t size, uint32_t flags, Cpu *c) {
+    if (!anim_on() || !mem) return;
+    uint64_t lr[4];
+    apl_chain(c, lr);
+    if (fini) apw_retire(pool);
+    else if ((lr[0] == 0x70005d74a0ull || lr[0] == 0x70005d77c0ull) && flags == 0x24) apw_add(pool, mem, size);
+    AcquireSRWLockExclusive(&apl_lock);
+    if (fini) {   // newest live record of this pool object
+        for (uint32_t k = 0; k < APL_N; k++) {
+            uint32_t i = (apl_next - 1 - k) & (APL_N - 1);
+            if (apl[i].used && !apl[i].fini && apl[i].pool == pool) {
+                apl[i].fini = 1, apl[i].fini_seq = __atomic_load_n(&aht_seq, __ATOMIC_RELAXED);
+                memcpy(apl[i].fini_lr, lr, sizeof lr);
+                break;
+            }
+        }
+    } else {
+        uint32_t i = apl_next++ & (APL_N - 1);
+        memset(&apl[i], 0, sizeof apl[i]);
+        apl[i].pool = pool, apl[i].mem = mem, apl[i].size = size, apl[i].flags = flags, apl[i].used = 1;
+        apl[i].seq = __atomic_load_n(&aht_seq, __ATOMIC_RELAXED);
+        memcpy(apl[i].lr, lr, sizeof lr);
+        if (size <= APL_HASH_MAX && plat_mem_readable(mem, size)) {
+            apl[i].hash = anim_hash((const uint8_t *)(uintptr_t)mem, size);
+            memcpy(apl[i].head, (const void *)(uintptr_t)mem, size < 32 ? size : 32);
+        }
+    }
+    ReleaseSRWLockExclusive(&apl_lock);
+}
+static void apl_hex(char *s, size_t n, const uint8_t *p) {
+    int o = 0;
+    for (int k = 0; k < 32 && o < (int)n - 3; k++) o += snprintf(s + o, n - o, "%02x%s", p[k], k % 8 == 7 && k < 31 ? " " : "");
+}
+// Reports the pool records over [lo, hi): the live one and up to 8 finalized ones before it.
+static void apl_report(uint64_t hdr, uint64_t pool, uint64_t lo, uint64_t hi) {
+    AcquireSRWLockShared(&apl_lock);
+    int shown = 0, olds = 0;
+    for (uint32_t k = 0; k < APL_N && k < apl_next && (shown < 1 || olds < 8); k++) {
+        uint32_t i = (apl_next - 1 - k) & (APL_N - 1);
+        if (!apl[i].used || apl[i].mem >= hi || apl[i].mem + apl[i].size <= lo) continue;
+        int mine = apl[i].pool == pool && !apl[i].fini;
+        if (!mine && olds >= 8) continue;
+        char a[80], b[80];
+        apl_hex(a, sizeof a, apl[i].head);
+        uint8_t now[32] = {0};
+        if (plat_mem_readable(apl[i].mem, 32)) memcpy(now, (const void *)(uintptr_t)apl[i].mem, 32);
+        apl_hex(b, sizeof b, now);
+        uint64_t h = apl[i].size <= APL_HASH_MAX && plat_mem_readable(apl[i].mem, apl[i].size)
+                         ? anim_hash((const uint8_t *)(uintptr_t)apl[i].mem, apl[i].size) : 0;
+        rt_log("dapool hdr %#llx: %s pool %#llx mem [%#llx, %#llx) flags %#x init at heap event #%u callers %#llx %#llx %#llx "
+               "%#llx%s | contents %s since init (init %s | now %s)",
+               (unsigned long long)hdr, mine ? "ITS" : apl[i].fini ? "earlier finalized" : "other live",
+               (unsigned long long)apl[i].pool, (unsigned long long)apl[i].mem, (unsigned long long)(apl[i].mem + apl[i].size),
+               apl[i].flags, apl[i].seq, (unsigned long long)apl[i].lr[0], (unsigned long long)apl[i].lr[1],
+               (unsigned long long)apl[i].lr[2], (unsigned long long)apl[i].lr[3], apl[i].fini ? " (finalized)" : "",
+               !apl[i].hash ? "not hashed" : h == apl[i].hash ? "UNCHANGED" : "CHANGED", a, b);
+        if (apl[i].fini)
+            rt_log("dapool   finalized at heap event #%u by %#llx %#llx %#llx %#llx", apl[i].fini_seq,
+                   (unsigned long long)apl[i].fini_lr[0], (unsigned long long)apl[i].fini_lr[1],
+                   (unsigned long long)apl[i].fini_lr[2], (unsigned long long)apl[i].fini_lr[3]);
+        if (mine) shown++;
+        else olds++;
+    }
+    if (!shown) rt_log("dapool hdr %#llx: no live record of pool %#llx", (unsigned long long)hdr, (unsigned long long)pool);
+    ReleaseSRWLockShared(&apl_lock);
+}
+
+// ---- MKW_ANIM_CHECK: who writes the animation keyframe pools. f_70005d72f0 creates one NVN pool per animation
+// resource (rt_anim_pool_note sees nvnMemoryPoolInitialize return to 0x70005d74a0 / 0x70005d77c0); its storage is made
+// read-only right after the call. The first write to each page faults: apw_veh records the writer (the lifted
+// function, or for the host memcpy the guest caller and source) and makes that page writable again. File reads into
+// a watched pool are recorded by rt_anim_preread (romfs.c, fs_host.c, aoc_romfs.c) and unprotect it first. GPU writes
+// into imported memory do not fault and are not seen. anim_first_sight reports the record ("dapw").
+#ifdef _WIN32
+enum { APW_N = 1024, APW_W = 6 };
+typedef struct {
+    uint64_t pool, mem, size;
+    uint32_t seq, pages_written, npages;
+    struct { uint64_t fn, rip, lr, src, off, host[6]; uint32_t pages, seq; uint8_t kind; } w[APW_W];   // kind 0 cpu 1 memcpy 2 file
+    int nw;
+    uint8_t live;
+} ApwRec;
+static ApwRec apw[APW_N];
+static volatile LONG apw_n;
+static SRWLOCK apw_lock = SRWLOCK_INIT;
+static PVOID apw_veh_h;
+extern _Thread_local uint64_t rt_memcpy_lr, rt_memcpy_src;   // nvn_api_core.c ov_memcpy
+
+static ApwRec *apw_find(uint64_t a) {   // apw_lock held
+    int n = apw_n;
+    for (int i = n - 1; i >= 0; i--)
+        if (apw[i].live && a >= apw[i].mem && a < apw[i].mem + apw[i].size) return &apw[i];
+    return NULL;
+}
+static _Thread_local uint64_t apw_host[6];   // apw_veh: mkw.exe code addresses found on the faulting thread's stack
+static void apw_note(ApwRec *r, int kind, uint64_t fn, uint64_t rip, uint64_t lr, uint64_t src, uint64_t a, uint32_t pages) {
+    int k;
+    for (k = 0; k < r->nw; k++)
+        if (r->w[k].kind == kind && r->w[k].fn == fn && r->w[k].lr == lr) break;
+    if (k == r->nw && r->nw < APW_W) {
+        r->nw++;
+        r->w[k].kind = (uint8_t)kind, r->w[k].fn = fn, r->w[k].rip = rip, r->w[k].lr = lr, r->w[k].src = src;
+        r->w[k].off = a - r->mem, r->w[k].pages = 0, r->w[k].seq = __atomic_load_n(&aht_seq, __ATOMIC_RELAXED);
+        memcpy(r->w[k].host, apw_host, sizeof apw_host);
+    }
+    if (k < r->nw) r->w[k].pages += pages;
+    r->pages_written += pages;
+}
+static LONG CALLBACK apw_veh(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || ep->ExceptionRecord->NumberParameters < 2 ||
+        ep->ExceptionRecord->ExceptionInformation[0] != 1 || !apw_n)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uint64_t a = ep->ExceptionRecord->ExceptionInformation[1];
+    AcquireSRWLockExclusive(&apw_lock);
+    ApwRec *r = apw_find(a);
+    if (!r) {
+        ReleaseSRWLockExclusive(&apw_lock);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    uint64_t rip = ep->ContextRecord->Rip, fn = rt_lifted_function((uintptr_t)rip);
+    int kind = !fn && rt_memcpy_lr ? 1 : 0;
+    // mkw.exe text addresses on the faulting stack (return addresses, most recent first): the host caller chain
+    static uint64_t img_lo, img_hi;
+    if (!img_lo) {
+        img_lo = (uint64_t)(uintptr_t)GetModuleHandleW(NULL);
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(uintptr_t)(img_lo + ((IMAGE_DOS_HEADER *)(uintptr_t)img_lo)->e_lfanew);
+        img_hi = img_lo + nt->OptionalHeader.SizeOfImage;
+    }
+    memset(apw_host, 0, sizeof apw_host);
+    apw_host[0] = rip;
+    const uint64_t *sp = (const uint64_t *)(uintptr_t)ep->ContextRecord->Rsp;
+    for (int i = 0, n = 1; i < 512 && n < 6; i++)
+        if (sp[i] >= img_lo && sp[i] < img_hi) apw_host[n++] = sp[i];
+    apw_note(r, kind, fn, rip, kind ? rt_memcpy_lr : 0, kind ? rt_memcpy_src : 0, a, 1);
+    DWORD old;
+    VirtualProtect((void *)(uintptr_t)(a & ~0xfffull), 0x1000, PAGE_READWRITE, &old);
+    ReleaseSRWLockExclusive(&apw_lock);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static void apw_add(uint64_t pool, uint64_t mem, uint64_t size) {
+    if ((mem & 0xfff) || (size & 0xfff) || !size || size > (16u << 20)) return;
+    AcquireSRWLockExclusive(&apw_lock);
+    if (!apw_veh_h) apw_veh_h = AddVectoredExceptionHandler(1, apw_veh);
+    for (int i = 0; i < apw_n; i++)   // an older record over the same storage is retired
+        if (apw[i].live && apw[i].mem < mem + size && mem < apw[i].mem + apw[i].size) apw[i].live = 0;
+    if (apw_n < APW_N) {
+        ApwRec *r = &apw[apw_n];
+        memset(r, 0, sizeof *r);
+        r->pool = pool, r->mem = mem, r->size = size, r->npages = (uint32_t)(size >> 12), r->live = 1;
+        r->seq = __atomic_load_n(&aht_seq, __ATOMIC_RELAXED);
+        DWORD old;
+        if (VirtualProtect((void *)(uintptr_t)mem, size, PAGE_READONLY, &old)) apw_n++;
+    }
+    ReleaseSRWLockExclusive(&apw_lock);
+}
+static void apw_retire(uint64_t pool) {
+    AcquireSRWLockExclusive(&apw_lock);
+    for (int i = 0; i < apw_n; i++)
+        if (apw[i].live && apw[i].pool == pool) {
+            DWORD old;
+            apw[i].live = 0;
+            VirtualProtect((void *)(uintptr_t)apw[i].mem, apw[i].size, PAGE_READWRITE, &old);
+        }
+    ReleaseSRWLockExclusive(&apw_lock);
+}
+// mem_thaw (memory.c): the range must be writable for a kernel write or a Vulkan host-memory import. Watched pages in
+// it are made writable; the record notes that its watch ended there (kind 3).
+void rt_anim_unwatch(uint64_t a, uint64_t n) {
+    if (!apw_n || !n) return;
+    AcquireSRWLockExclusive(&apw_lock);
+    for (int i = 0; i < apw_n; i++) {
+        ApwRec *r = &apw[i];
+        if (!r->live || a >= r->mem + r->size || a + n <= r->mem) continue;
+        uint64_t lo = a > r->mem ? a : r->mem, hi = a + n < r->mem + r->size ? a + n : r->mem + r->size;
+        lo &= ~0xfffull, hi = (hi + 0xfff) & ~0xfffull;
+        apw_note(r, 3, 0, 0, 0, 0, lo, 0);
+        DWORD old;
+        VirtualProtect((void *)(uintptr_t)lo, hi - lo, PAGE_READWRITE, &old);
+    }
+    ReleaseSRWLockExclusive(&apw_lock);
+}
+void rt_anim_preread(uint64_t a, uint64_t n) {
+    if (!apw_n || !n) return;
+    AcquireSRWLockExclusive(&apw_lock);
+    for (int i = 0; i < apw_n; i++) {
+        ApwRec *r = &apw[i];
+        if (!r->live || a >= r->mem + r->size || a + n <= r->mem) continue;
+        uint64_t lo = a > r->mem ? a : r->mem, hi = a + n < r->mem + r->size ? a + n : r->mem + r->size;
+        lo &= ~0xfffull, hi = (hi + 0xfff) & ~0xfffull;
+        apw_note(r, 2, 0, 0, 0, 0, lo, (uint32_t)((hi - lo) >> 12));
+        DWORD old;
+        VirtualProtect((void *)(uintptr_t)lo, hi - lo, PAGE_READWRITE, &old);
+    }
+    ReleaseSRWLockExclusive(&apw_lock);
+}
+static void apw_report(uint64_t hdr, uint64_t pool) {
+    static const char *const kn[4] = {"lifted code", "host memcpy", "file read", "watch ended by a thaw (import or read)"};
+    AcquireSRWLockShared(&apw_lock);
+    ApwRec *r = NULL;
+    for (int i = apw_n - 1; i >= 0 && !r; i--)
+        if (apw[i].pool == pool && apw[i].live) r = &apw[i];
+    if (!r)
+        rt_log("dapw hdr %#llx: pool %#llx was not watched (not created by f_70005d72f0 while watching)",
+               (unsigned long long)hdr, (unsigned long long)pool);
+    else {
+        rt_log("dapw hdr %#llx: pool %#llx storage [%#llx, %#llx): %u of %u pages written by the CPU or a file read since "
+               "creation (heap event #%u)%s",
+               (unsigned long long)hdr, (unsigned long long)pool, (unsigned long long)r->mem,
+               (unsigned long long)(r->mem + r->size), r->pages_written, r->npages, r->seq,
+               r->pages_written ? "" : " -- NOTHING on the CPU side wrote it");
+        for (int k = 0; k < r->nw; k++)
+        {
+            char mod[MAX_PATH] = "?";
+            HMODULE hm = NULL;
+            if (r->w[k].rip && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                  (LPCSTR)(uintptr_t)r->w[k].rip, &hm))
+                GetModuleFileNameA(hm, mod, sizeof mod);
+            uint64_t base = (uint64_t)(uintptr_t)GetModuleHandleW(NULL);
+            rt_log("dapw   %s f_%llx at %#llx (%s), guest caller %#llx, source %#llx: first at +%#llx (heap event #%u), %u pages | "
+                   "mkw.exe stack (image offsets) %#llx %#llx %#llx %#llx %#llx",
+                   kn[r->w[k].kind], (unsigned long long)r->w[k].fn, (unsigned long long)r->w[k].rip, mod,
+                   (unsigned long long)r->w[k].lr, (unsigned long long)r->w[k].src, (unsigned long long)r->w[k].off,
+                   r->w[k].seq, r->w[k].pages, (unsigned long long)(r->w[k].host[1] ? r->w[k].host[1] - base : 0),
+                   (unsigned long long)(r->w[k].host[2] ? r->w[k].host[2] - base : 0),
+                   (unsigned long long)(r->w[k].host[3] ? r->w[k].host[3] - base : 0),
+                   (unsigned long long)(r->w[k].host[4] ? r->w[k].host[4] - base : 0),
+                   (unsigned long long)(r->w[k].host[5] ? r->w[k].host[5] - base : 0));
+        }
+    }
+    ReleaseSRWLockShared(&apw_lock);
+}
+#else
+static void apw_add(uint64_t pool, uint64_t mem, uint64_t size) { (void)pool, (void)mem, (void)size; }
+static void apw_retire(uint64_t pool) { (void)pool; }
+void rt_anim_preread(uint64_t a, uint64_t n) { (void)a, (void)n; }
+void rt_anim_unwatch(uint64_t a, uint64_t n) { (void)a, (void)n; }
+static void apw_report(uint64_t hdr, uint64_t pool) { (void)hdr, (void)pool; }
+#endif

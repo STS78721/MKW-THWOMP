@@ -251,3 +251,69 @@ integrated them: `recomp/patches-mkw180.txt` is empty apart from comments, the g
 `RT_PATCH_COUNT 0`, and `runtime/ov_zstd.c` still targets TotK 1.4.3 guest addresses. Validate the upstream sites
 against this dump and port the 1.8.0 entries before using the local decoder comparison option. No confirmed game fix
 yet; capture actual sample inputs and bounds next.
+- **Result, 01:04 run on 2026-11-13 (moved probe):** about 16% of rotations written by this path are non-orthonormal. The raw packed words behind them are **not keyframes**. They are pieces of heap pointers (`0x4030`, `0x00000002`, i.e. halves of `0x2_4030_7060`-style addresses), `0xffff` runs and small integers. The same junk repeats every frame for the same bone, so the junk is static.
+  - Time is in range: t = 1036 with 1218 frames in the buffer (`hdr+0x98` high16 = 0x4c2, size `hdr+0xa8` = 0x26100 = 1218×128); t = 1394 of 1516 frames. So this is **not a time overrun**.
+  - The read address = `[[[hdr+0x40]+0x10]+0x100]` + `[hdr+0x28]` + stride(`hdr+0x10c` = 128) × frame + bone × `[hdr+0x129]`.
+  - Host zstd (`ov_zstd.c`) is **not active** for MKW (no `zstd:` log lines; its patch sites are for TotK 1.4.3 only), so the guest's own decoder fills the data.
+  - **Conclusion so far:** the keyframe buffer's contents are wrong (unfilled, freed and reused, or overwritten). The decode is not at fault.
+  - **Probe now also dumps:** on the first bad rotation for a header, it writes the whole keyframe buffer and 0x400 bytes of its resource object to `build/mkw/anim-dump/h<hdr>_b<base>_n<k>.bin`. It dumps again (up to 4 times) if the buffer's hash changes. Next: see where in the buffer the junk starts, and whether it changes over time, then find the loader or allocator responsible. Candidates: short read, async-load-not-finished, a use-after-free through the heap changes in `mkw-heap-root-cause`.
+
+### 12c. Keyframe buffer holds foreign objects; heap tracker added (Claude, 2026-11-13)
+
+**Evidence so far (runs at 01:04 and 01:08 with the matrix probe):**
+- The raw packed words behind the bad rotations are not keyframes. Reassembled as the 8 bytes per bone that the game reads, the 01:04 samples are `0x0000000240300600`, `0x0000000240300600`, `0xffffffff00000000`, three good bones, `0x00000000ffffffff`, `0x0000000240300638`.
+- **Those pointers point at themselves.** The layout is the same in every run: hdr, then `[hdr+0x40]` 0x3b8 later, then the keyframe buffer at the next page boundary (`source_base`), then `[hdr+0x38]` about 0xf60 past the buffer's end. For hdr `0x2402df358` that puts the buffer at `0x2402e0000`. Frame 1036 × stride 128 = +0x20600 → the read address is `0x240300600`, which is exactly the pointer value found there. So a live object with empty intrusive-list heads (prev = next = self) sits **inside** the keyframe buffer. This is an overlapping allocation, a use-after-free, or a shrunk block. It is not a bad decode and not bad file data.
+- The same junk repeats every frame, and bones in between still hold valid unit quaternions, so the buffer is partly overwritten, not wholly replaced.
+- All three bad samples so far are in the last quarter of their buffers (76%, 85%, 92%).
+- The header fields: frames = u16 at `hdr+0x8a`; buffer size = u32 at **`hdr+0x98`** (= frames × stride; my first dump used +0xa8, which is why the 01:08 run logged "keyframe buffer not resolved" and wrote no dump); stride = `hdr+0x10c`; bytes per bone = `hdr+0x129`; component types at `hdr+0x114` (0x10 = half, 0x20 = float).
+- Both formats are affected: stride 128 with halves (8 bytes per bone) and stride 512 with floats (16 bytes per bone, 01:08 run: raw floats 1,0,1,0 / 1,0,1,1 where a quaternion should be).
+- Host zstd is not active for this build (Codex's 12b explains the missing 1.8.0 patch entries), so it cannot be the corrupter.
+- The only heap message in the log is `getMaxAllocatableSize heap 0x283cb0440 returned 0` at boot (20 times, lr `0x700259a214`). None of the soft-catch wraps (`system:` / `heap: ... unattached`) fire in these runs.
+
+**Probe now in the build (`anim_check = 1`, all in `runtime/ov_system.c`):**
+- **Heap tracker (`daht` lines).** With `anim_check` on, the ExpHeap alloc hook and the free/resizeFront/resizeBack vtable pass-throughs (the `MKW_HEAP_TRACE` ones, now also installed for `anim_check` and re-applied in `ov_system_on_inits_done`) record every event into a 512K-entry ring with four guest return addresses each. Allocations ≥ 0x8000 bytes also go in a table until freed.
+- **First sight of a curve header** (`danim first sight`): resolves the keyframe buffer, keeps a copy, and registers it with the tracker. The tracker then logs the live big allocations overlapping it, the past ring events touching it, and from then on every alloc/free/resize that touches it, as it happens.
+- **Change detection** (`danim buffer CHANGED`): every 512 samples per header the live buffer is compared with the first-sight copy; changed byte ranges are logged with the heap event number, and the first three changed states are written to `build/mkw/anim-dump/`.
+- **Bad sample** (`danim sample`): the exact read address (frame, bone = `c->x[19]`), the 16 bytes there now and at first sight.
+- **Dump at the first bad rotation**: live buffer with 0x2000 bytes either side, the first-sight copy, the resource object and the header.
+
+**What the next run should tell:** which allocation the keyframe buffer belongs to and who made it; whether it was freed or resized; and who allocates inside it (return addresses). If no ExpHeap event explains it, the dumps and the change log give the offsets and timing for a write-watch on the changed pages.
+
+### 12d. ROOT CAUSE FOUND AND FIXED: animation bakes were never written back to the CPU (Claude, 2026-11-13 morning)
+
+**Read this before 12a–12c; it supersedes their open hypotheses.**
+
+**Mechanism (verified headless, several runs):**
+- MKW bakes each skeletal animation on the GPU into an **RGBA16F texture** (format `0x29`, width = bones, height = frames: 13×1211, 8×1218, 11×1516 for the Crown City pedestrians), stored in a **CPU-cached NVN pool** (flags `0x24`) created per animation by the generic pool allocator `f_70005d72f0`.
+- The CPU animation code (`f_700042bea0`) then reads the half-float keyframes **straight from that pool** after the fence, without `nvnMemoryPoolInvalidateMappedRange`. This is the same pattern as TotK's grass maps.
+- The runtime writes GPU-rendered (mirrored) targets back to their storage when the CPU waits on a fence, but only up to `WB_FENCE_LIMIT` = **64 KiB** (`vk_texture_write_back_small`). The pedestrian bakes are 150–200 KiB, so they were **never written back**. The trace line `vk: fence write-back skipped-for-size ... 13x1211 fmt 0x29 ... pool cpu-cached` listed exactly these, 18–20 per session.
+- So the CPU read whatever was in the pool memory: **zeros** (fresh pages: zero scale → collapsed mesh → **invisible pedestrians** that still collide and launch the kart) or **stale heap bytes** (old objects, pointers, float transforms → huge bone matrices → the **full-screen blue sheets**). Which one you got depended on what that memory held before, hence "1 in 3 runs".
+- Small bakes (≤ 64 KiB) were written back and animated correctly. The pool write-watch (`dapw`) showed their only writer was `vk_texture_write_back_small → storage_texels → nvn_texels_box`, and the large pools were never written by anything on the CPU side.
+
+**Fix (`runtime/vk_texture.c`, `wb_limit_of`):** a target in a **CPU-cached pool** is written back on fence waits up to **4 MiB** (`WB_CACHED_LIMIT`). Other pools keep the 64 KiB limit; `WB_FENCE_LIMIT = 0` still disables it.
+- Verified with probes off and `MKW_TRACE=gfx`: no `skipped-for-size` lines; all 18 bakes appear as `over-default` write-backs; frame rate unchanged (60 fps, 1% low ~50).
+- Two other CPU-cached targets that used to be skipped now go back too: 256×64 (128 KiB) and 256×32 (1 MiB, `0x2af350000`/`0x2af371000`). Their purpose is unknown. Possibly relevant to other "the CPU sees nothing" symptoms such as the **lamp posts that don't break** (not verified).
+- **Confirmed fixed in-game by the user in Crown City (2026-11-13).** Lamp posts not re-checked separately.
+
+**Cleanup done:**
+- `generated/mkw180/main/main_0049.c` restored byte-for-byte (probe hooks removed).
+- The per-file `-g` lines removed from `build/mkw/build.ninja`.
+- Diagnostic keys (`skin_check`, `skin_watch`, `trig_check`, `anim_check`) removed from `build/mkw/mkw.ini`; the copy with them is in the scratchpad as `mkw.ini.with-diagnostics`.
+
+**Diagnostics kept in source, all off by default:**
+- Knobs: `MKW_SKIN_CHECK`, `MKW_SKIN_WATCH`, `MKW_SSBO_SNAPSHOT`, `MKW_TRIG_CHECK`, `MKW_ANIM_CHECK`.
+- Under `anim_check`, `ov_system.c` holds the heap tracker (`daht`), the per-pool init records (`dapool`), the write-watch of `f_70005d72f0` pools (`dapw`), and the keyframe-buffer first-sight / dump / diff (`danim`).
+- `rt_anim_t`/`rt_anim_q` only fire if hand-inserted into the generated `main_0049.c` again.
+- Always-on hooks, with negligible cost:
+  - `rt_anim_pool_note` at pool init/fini (returns at once when off);
+  - `rt_anim_unwatch` in `mem_thaw` and `rt_anim_preread` in the three file-read paths (return when nothing is watched);
+  - two thread-local stores in the host `memcpy` override.
+- `build/test_anim_probe.py` passes (its harness now includes `windows.h`).
+
+### 12e. Still open after the 12d fix: some objects have no collision (user report, 2026-11-13)
+
+The pedestrians now draw and animate (a Yoshi pedestrian is visible on the pavement in the user's screenshot). But the kart still **drives through some objects** in Crown City:
+- the **green lamp posts**, which should break and fall over;
+- **metal road barriers / guard rails** on the kerb.
+
+The original game was compared in an emulator, where these collide. Bushes pass through in the emulator too, so they are not a bug. Nothing has been investigated yet. A first idea, unverified: the 12d fix covered CPU-cached render targets of up to 4 MiB. Collision for breakable objects might depend on another GPU→CPU path that is still missing, such as a target in a non-CPU-cached pool, a buffer the GPU writes and the CPU reads, or a size over 4 MiB. The `MKW_TRACE=gfx` lines `fence write-back skipped-for-size` and the `dapw` pool write-watch (`anim_check`) are the tools to start with.

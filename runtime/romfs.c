@@ -81,6 +81,7 @@ static double now_s(void) { return (double)plat_now_ns() / 1e9; }
 void vk_guest_written(uint64_t addr, uint64_t size);
 static int64_t read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
     mem_thaw((uintptr_t)buf, n);   // the kernel's write would fail on a frozen page instead of faulting
+    rt_anim_preread((uintptr_t)buf, n);
     int64_t got = plat_file_pread(f, buf, n, off);
     if (got > 0) vk_guest_written((uintptr_t)buf, (uint64_t)got);
     if (got == -2)   // a read-only page in the buffer: a frozen region missed its thaw

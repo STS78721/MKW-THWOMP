@@ -111,6 +111,7 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
 }
 
 void mem_thaw(uint64_t a, uint64_t n) {
+    rt_anim_unwatch(a, n);
     plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
     plat_mutex_unlock(&frz_lock);
