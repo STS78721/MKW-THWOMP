@@ -1848,6 +1848,23 @@ void vk_texture_storage_bound_locked(const VkTexImage *img) {
     Tex *e = (Tex *)img;   // pub is the first member
     uint64_t f = vk_exec_recording_fence();
     if (f > e->wr_fence) e->wr_fence = f;
+    // A storage image in a pool the CPU can read: the game may read the shaders' results straight from the pool once
+    // the fence passed (as with render targets, vk_texture_write_back_small). Mark it GPU-written like a render target
+    // so the fence write-back, memcpy and invalidate send the image back to its storage. Other pools keep only the
+    // ReadTexels fence: the CPU cannot read them.
+    const pool_t *p = e->t.pool;
+    if (!p || !(p->flags & (NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED)) || !e->pub.mirrored) return;
+    static uint64_t seen[64];
+    static int n_seen;
+    int known = 0;
+    for (int i = 0; i < n_seen && !known; i++) known = seen[i] == e->pub.addr;
+    if (!known && n_seen < 64) {
+        seen[n_seen++] = e->pub.addr;
+        rt_log("vk: storage image in a CPU-readable pool: %#llx %ux%ux%u fmt %#x size %llu pool flags %#x: written back like a "
+               "render target", (unsigned long long)e->pub.addr, e->t.d.width, e->t.d.height, e->t.d.depth, e->t.d.format,
+               (unsigned long long)e->t.L.size, p->flags);
+    }
+    vk_texture_gpu_written(&e->t);
 }
 
 uint64_t vk_texture_last_write(const tex_t *t) {
@@ -1923,7 +1940,8 @@ int vk_texture_small_dirty(void) { return __atomic_load_n(&small_pending, __ATOM
 
 // TOTK_TRACE=gfx: a dirty target the fence write-back leaves alone because it is over the limit (what a CPU read
 // after the wait would miss), or sends back although it is over the default limit (what a raised limit changed). One
-// line per target address and outcome; the table is small and a full one stops logging.
+// line per target address and outcome; the table is small and a full one stops logging. The skipped ones are logged
+// without the trace too: a CPU read of one of them sees stale bytes (Crown City pedestrians, HANDOVER 12d).
 static void wb_note(const Tex *e, int skipped) {
     static uint64_t seen[2][64];
     static int n_seen[2];
@@ -1933,11 +1951,11 @@ static void wb_note(const Tex *e, int skipped) {
     seen[skipped][n_seen[skipped]++] = e->pub.addr;
     const pool_t *p = e->t.pool;
     unsigned fl = p ? p->flags : 0;
-    rt_log("vk: fence write-back %s %#llx %ux%u fmt %#x size %llu pool %s (limit %llu)",
+    rt_log("vk: fence write-back %s %#llx %ux%ux%u fmt %#x target %u size %llu pool %s flags %#x (limit %llu)",
            skipped ? "skipped-for-size" : "over-default", (unsigned long long)e->pub.addr, e->t.d.width, e->t.d.height,
-           e->t.d.format, (unsigned long long)e->t.L.size,
+           e->t.d.depth, e->t.d.format, e->t.d.target, (unsigned long long)e->t.L.size,
            !p ? "none" : (fl & NVN_MEMORY_POOL_FLAGS_CPU_CACHED) ? "cpu-cached" : (fl & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) ? "cpu-uncached" : "other",
-           (unsigned long long)wb_limit_of(e));
+           fl, (unsigned long long)wb_limit_of(e));
 }
 
 void vk_texture_write_back_small(uint64_t fence) {
@@ -1954,7 +1972,7 @@ void vk_texture_write_back_small(uint64_t fence) {
         Tex *e = owned[i];
         if (!e->gpu_dirty) continue;
         if (e->t.L.size > wb_limit_of(e)) {
-            if (wb_trace && e->gpu_fence <= fence) {
+            if (e->gpu_fence <= fence) {
                 wb_note(e, 1);
                 perf_count(PERF_CNT_WB_SKIP);
             }

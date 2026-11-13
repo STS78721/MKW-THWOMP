@@ -674,7 +674,14 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
     const char *p = mname ? romfs_path_relative(mname, path) : NULL;
     if (!p) return FS_R_PATH_NOT_FOUND;
     uint64_t i = file_index(p);
-    if (i == UINT64_MAX) return FS_R_PATH_NOT_FOUND;
+    if (i == UINT64_MAX) {
+        // MKW_TRACE=fs: a file the game asks for that the RomFS lacks (the first 200). Normal ones: loose Gyml files the
+        // game tries before its archives, ProductME HeapDef (falls back to Default), FastTravel/BancWorldTransformInfo.
+        static long nmiss;
+        if ((rt_trace & RT_TRACE_FS) && __atomic_add_fetch(&nmiss, 1, __ATOMIC_RELAXED) <= 200)
+            rt_log("RomFS: open of %s: not in the RomFS", path);
+        return FS_R_PATH_NOT_FOUND;
+    }
     uint32_t ov = overlay_slot(i);
     PlatFile *f = NULL;
     if (ov) {

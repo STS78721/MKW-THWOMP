@@ -1474,6 +1474,59 @@ enum { AHT_ALLOC, AHT_FREE, AHT_RESIZE_FRONT, AHT_RESIZE_BACK };
 static int anim_on(void);
 static void aht_event(int kind, uint64_t heap, uint64_t ptr, uint64_t size, uint64_t res, Cpu *c, uint64_t lr);
 
+static const char *heap_name(uint64_t heap, char *buf, size_t n);   // below
+
+// MKW_SOUND_HEAP_TRACE: live bytes in the "SLinkUserCreate" heap (allocations minus frees, the freed block's size from
+// its ExpHeap header at ptr-0x20+0x18), per allocating guest caller; reported when its getMaxAllocatableSize fails.
+static uint64_t slink_heap;
+static int64_t slink_live, slink_n_alloc, slink_n_free;
+static struct { uint64_t lr; int64_t n, live; } slink_by[32];
+static int slink_nby;
+static SRWLOCK slink_l = SRWLOCK_INIT;
+static struct { uint64_t ptr, lr; } slink_blk[8192];   // open addressing: ptr 0 empty, 1 deleted
+static void slink_note(uint64_t heap, uint64_t ptr, uint64_t size, uint64_t lr, int alloc) {
+    if (!slink_heap) {
+        static uint64_t seen_h[512];
+        uint32_t slot = (uint32_t)((heap >> 4) * 0x9E3779B1u) & 511;
+        if (seen_h[slot] == heap) return;
+        char nm[64];
+        heap_name(heap, nm, sizeof nm);
+        if (strncmp(nm, "SLinkUserCreate ", 16)) {
+            seen_h[slot] = heap;
+            return;
+        }
+        slink_heap = heap;
+    }
+    if (heap != slink_heap || !ptr) return;
+    AcquireSRWLockExclusive(&slink_l);
+    uint32_t h = (uint32_t)((ptr >> 4) * 0x9E3779B97F4A7C15ull >> 51) & 8191;
+    if (alloc) {
+        for (uint32_t k = 0; k < 8192; k++, h = (h + 1) & 8191)
+            if (slink_blk[h].ptr <= 1) { slink_blk[h].ptr = ptr, slink_blk[h].lr = lr; break; }
+    } else {
+        lr = 0;
+        for (uint32_t k = 0; k < 8192 && slink_blk[h].ptr; k++, h = (h + 1) & 8191)
+            if (slink_blk[h].ptr == ptr) { lr = slink_blk[h].lr, slink_blk[h].ptr = 1; break; }
+        if (plat_mem_readable(ptr - 0x20, 0x20)) memcpy(&size, (const void *)(uintptr_t)(ptr - 0x20 + 0x18), 8);
+    }
+    int64_t s = alloc ? (int64_t)size : -(int64_t)size;
+    slink_live += s, alloc ? slink_n_alloc++ : slink_n_free++;
+    int i;
+    for (i = 0; i < slink_nby && slink_by[i].lr != lr; i++) {}
+    if (i == slink_nby && slink_nby < 32) slink_by[slink_nby++] = (typeof(slink_by[0])){lr, 0, 0};
+    if (i < slink_nby) slink_by[i].n += alloc ? 1 : -1, slink_by[i].live += s;
+    ReleaseSRWLockExclusive(&slink_l);
+}
+static void slink_report(const char *why) {
+    AcquireSRWLockShared(&slink_l);
+    rt_log("dslink %s: heap %#llx, %lld allocations, %lld frees, %.1f KiB live", why, (unsigned long long)slink_heap,
+           (long long)slink_n_alloc, (long long)slink_n_free, slink_live / 1024.0);
+    for (int i = 0; i < slink_nby; i++)
+        rt_log("dslink   by %#llx: %lld blocks live, %.1f KiB", (unsigned long long)slink_by[i].lr, (long long)slink_by[i].n,
+               slink_by[i].live / 1024.0);
+    ReleaseSRWLockShared(&slink_l);
+}
+
 static int heap_trace(void) {
     static int on = -1;
     if (on < 0) {
@@ -1483,8 +1536,27 @@ static int heap_trace(void) {
     return on;
 }
 
+// A sead heap's name: the first pointer in its first 0x100 bytes to a short printable NUL-terminated string.
+static const char *heap_name(uint64_t heap, char *buf, size_t n) {
+    snprintf(buf, n, "?");
+    if (!heap || !plat_mem_readable(heap, 0x100)) return buf;
+    for (int o = 8; o < 0x100; o += 8) {
+        uint64_t p;
+        memcpy(&p, (const void *)(uintptr_t)(heap + o), 8);
+        if (p < 0x100000000ull || p >= 0x8000000000ull || !plat_mem_readable(p, 24)) continue;
+        const char *s = (const char *)(uintptr_t)p;
+        int k = 0;
+        while (k < 23 && s[k] >= 0x20 && s[k] < 0x7f) k++;
+        if (k >= 3 && s[k] == 0) {
+            snprintf(buf, n, "%s (+%#x)", s, o);
+            return buf;
+        }
+    }
+    return buf;
+}
+
 void __wrap_f_70005e10a0(Cpu *c) {
-    uint64_t trace_heap = c->x[0], trace_lr = c->x[30], zheap = trace_heap, zlr = trace_lr;
+    uint64_t trace_heap = c->x[0], trace_lr = c->x[30], zheap = trace_heap, zlr = trace_lr, zchild = c->x[20];
     if (__real_f_70005e10a0) {
         __real_f_70005e10a0(c);
     } else {
@@ -1497,9 +1569,29 @@ void __wrap_f_70005e10a0(Cpu *c) {
                (unsigned long long)c->x[0], (unsigned long long)trace_lr);
     if (c->x[0] == 0) {
         static volatile int32_t nz;
-        if (__atomic_fetch_add(&nz, 1, __ATOMIC_RELAXED) < 20)
-            rt_log("heap: f_70005e10a0 getMaxAllocatableSize heap %#llx returned 0 (lr %#llx)%s", (unsigned long long)zheap,
-                   (unsigned long long)zlr, heap_legacy() ? ", legacy: reporting 32 MiB" : "");
+        int32_t k = __atomic_fetch_add(&nz, 1, __ATOMIC_RELAXED) + 1;
+        if (k <= 20 || !(k & (k - 1))) {   // the first 20, then at powers of two with the guest callers
+            char pn[64], cn[64];
+            if (slink_heap && (k == 1 || k == 16 || k == 128)) slink_report(k == 1 ? "at the first full report" : "later");
+            if (slink_heap && (k == 1 || k == 64)) {
+                for (int w = 0; w < 2; w++) {
+                    uint64_t hp = w ? zchild : zheap, q[16] = {0};
+                    if (hp && plat_mem_readable(hp, 0x80)) memcpy(q, (const void *)(uintptr_t)hp, 0x80);
+                    rt_log("heap: %s %#llx words: %llx %llx %llx %llx | %llx %llx %llx %llx | %llx %llx %llx %llx | %llx %llx %llx %llx",
+                           w ? "child" : "parent", (unsigned long long)hp, (unsigned long long)q[0], (unsigned long long)q[1],
+                           (unsigned long long)q[2], (unsigned long long)q[3], (unsigned long long)q[4], (unsigned long long)q[5],
+                           (unsigned long long)q[6], (unsigned long long)q[7], (unsigned long long)q[8], (unsigned long long)q[9],
+                           (unsigned long long)q[10], (unsigned long long)q[11], (unsigned long long)q[12], (unsigned long long)q[13],
+                           (unsigned long long)q[14], (unsigned long long)q[15]);
+                }
+            }
+            rt_log("heap: f_70005e10a0 getMaxAllocatableSize heap %#llx '%s' returned 0 (lr %#llx; call %d; child heap x20 %#llx '%s'; "
+                   "caller %#llx)%s",
+                   (unsigned long long)zheap, heap_name(zheap, pn, sizeof pn), (unsigned long long)zlr, k, (unsigned long long)zchild,
+                   heap_name(zchild, cn, sizeof cn),
+                   (unsigned long long)(c->x[29] && plat_mem_readable(c->x[29], 16) ? *(const uint64_t *)(uintptr_t)(c->x[29] + 8) : 0),
+                   heap_legacy() ? ", legacy: reporting 32 MiB" : "");
+        }
         if (heap_legacy()) c->x[0] = 32 * 1024 * 1024;
     }
 }
@@ -1562,6 +1654,71 @@ void __wrap_f_70003f24c0(Cpu *c) {
                (unsigned long long)size, (long long)raw_align, (unsigned long long)c->x[0], (unsigned long long)lr);
     if (c->x[0] != 0) {
         if (anim_on()) aht_event(AHT_ALLOC, heap, c->x[0], size, 0, c, lr);
+        // Collision investigation (HANDOVER 12e): allocations of 64 KiB or more under the "Sound" heap, with the heap
+        // chain and guest callers (the Sound heap is full at boot on PC, so SLinkUserCreate cannot grow).
+        static int snd_on = -1;
+        if (snd_on < 0) snd_on = cfg_bool("MKW_SOUND_HEAP_TRACE");
+        // direct allocations in the Sound heap (any size), summed per guest caller: a line per 256 and per 4 MiB more
+        static uint64_t snd_heap;
+        if (snd_on && !snd_heap) {
+            static uint64_t seen_h[512];   // heaps already known not to be Sound (a direct-mapped cache)
+            uint32_t slot = (uint32_t)((heap >> 4) * 0x9E3779B1u) & 511;
+            if (seen_h[slot] != heap) {
+                char nm[64];
+                heap_name(heap, nm, sizeof nm);
+                if (!strncmp(nm, "Sound ", 6)) snd_heap = heap;
+                else seen_h[slot] = heap;
+            }
+        }
+        if (snd_on) slink_note(heap, c->x[0], size, lr, 1);
+        if (snd_on && heap == snd_heap) {
+            static struct { uint64_t lr, n, bytes; } agg[64];
+            static int nagg;
+            static uint64_t total, count, next_report = 4u << 20;
+            static SRWLOCK l = SRWLOCK_INIT;
+            AcquireSRWLockExclusive(&l);
+            int i;
+            for (i = 0; i < nagg && agg[i].lr != lr; i++) {}
+            if (i == nagg && nagg < 64) agg[nagg++] = (typeof(agg[0])){lr, 0, 0};
+            if (i < nagg) agg[i].n++, agg[i].bytes += size;
+            total += size, count++;
+            if (total >= next_report || !(count & 255)) {
+                next_report = total + (4u << 20);
+                uint64_t hs = 0;
+                memcpy(&hs, (const void *)(uintptr_t)(heap + 0x30), 8);
+                rt_log("dsound direct: %llu allocations, %.1f MiB of the %.1f MiB Sound heap so far; by caller:", (unsigned long long)count,
+                       total / 1048576.0, hs / 1048576.0);
+                for (int k = 0; k < nagg; k++)
+                    if (agg[k].bytes >= (256u << 10))
+                        rt_log("dsound   lr %#llx: %llu allocations, %.2f MiB", (unsigned long long)agg[k].lr, (unsigned long long)agg[k].n,
+                               agg[k].bytes / 1048576.0);
+            }
+            ReleaseSRWLockExclusive(&l);
+        }
+        if (size >= 0x10000) {
+            int on = snd_on && snd_heap;
+            if (on) {
+                char chain[200];
+                int o = 0, under = 0;
+                uint64_t h = heap;
+                for (int dpt = 0; dpt < 6 && h && plat_mem_readable(h, 0x40); dpt++) {
+                    char nm[64];
+                    heap_name(h, nm, sizeof nm);
+                    if (!strncmp(nm, "Sound ", 6)) under = 1;
+                    char *sp = strstr(nm, " (+");
+                    if (sp) *sp = 0;
+                    o += snprintf(chain + o, sizeof chain - o, "%s%s", dpt ? "<" : "", nm);
+                    if (o >= (int)sizeof chain - 8) break;
+                    memcpy(&h, (const void *)(uintptr_t)(h + 0x38), 8);
+                }
+                if (under) {
+                    uint64_t lr2 = 0, fp = c->x[29];
+                    if (fp && plat_mem_readable(fp, 16)) lr2 = *(const uint64_t *)(uintptr_t)(fp + 8);
+                    rt_log("dsound alloc %#llx bytes (%.1f MiB) in %s -> %#llx (lr %#llx, caller %#llx)", (unsigned long long)size,
+                           size / 1048576.0, chain, (unsigned long long)c->x[0], (unsigned long long)lr, (unsigned long long)lr2);
+                }
+            }
+        }
         return; // Normal guest allocation succeeded
     }
     if (!heap_legacy()) {
@@ -2086,6 +2243,7 @@ static const int ht_slot[4] = {-1, 1, 2, 3};
 static const char *const ht_name[4] = {"adjust", "free", "resizeFront", "resizeBack"};
 static void ht_call(Cpu *c, int k) {
     uint64_t heap = c->x[0], a1 = c->x[1], a2 = c->x[2], lr = c->x[30];
+    if (k == 1 && slink_heap && heap == slink_heap) slink_note(heap, a1, 0, lr, 0);   // before the free rewrites the header
     GuestFn orig = rt_dispatch_lookup(ht_orig[k]);
     if (orig) orig(c);
     if (k && anim_on())
@@ -2097,6 +2255,20 @@ static void ht_call(Cpu *c, int k) {
     if (big && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 400)
         rt_log("htrace %s heap %#llx a1 %#llx a2 %#llx -> %#llx (lr %#llx)", ht_name[k], (unsigned long long)heap,
                (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)c->x[0], (unsigned long long)lr);
+}
+// MKW_SOUND_HEAP_TRACE: the growable heap class at vtable 0x700363a7c0 (SLinkUserCreate is one): pass-throughs on its
+// alloc (slot 6, f_70003f18e0) and free (slot 7, f_70001a5220) feed slink_note.
+static void gh_alloc(Cpu *c) {
+    uint64_t heap = c->x[0], size = c->x[1], lr = c->x[30];
+    GuestFn orig = rt_dispatch_lookup(0x70003f18e0ull);
+    if (orig) orig(c);
+    slink_note(heap, c->x[0], size, lr, 1);
+}
+static void gh_free(Cpu *c) {
+    uint64_t heap = c->x[0], ptr = c->x[1], lr = c->x[30];
+    if (slink_heap && heap == slink_heap) slink_note(heap, ptr, 0, lr, 0);
+    GuestFn orig = rt_dispatch_lookup(0x70001a5220ull);
+    if (orig) orig(c);
 }
 static void ht_adjust(Cpu *c) { ht_call(c, 0); }
 static void ht_free(Cpu *c) { ht_call(c, 1); }
@@ -2110,7 +2282,7 @@ void ov_system_post_load(void) {
         s_expheap_hook_addr = hostfn_register("sead__ExpHeap__alloc", ov_expheap_alloc_hook);
         uint64_t *vtable1 = (uint64_t *)(uintptr_t)0x700363a330ull;
         uint64_t *vtable2 = (uint64_t *)(uintptr_t)0x70036e1e18ull;
-        if (heap_trace() || anim_on()) {
+        if (heap_trace() || anim_on() || cfg_bool("MKW_SOUND_HEAP_TRACE")) {
             static const GuestFn fn[4] = {ht_adjust, ht_free, ht_resize_front, ht_resize_back};
             for (int k = 0; k < 4; k++) {
                 ht_orig[k] = vtable1[ht_slot[k]];
@@ -2119,6 +2291,16 @@ void ov_system_post_load(void) {
                 if (vtable2[ht_slot[k]] == ht_orig[k]) vtable2[ht_slot[k]] = h;
                 rt_log("htrace hooked ExpHeap %s (%#llx)", ht_name[k], (unsigned long long)ht_orig[k]);
             }
+        }
+        if (cfg_bool("MKW_SOUND_HEAP_TRACE")) {
+            uint64_t *gvt = (uint64_t *)(uintptr_t)0x700363a7c0ull;
+            if (gvt[6] == 0x70003f18e0ull && gvt[7] == 0x70001a5220ull) {
+                gvt[6] = hostfn_register("growheap_alloc", gh_alloc);
+                gvt[7] = hostfn_register("growheap_free", gh_free);
+                rt_log("dslink: hooked alloc/free of heap class 0x700363a7c0");
+            } else
+                rt_log("dslink: heap class 0x700363a7c0 slots are %#llx %#llx, not hooked", (unsigned long long)gvt[6],
+                       (unsigned long long)gvt[7]);
         }
         rt_log("heap: patching ExpHeap::alloc vtable at %p (%#llx -> %#llx)",
                vtable1, (unsigned long long)*vtable1, (unsigned long long)s_expheap_hook_addr);
@@ -3154,4 +3336,422 @@ static void apw_retire(uint64_t pool) { (void)pool; }
 void rt_anim_preread(uint64_t a, uint64_t n) { (void)a, (void)n; }
 void rt_anim_unwatch(uint64_t a, uint64_t n) { (void)a, (void)n; }
 static void apw_report(uint64_t hdr, uint64_t pool) { (void)hdr, (void)pool; }
+#endif
+
+// ---- Collision investigation probe (HANDOVER 12e): hand-inserted calls in GENERATED code (main_0061.c
+// f_7000514d90, the CrashFade2 controller setup; pristine copy main_0061.c.orig in the scratchpad). Counts calls per
+// id and logs the first ones with x0 and the guest return addresses ("dprobe"). Regenerating the code removes the calls.
+// Controllers seen by probe 0 (CrashFade2 setup, x0 = the controller); 25 s after the first, a background thread dumps
+// the first 0x200 bytes of each controller and 0x800 of the object at [controller+0x20] (the actor) to
+// probe-dump/ (cf2_<n>.bin), for working out where the actor keeps its world matrix.
+static uint64_t probe_ctrl[4096];
+static volatile LONG probe_nctrl;
+static DWORD WINAPI probe_dump_thread(LPVOID arg) {
+    (void)arg;
+    Sleep(25000);
+    CreateDirectoryA("probe-dump", NULL);
+    int n = probe_nctrl < 4096 ? (int)probe_nctrl : 4096, written = 0;
+    for (int i = 0; i < n && written < 64; i++) {
+        uint64_t ctl = probe_ctrl[i], act = 0;
+        if (!plat_mem_readable(ctl, 0x200)) continue;
+        memcpy(&act, (const void *)(uintptr_t)(ctl + 0x20), 8);
+        if (!plat_mem_readable(act, 0x800)) continue;
+        char name[96];
+        snprintf(name, sizeof name, "probe-dump/cf2_%03d.bin", written);
+        FILE *f = fopen(name, "wb");
+        if (!f) continue;
+        fwrite(&ctl, 8, 1, f), fwrite(&act, 8, 1, f);
+        fwrite((const void *)(uintptr_t)ctl, 1, 0x200, f);
+        fwrite((const void *)(uintptr_t)act, 1, 0x800, f);
+        fclose(f);
+        written++;
+    }
+    rt_log("dprobe: dumped %d of %d CrashFade2 controllers and their actors to probe-dump/", written, n);
+    // Where are the props' bodies? Each actor's world position (row-major 3x4 at actor+0x410, translation in column 3)
+    // is searched for in all committed guest memory, to 0.05: a hit whose 48 bytes before hold three unit columns is a
+    // column-major transform (Havok hkTransform: rotation columns, then the translation at +0x30).
+    enum { NA = 4096 };
+    static float pos[NA][3];
+    static uint64_t act_of[NA];
+    static int ncol[NA], nrow[NA], noth[NA];
+    static uint64_t col_at[NA][4], oth_at[NA][6];
+    int na = 0;
+    for (int i = 0; i < n && na < NA; i++) {
+        uint64_t ctl = probe_ctrl[i], act = 0;
+        if (!plat_mem_readable(ctl + 0x20, 8)) continue;
+        memcpy(&act, (const void *)(uintptr_t)(ctl + 0x20), 8);
+        if (!plat_mem_readable(act + 0x410, 48)) continue;
+        float m[12];
+        memcpy(m, (const void *)(uintptr_t)(act + 0x410), 48);
+        if (!(fabsf(m[3]) > 1.0f || fabsf(m[11]) > 1.0f) || !(fabsf(m[3]) < 1e5f && fabsf(m[7]) < 1e5f && fabsf(m[11]) < 1e5f)) continue;
+        int dup = 0;
+        for (int k = 0; k < na && !dup; k++) dup = act_of[k] == act;
+        if (dup) continue;
+        pos[na][0] = m[3], pos[na][1] = m[7], pos[na][2] = m[11], act_of[na] = act;
+        na++;
+    }
+    uint64_t scanned = 0, arr_found = 0;
+    for (uint64_t a = 0x100000000ull; a < 0x8000000000ull;) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) break;
+        uint64_t lo = (uint64_t)(uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
+        int ok = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                 (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
+        if (ok && hi - lo <= (1ull << 34)) {
+            const float *p = (const float *)(uintptr_t)lo;
+            size_t cnt = (size_t)((hi - lo) / 4);
+            for (size_t j = 12; j + 3 < cnt; j++) {
+                if (!arr_found && !(j & 3) && j + 100 < cnt) {   // three consecutive body entries (ids n, n+1, n+2)
+                    const uint32_t *u = (const uint32_t *)(p + j);
+                    uint32_t i0 = u[0] & 0xffffff, f0 = u[0] >> 24;
+                    if (i0 > 16 && i0 < 0x100000 && f0 && f0 < 16 && (u[48] & 0xffffff) == i0 + 1 && (u[96] & 0xffffff) == i0 + 2) {
+                        const float *t = p + j + 4;
+                        float l0 = t[0] * t[0] + t[1] * t[1] + t[2] * t[2], l1 = t[4] * t[4] + t[5] * t[5] + t[6] * t[6];
+                        if (l0 > 0.98f && l0 < 1.02f && l1 > 0.98f && l1 < 1.02f) arr_found = lo + 4 * (uint64_t)j;
+                    }
+                }
+                float x = p[j];
+                if (!(fabsf(x) > 1.0f && fabsf(x) < 1e5f)) continue;
+                for (int k = 0; k < na; k++) {
+                    if (fabsf(x - pos[k][0]) > 0.05f || fabsf(p[j + 1] - pos[k][1]) > 0.05f || fabsf(p[j + 2] - pos[k][2]) > 0.05f)
+                        continue;
+                    uint64_t at = lo + 4 * (uint64_t)j;
+                    if (at >= act_of[k] && at < act_of[k] + 0x800) break;   // the actor's own copies
+                    int col = 1;
+                    for (int c3 = 0; c3 < 3 && col; c3++) {
+                        const float *v = p + j - 12 + 4 * c3;
+                        float l = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+                        col = l > 0.95f && l < 1.05f;
+                    }
+                    int row = !col && j >= 3 && fabsf(p[j - 3] * p[j - 3] + p[j - 2] * p[j - 2] + p[j - 1] * p[j - 1] - 1.0f) < 0.05f;
+                    if (col) {
+                        if (ncol[k] < 4) col_at[k][ncol[k]] = at;
+                        ncol[k]++;
+                    } else if (row) nrow[k]++;
+                    else {
+                        if (noth[k] < 6) oth_at[k][noth[k]] = at;
+                        noth[k]++;
+                    }
+                    if (row && noth[k] < 6) oth_at[k][noth[k]++] = at | 1;   // keep the row-major hit too (bit 0 marks it)
+                    break;
+                }
+            }
+            scanned += hi - lo;
+        }
+        a = hi;
+    }
+    int nobody = 0;
+    for (int k = 0; k < na; k++) {
+        nobody += !ncol[k];
+        rt_log("dprobe body: actor %#llx at (%.2f %.2f %.2f): %d column-major transforms (%#llx %#llx), %d row-major, %d other%s",
+               (unsigned long long)act_of[k], pos[k][0], pos[k][1], pos[k][2], ncol[k], (unsigned long long)col_at[k][0],
+               (unsigned long long)col_at[k][1], nrow[k], noth[k], ncol[k] ? "" : "  <-- NO BODY-LIKE TRANSFORM");
+    }
+    rt_log("dprobe body: %d actors, %d with no column-major transform at their position; %.1f GiB scanned", na, nobody,
+           scanned / 1073741824.0);
+    // Actors whose component arrays (+0x300) are empty: their state (+0x30..+0x40) and the list they sit in (+0x1a0,
+    // +0x1a8); for the first few, the object around the list node and the nearest vtable-looking word before it.
+    {
+        int shown = 0, stuck = 0;
+        static uint64_t heads[64];
+        static int nheads[64], nh = 0;
+        for (int k = 0; k < na; k++) {
+            uint64_t act = act_of[k], vt = 0, l0 = 0, l1 = 0;
+            uint32_t cnt0 = 0, st = 0;
+            memcpy(&vt, (const void *)(uintptr_t)act, 8);
+            memcpy(&cnt0, (const void *)(uintptr_t)(act + 0x308), 4);
+            memcpy(&st, (const void *)(uintptr_t)(act + 0x34), 4);
+            memcpy(&l0, (const void *)(uintptr_t)(act + 0x1a0), 8);
+            memcpy(&l1, (const void *)(uintptr_t)(act + 0x1a8), 8);
+            if (vt != 0x700352c148ull || cnt0) continue;
+            stuck++;
+            int h;
+            for (h = 0; h < nh && heads[h] != l0; h++) {}
+            if (h == nh && nh < 64) heads[nh] = l0, nheads[nh++] = 0;
+            if (h < 64) nheads[h]++;
+            if (shown++ < 6) {
+                uint32_t w[16];
+                memcpy(w, (const void *)(uintptr_t)(act + 0x20), 64);
+                rt_log("dprobe stuck actor %#llx (%d body hits): +0x20.. %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x "
+                       "| list %#llx %#llx", (unsigned long long)act, ncol[k], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9],
+                       w[10], w[11], (unsigned long long)l0, (unsigned long long)l1);
+            }
+        }
+        rt_log("dprobe stuck: %d actors of class 0x700352c148 with empty component arrays; %d distinct list words at +0x1a0", stuck,
+               nh);
+        for (int h = 0; h < nh && h < 8; h++) {
+            uint64_t p = heads[h];
+            if (!plat_mem_readable(p - 0x200, 0x300)) {
+                rt_log("dprobe list %#llx (%d actors): not readable", (unsigned long long)p, nheads[h]);
+                continue;
+            }
+            uint64_t vtab = 0, at = 0;
+            for (uint64_t q = p; q >= p - 0x200 && !vtab; q -= 8) {
+                uint64_t v;
+                memcpy(&v, (const void *)(uintptr_t)q, 8);
+                if (v >= 0x7003500000ull && v < 0x7003800000ull) vtab = v, at = q;
+            }
+            uint64_t qw[8];
+            memcpy(qw, (const void *)(uintptr_t)(p - 0x20), 64);
+            rt_log("dprobe list %#llx (%d actors): nearest vtable-like word %#llx at %#llx (-%#llx); around: %llx %llx %llx %llx [%llx] %llx "
+                   "%llx %llx",
+                   (unsigned long long)p, nheads[h], (unsigned long long)vtab, (unsigned long long)at, (unsigned long long)(p - at),
+                   (unsigned long long)qw[0], (unsigned long long)qw[1], (unsigned long long)qw[2], (unsigned long long)qw[3],
+                   (unsigned long long)qw[4], (unsigned long long)qw[5], (unsigned long long)qw[6], (unsigned long long)qw[7]);
+        }
+    }
+    // The body array: entries of 0xc0 bytes whose transform (3 rotation columns, then the translation) starts at +0x10;
+    // a column-major hit h is an entry's translation, so the entry is at h - 0x40. Walk +-20000 entries around the first
+    // hit, keep the ones whose rotation columns are unit length, and match each actor without a hit by rotation alone.
+    {
+        uint64_t h0 = 0;
+        for (int k = 0; k < na && !h0; k++)
+            if (ncol[k]) h0 = col_at[k][0];
+        if (!h0 && arr_found) h0 = arr_found + 0x40;   // an entry found by its id sequence
+        if (h0) {
+            enum { NB = 40001 };
+            static float brot[NB][9], bpos[NB][3];
+            static uint64_t baddr[NB];
+            int nb = 0, near_origin = 0;
+            uint64_t base = h0 - 0x40;
+            for (int64_t e = -20000; e <= 20000 && nb < NB; e++) {
+                uint64_t ent = base + (uint64_t)(e * 0xc0);
+                if (!plat_mem_readable(ent, 0xc0)) continue;
+                const float *t = (const float *)(uintptr_t)(ent + 0x10);
+                int ok = 1;
+                for (int c3 = 0; c3 < 3 && ok; c3++) {
+                    float l = t[4 * c3] * t[4 * c3] + t[4 * c3 + 1] * t[4 * c3 + 1] + t[4 * c3 + 2] * t[4 * c3 + 2];
+                    ok = l > 0.98f && l < 1.02f;
+                }
+                if (!ok || !(fabsf(t[12]) < 1e6f && fabsf(t[13]) < 1e6f && fabsf(t[14]) < 1e6f)) continue;
+                for (int q = 0; q < 3; q++)
+                    for (int r3 = 0; r3 < 3; r3++) brot[nb][q * 3 + r3] = t[4 * q + r3];
+                bpos[nb][0] = t[12], bpos[nb][1] = t[13], bpos[nb][2] = t[14], baddr[nb] = ent;
+                near_origin += fabsf(t[12]) < 2.0f && fabsf(t[13]) < 2.0f && fabsf(t[14]) < 2.0f;
+                nb++;
+            }
+            rt_log("dprobe bodies: %d body-like entries around %#llx, %d within 2 m of the world origin", nb,
+                   (unsigned long long)base, near_origin);
+            // The real array: the hit entry's id (low 24 bits of its first word) is its index, so the array starts id
+            // entries before it. Walk while the id matches the index (free slots are counted apart) and classify.
+            uint32_t w00;
+            memcpy(&w00, (const void *)(uintptr_t)base, 4);
+            uint64_t arr = base - (uint64_t)(w00 & 0xffffff) * 0xc0;
+            int n_body = 0, n_free = 0, n_ident_origin = 0, n_rot_origin = 0, n_zero = 0, n_bad = 0, n_world = 0, misses = 0;
+            int shown = 0;
+            for (uint32_t i = 0; i < 200000 && misses < 64; i++) {
+                uint64_t ent = arr + (uint64_t)i * 0xc0;
+                if (!plat_mem_readable(ent, 0xc0)) break;
+                uint32_t w0;
+                memcpy(&w0, (const void *)(uintptr_t)ent, 4);
+                if ((w0 & 0xffffff) != i) {
+                    n_free++, misses++;
+                    continue;
+                }
+                misses = 0;
+                n_body++;
+                const float *t = (const float *)(uintptr_t)(ent + 0x10);
+                int unit = 1, zero = 1, finite = 1;
+                for (int k2 = 0; k2 < 16; k2++) finite &= t[k2] == t[k2] && fabsf(t[k2]) < 1e7f;
+                for (int c3 = 0; c3 < 3; c3++) {
+                    float l = t[4 * c3] * t[4 * c3] + t[4 * c3 + 1] * t[4 * c3 + 1] + t[4 * c3 + 2] * t[4 * c3 + 2];
+                    unit &= l > 0.98f && l < 1.02f;
+                    zero &= l < 1e-6f;
+                }
+                int origin = fabsf(t[12]) < 2.0f && fabsf(t[13]) < 2.0f && fabsf(t[14]) < 2.0f;
+                int ident = unit && fabsf(t[0] - 1) < 1e-3f && fabsf(t[5] - 1) < 1e-3f && fabsf(t[10] - 1) < 1e-3f;
+                const char *kind = NULL;
+                if (!finite) n_bad++, kind = "non-finite";
+                else if (zero) n_zero++, kind = "zero rotation";
+                else if (unit && origin && ident) n_ident_origin++;
+                else if (origin) n_rot_origin++, kind = "rotated at origin";
+                else n_world++;
+                if (kind && shown < 12) {
+                    shown++;
+                    uint32_t u[4];
+                    memcpy(u, (const void *)(uintptr_t)ent, 16);
+                    rt_log("dprobe slot %u %s: %08x %08x %08x %08x | rot (%.3f %.3f %.3f) pos (%.3f %.3f %.3f)", i, kind, u[0], u[1],
+                           u[2], u[3], t[0], t[1], t[2], t[12], t[13], t[14]);
+                }
+            }
+            rt_log("dprobe array %#llx: %d bodies (%d free/other slots): %d placed in the world, %d identity at the origin, "
+                   "%d rotated at the origin, %d zero rotation, %d non-finite",
+                   (unsigned long long)arr, n_body, n_free, n_world, n_ident_origin, n_rot_origin, n_zero, n_bad);
+            for (int k = 0; k < na; k++) {
+                if (ncol[k]) continue;
+                float m[12];
+                memcpy(m, (const void *)(uintptr_t)(act_of[k] + 0x410), 48);
+                int best = -1;
+                float bestd = 1e30f;
+                int same_rot = 0;
+                for (int b = 0; b < nb; b++) {
+                    // actor rows m[0..2], m[4..6], m[8..10]; body columns brot[b][0..2] etc. (column j = row j of R^T)
+                    float err = 0;
+                    for (int q = 0; q < 3; q++)
+                        for (int r3 = 0; r3 < 3; r3++) err += fabsf(brot[b][q * 3 + r3] - m[r3 * 4 + q]);
+                    if (err > 0.01f) continue;
+                    same_rot++;
+                    float dx = bpos[b][0] - m[3], dy = bpos[b][1] - m[7], dz = bpos[b][2] - m[11];
+                    float dd = sqrtf(dx * dx + dy * dy + dz * dz);
+                    if (dd < bestd) bestd = dd, best = b;
+                }
+                if (best >= 0)
+                    rt_log("dprobe match: actor %#llx at (%.1f %.1f %.1f): %d bodies with its rotation; nearest at (%.2f %.2f %.2f), "
+                           "%.2f m away (entry %#llx)",
+                           (unsigned long long)act_of[k], m[3], m[7], m[11], same_rot, bpos[best][0], bpos[best][1], bpos[best][2],
+                           bestd, (unsigned long long)baddr[best]);
+                else
+                    rt_log("dprobe match: actor %#llx at (%.1f %.1f %.1f): NO body with its rotation", (unsigned long long)act_of[k],
+                           m[3], m[7], m[11]);
+            }
+        }
+    }
+    for (int k = 0, shown = 0; k < 0 && shown < 3; k++) {
+        if (!ncol[k]) continue;
+        shown++;
+        uint64_t at = col_at[k][0] - 0x30;
+        for (int row = -4; row < 12; row++) {
+            uint64_t r = at + 16 * (int64_t)row;
+            uint32_t u[4];
+            float f[4];
+            memcpy(u, (const void *)(uintptr_t)r, 16);
+            memcpy(f, u, 16);
+            rt_log("dprobe arr k%d %#llx: %08x %08x %08x %08x | %.4g %.4g %.4g %.4g", k, (unsigned long long)r, u[0], u[1], u[2], u[3],
+                   f[0], f[1], f[2], f[3]);
+        }
+    }
+    for (int k = 0; k < 0; k++)
+        for (int h = 0; h < 6 && h < noth[k]; h++) {
+            uint64_t at = oth_at[k][h] & ~1ull;
+            char s[1200];
+            int o = 0;
+            for (int q = -16; q < 24; q++) {
+                float f;
+                uint32_t u;
+                memcpy(&u, (const void *)(uintptr_t)(at + 4 * (int64_t)q), 4);
+                memcpy(&f, &u, 4);
+                o += snprintf(s + o, sizeof s - o, "%s%s%.4g", q % 4 == 0 ? " |" : " ", q == 0 ? ">" : "", f);
+            }
+            rt_log("dprobe ctx actor %d hit %#llx%s:%s", k, (unsigned long long)at, (oth_at[k][h] & 1) ? " (row)" : "", s);
+        }
+    return 0;
+}
+void rt_probe_hit(Cpu *c, int id) {
+    static long n[8];
+    if (id < 0 || id >= 8) return;
+    long k = __atomic_add_fetch(&n[id], 1, __ATOMIC_RELAXED);
+    if (id == 0) {
+        void rt_aww_register(uint64_t act);
+        uint64_t act = 0;
+        if (plat_mem_readable(c->x[0] + 0x20, 8)) memcpy(&act, (const void *)(uintptr_t)(c->x[0] + 0x20), 8);
+        rt_aww_register(act);
+        LONG i = InterlockedIncrement(&probe_nctrl) - 1;
+        if (i < 4096) probe_ctrl[i] = c->x[0];
+        if (i == 0) CloseHandle(CreateThread(NULL, 0, probe_dump_thread, NULL, 0, NULL));
+    }
+    if (k > 12 && (k & (k - 1))) return;
+    uint64_t lr[4];
+    apl_chain(c, lr);
+    rt_log("dprobe %d: call %ld x0 %#llx x1 %#llx | callers %#llx %#llx %#llx %#llx", id, k, (unsigned long long)c->x[0],
+           (unsigned long long)c->x[1], (unsigned long long)lr[0], (unsigned long long)lr[1], (unsigned long long)lr[2],
+           (unsigned long long)lr[3]);
+}
+
+// ---- Collision investigation: write-watch of CrashFade2 actors' state (+0x30..+0x40) and list node (+0x1a0..+0x1b0).
+// rt_probe_hit registers the actor of each controller (first AWW_N); their pages are read-only for AWW_MS. A write to a
+// watched field is logged with the lifted function, the field and the value it wrote ("daww"); every write to the page
+// runs one instruction with the page writable (trap flag) and the page is protected again.
+#ifdef _WIN32
+enum { AWW_N = 48, AWW_MS = 25000, AWW_LOGS = 600 };
+static uint64_t aww_act[AWW_N];
+static volatile LONG aww_n, aww_logs;
+static volatile LONG aww_on;
+static ULONGLONG aww_until;
+static _Thread_local uint64_t aww_page, aww_addr, aww_fn, aww_rip, aww_act_hit;
+static _Thread_local int aww_field;
+static PVOID aww_veh_h;
+static int aww_find(uint64_t a, uint64_t *act, int *field) {
+    int n = aww_n;
+    for (int i = 0; i < n; i++) {
+        uint64_t b = aww_act[i];
+        if (a >= b + 0x30 && a < b + 0x40) { *act = b, *field = (int)(a - b); return 1; }
+        if (a >= b + 0x1a0 && a < b + 0x1b0) { *act = b, *field = (int)(a - b); return 1; }
+    }
+    return 0;
+}
+static int aww_in_page(uint64_t a) {
+    uint64_t p = a & ~0xfffull;
+    int n = aww_n;
+    for (int i = 0; i < n; i++) {
+        uint64_t b = aww_act[i];
+        if (p == ((b + 0x30) & ~0xfffull) || p == ((b + 0x1a0) & ~0xfffull)) return 1;
+    }
+    return 0;
+}
+static void aww_protect(DWORD prot) {
+    int n = aww_n;
+    for (int i = 0; i < n; i++) {
+        DWORD old;
+        VirtualProtect((void *)(uintptr_t)((aww_act[i] + 0x30) & ~0xfffull), 0x1000, prot, &old);
+        VirtualProtect((void *)(uintptr_t)((aww_act[i] + 0x1a0) & ~0xfffull), 0x1000, prot, &old);
+    }
+}
+static LONG CALLBACK aww_veh(PEXCEPTION_POINTERS ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION && aww_on && ep->ExceptionRecord->NumberParameters >= 2 &&
+        ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uint64_t a = ep->ExceptionRecord->ExceptionInformation[1];
+        if (!aww_in_page(a)) return EXCEPTION_CONTINUE_SEARCH;
+        DWORD old;
+        aww_page = a & ~0xfffull, aww_addr = a, aww_act_hit = 0, aww_field = -1;
+        uint64_t act;
+        int field;
+        if (aww_find(a, &act, &field)) {
+            aww_act_hit = act, aww_field = field;
+            aww_rip = ep->ContextRecord->Rip;
+            aww_fn = rt_lifted_function((uintptr_t)aww_rip);
+        }
+        VirtualProtect((void *)(uintptr_t)aww_page, 0x1000, PAGE_READWRITE, &old);
+        ep->ContextRecord->EFlags |= 0x100;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code == EXCEPTION_SINGLE_STEP && aww_page) {
+        DWORD old;
+        if (aww_act_hit && InterlockedIncrement(&aww_logs) <= AWW_LOGS) {
+            uint64_t v = 0;
+            memcpy(&v, (const void *)(uintptr_t)(aww_addr & ~7ull), 8);
+            uint32_t st = 0;
+            memcpy(&st, (const void *)(uintptr_t)(aww_act_hit + 0x34), 4);
+            rt_log("daww actor %#llx +%#x <- %#llx (word at +%#llx) by f_%llx (image+%#llx); state +0x34 now %u",
+                   (unsigned long long)aww_act_hit, aww_field, (unsigned long long)v,
+                   (unsigned long long)((aww_addr & ~7ull) - aww_act_hit), (unsigned long long)aww_fn,
+                   (unsigned long long)(aww_rip - (uint64_t)(uintptr_t)GetModuleHandleW(NULL)), st);
+        }
+        if (aww_on && GetTickCount64() < aww_until) VirtualProtect((void *)(uintptr_t)aww_page, 0x1000, PAGE_READONLY, &old);
+        else if (aww_on) {
+            aww_on = 0;
+            aww_protect(PAGE_READWRITE);
+            rt_log("daww: watch ended");
+        }
+        aww_page = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+void rt_aww_register(uint64_t act) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("MKW_SOUND_HEAP_TRACE");
+    if (!on || !act || aww_n >= AWW_N) return;
+    for (int i = 0; i < aww_n; i++)
+        if (aww_act[i] == act) return;
+    if (!aww_veh_h) aww_veh_h = AddVectoredExceptionHandler(1, aww_veh), aww_until = GetTickCount64() + AWW_MS, aww_on = 1;
+    if (!aww_on) return;
+    LONG i = InterlockedIncrement(&aww_n) - 1;
+    aww_act[i] = act;
+    DWORD old;
+    VirtualProtect((void *)(uintptr_t)((act + 0x30) & ~0xfffull), 0x1000, PAGE_READONLY, &old);
+    VirtualProtect((void *)(uintptr_t)((act + 0x1a0) & ~0xfffull), 0x1000, PAGE_READONLY, &old);
+}
+#else
+void rt_aww_register(uint64_t act) { (void)act; }
 #endif

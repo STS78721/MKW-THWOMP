@@ -50,7 +50,7 @@ static const char *const known[] = {
     "REPLAY_CHECK", "RESOLVE_CHECK", "ROMFS", "ROMFS_INDEX", "ROMFS_MMAP", "ROMFS_MODS", "ROMFS_PATCHES",
     "ROMFS_PROOF_DIR", "ROMFS_VERIFY", "RUMBLE", "RUMBLE_CURVE", "RUMBLE_STRENGTH", "RUMBLE_TRIGGERS", "SAVE", "SEED", "SHADER_CACHE",
     "SHADER_DUMP", "SHADER_FAILURE_DUMP", "SHADER_MEMO", "SHADOW", "SHARED_FONTS", "SHOTS", "SHOTS_DIR", "SHOTS_FULL", "SKIP_COMPUTE", "SKIP_DRAWS", "SKIP_PROG", "SKIP_STAGE", "SPARSE_IMAGES", "SPARSE_MIB", "SPARSE_ORDER", "SPARSE_TRACE", "SPEED_PROBE", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_US", "SPV_OVERRIDE", "STICK_DEADZONE", "SWKBD_ANSWER",
-    "SWKBD_TEST", "TEST_PAD", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "TEX_HASH", "TEX_MEMO", "TEX_VRAM_PRESSURE", "COMPACT_ASTC_MB", "COMPACT_HUGE_EDGE", "ASTC_BC7", "ASTC_PROBE_LEVEL", "COMPACT_LOD_BIAS", "TIMER_1MS", "REC_BATCH", "TRACE", "UBO_SNAPSHOT", "SSBO_SNAPSHOT", "SKIN_CHECK", "SKIN_WATCH", "SKIN_WATCH_TEST", "TRIG_CHECK", "ANIM_CHECK", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
+    "SWKBD_TEST", "TEST_PAD", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "TEX_HASH", "TEX_MEMO", "TEX_VRAM_PRESSURE", "COMPACT_ASTC_MB", "COMPACT_HUGE_EDGE", "ASTC_BC7", "ASTC_PROBE_LEVEL", "COMPACT_LOD_BIAS", "TIMER_1MS", "REC_BATCH", "TRACE", "UBO_SNAPSHOT", "SSBO_SNAPSHOT", "SKIN_CHECK", "SKIN_WATCH", "SKIN_WATCH_TEST", "TRIG_CHECK", "ANIM_CHECK", "SOUND_HEAP_TRACE", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
     "VK_PRESENT", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOLUME", "VRAM_HEADROOM", "VS_OUTS",
     "WB_EXACT", "WB_FENCE_LIMIT", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_PROCS", "ZSTD_CHECK", "ZSTD_NATIVE",};
 
@@ -90,7 +90,9 @@ static const struct { const char *key, *section; } sections[] = {
     {"TRACE", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
     {"WB_FENCE_LIMIT", "diagnostics"}, {"WB_EXACT", "diagnostics"}, {"NX2_READ_NOWAIT", "diagnostics"},
     {"NVN2_MODE_TRACE", "diagnostics"},
-    {"NVN2_MODE_TRACE_START_MS", "diagnostics"}, {"NVN2_MODE_TRACE_DURATION_MS", "diagnostics"},};
+    {"NVN2_MODE_TRACE_START_MS", "diagnostics"}, {"NVN2_MODE_TRACE_DURATION_MS", "diagnostics"},
+    {"SKIN_CHECK", "diagnostics"}, {"SKIN_WATCH", "diagnostics"}, {"SKIN_WATCH_TEST", "diagnostics"},
+    {"TRIG_CHECK", "diagnostics"}, {"ANIM_CHECK", "diagnostics"}, {"SOUND_HEAP_TRACE", "diagnostics"},};
 
 // The settings the menu shows: the value in effect when the key is unset, and what the key accepts. The only place a
 // default lives: consumers read cfg_value / cfg_int / cfg_double / cfg_bool. A row with an empty default has no fixed
@@ -162,6 +164,9 @@ static const CfgMeta metas[] = {
     {"NVN2_MODE_TRACE", "0", "0|1", RESTART},
     {"NVN2_MODE_TRACE_START_MS", "0", "0..600000", RESTART},
     {"NVN2_MODE_TRACE_DURATION_MS", "0", "0..600000", RESTART},
+    // Crown City animation diagnostics (HANDOVER 12a-12d), off by default
+    {"SKIN_CHECK", "0", "0|1", RESTART}, {"SKIN_WATCH", "0", "0|1", RESTART}, {"SKIN_WATCH_TEST", "0", "0|1", RESTART},
+    {"TRIG_CHECK", "0", "0|1", RESTART}, {"ANIM_CHECK", "0", "0|1", RESTART}, {"SOUND_HEAP_TRACE", "0", "0|1", RESTART},
     {"INPUT_RECORD", "", NULL, RESTART},};
 
 static int is_known(const char *key) {

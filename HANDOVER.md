@@ -317,3 +317,76 @@ The pedestrians now draw and animate (a Yoshi pedestrian is visible on the pavem
 - **metal road barriers / guard rails** on the kerb.
 
 The original game was compared in an emulator, where these collide. Bushes pass through in the emulator too, so they are not a bug. Nothing has been investigated yet. A first idea, unverified: the 12d fix covered CPU-cached render targets of up to 4 MiB. Collision for breakable objects might depend on another GPU→CPU path that is still missing, such as a target in a non-CPU-cached pool, a buffer the GPU writes and the CPU reads, or a size over 4 MiB. The `MKW_TRACE=gfx` lines `fence write-back skipped-for-size` and the `dapw` pool write-watch (`anim_check`) are the tools to start with.
+
+**12e progress (Claude, 2026-11-13 day):**
+- **Ruled out:**
+  - Texture write-back by size: no `skipped-for-size` lines in a user drive. The skip is now logged without `MKW_TRACE`.
+  - Soft-skips: none fired.
+  - Heap failures: none, apart from a full parent heap queried inside ExpHeap `getMaxAllocatableSize`, which is normal.
+  - The resolution overlay: it patches resolution integers in place.
+  - The packed RomFS: 206,202 files, the same as the loose dump.
+- **Lifter checked instruction by instruction.** New tool: `tools/check_lift_diff.py`. It samples real instruction words per form from the NSO, lifts each one with `recomp/lifter.py` (`simd='c'`), compiles it against `runtime/cpu.h` and `simd.h`, runs it on random states, and compares the result with Unicorn.
+  - Results: 0 differences in 11,264 integer, 8,466 AdvSIMD and 4,971 scalar-FP words of main, and in 1,659 SDK words. That is every data-processing and FP/SIMD form.
+  - A self-test that injects a bug is caught.
+  - Loads, stores, branches and exclusives are not covered yet.
+- **What the colliding props are:**
+  - The green Crown City street lamp is `CmnObj_StreetLight000_A` and the guard rails are `CmnObj_Guardrail00x`. Both are `Obj_CrashFade2` props, with `CrashRuleVsKart: OverHighSpeed` and a react table (`VsKart: Crash`).
+  - Their phive body is a **Dynamic** rigid body on layer `FreeMoveObj` (guard rail: a 0.6×1.2×20 box). It is bound to the model's bones (`BoneBindModePosition/Rotation: All`, `WarpMode: AfterUpdateWorldMtx`).
+  - The executable also has an InstancingCompound path for mass-placed props, and a GPU-motion system with CPU access (`GpuMotionCPUAccess2`, `GPUMBoneName`, `GPUMFollowEntityIdx`, `Obj_GPUMCrashFade`).
+  - Tools: the scratchpad's `byml.py` plus the GymlArchive SARCs, which are plain zstd.
+- **Gap found and fixed (`vk_texture.c` `vk_texture_storage_bound_locked`):** storage images, i.e. image stores from compute or fragment shaders, were never written back to their storage. The old comment said "only the write fence for ReadTexels".
+  - A storage image in a CPU-readable pool (CPU_CACHED or CPU_UNCACHED) is now marked GPU-written like a render target, so the fence write-back, memcpy and invalidate send it back.
+  - The attract demo has two of these: `256x256 fmt 0x2b` in CPU-cached pools, 512 KiB each. Each one logs `storage image in a CPU-readable pool ... written back like a render target` once.
+  - Frame rate unchanged headless.
+  - Not yet confirmed to fix the collision.
+- **Storage-image fix did not restore collision** (user drive at 08:05): only the same two 256x256 images, no skipped write-backs. The user adds that the guard rails should also be **grindable** (rail slide to reach coins over them), and that doesn't work either.
+- **CrashFade2 actors ARE created:** a temporary probe in generated `main_0061.c` at `f_7000514d90`, which looks up the "CrashFade2" game parameter (string `0x7002c80aac`), logs `dprobe 0` with call counts and callers (`0x70009157c8 ← 0x700074b0dc ← 0x70006ef670 ← 0x70007a0ca8`). 64+ calls in an attract race. The pristine file is `main_0061.c.orig` in the scratchpad; **restore it before shipping**.
+- **Physics setup of the props** (phive gyml): a dynamic `FreeMoveObj` body, `CrashObj`, `IsAddToWorldOnReset: true`, `IsSkipTrackingWhenNoHit: true`, bone-bound. So the body is placed at reset and only re-tracks after a hit. A wrong initial placement, or a body never added to the world, would give exactly "visible, no collision, no grind".
+- **Pedestrians are different:** `CmnObj_Crowd*` use `UseObjectMassiveDraw` and have no physics component, so their hits come from another system.
+- **Also checked and fine:**
+  - the lifter's exclusive/LSE atomics (`ldxN`/`stxN` CAS emulation, `cas`/`casp`/`atomic`);
+  - the forced global `0x70052db828` (the SDK's "graphics system initialized" flag);
+  - `ExistConditionGParam/Default` (empty);
+  - the PhiveConfig layer lists (game data, untouched).
+- **Open question to the user:** do other `FreeMoveObj` props behave (cardboard boxes, bus stops, tables, cones), and do traffic cars (`MapObj` layer) collide? That would tell a layer-wide problem from a CrashFade2-specific one.
+
+### 12f. Collision investigation, continued (Claude, 2026-11-13): no fix yet; where it stands
+
+**User facts:**
+- Some lamp posts and guard rails **work in some areas and not in others**: the same prop types, so it depends on the instance or area.
+- Other knock-away props work: cardboard boxes, bus stops, tables.
+- Guard rails should also be grindable, and in the broken areas they aren't.
+
+**What the props are:** the guard rails, `CmnObj_StreetLight000` and the bus stops are all `Obj_CrashFade2`. Cardboard boxes and tables are `Obj_GPUMCrashFade`. Physics is a dynamic phive body that only exists while the actor is **active**.
+
+**Activation levels (key finding):**
+- The actor manager (global `0x70036cce30`, per-frame `f_70005c3430` → `f_70005c3940`) moves each actor between levels 13 / 12 / 8 / 4, stored in **actor + 0x34**. Each level has its own sead `OffsetList`, using the node at actor + 0x1a0 and lists at manager + 0x390 / 0x3a8 / 0x3c0, set up by `f_7000dcb2c0`.
+- In headless attract runs the props cycle 13 → 12 → 8 → 4 → 8 → 12… as the camera moves.
+- Props at level 4 have empty component arrays (actor + 0x300…0x350) and **no Havok body**. Active props have bodies.
+- So "no body" is **by design for inactive props**. The likely bug: props near the player stay at a low level in some areas. What drives the level request (distance, sector, visibility) is not found yet. The next step is to trace who sets the requested level that `f_70005c3940` applies.
+
+**Tools that worked (in `runtime/ov_system.c`, all off by default):**
+- `rt_probe_hit` (needs a hand-inserted call in generated `main_0061.c` at `f_7000514d90`, which looks up the "CrashFade2" game parameter):
+  - dumps controllers and actors; the actor world matrix is at **actor + 0x410**, row-major 3×4;
+  - searches all guest memory for Havok bodies at each actor's position. Body array entries are 0xc0 bytes with the transform at +0x10, column-major, translation at +0x40;
+  - matches bodies by rotation, and diffs actors with and without a body.
+- `rt_aww_register` / `aww_veh`: write-watch of actor + 0x30…0x40 and + 0x1a0…0x1b0 (who changes the level / list). It runs under `MKW_SOUND_HEAP_TRACE=1` together with the probe hook.
+- `MKW_SOUND_HEAP_TRACE=1` also:
+  - names heaps (`heap_name`: the sead name pointer is at heap + 0x20; start at +0x28, size at +0x30, parent at +0x38);
+  - logs Sound heap allocations by caller;
+  - hooks the growable heap class (vtable `0x700363a7c0`, alloc `f_70003f18e0`, free `f_70001a5220`) to track live bytes in `SLinkUserCreate`.
+- `MKW_TRACE=fs` now logs RomFS opens of missing files.
+- `tools/check_lift_diff.py`: the lifter-versus-Unicorn instruction differential tester (see 12e).
+
+**Ruled out (with evidence):**
+- Lifted instruction semantics: 26k+ words of integer/FP/SIMD, plus a review of the exclusive/LSE atomics.
+- GPU readback: texture write-back by size, and storage images; the storage-image write-back fix stays because it is correct anyway.
+- Soft-skips, game data and phive config, the resolution overlay, RomFS completeness, `TOTK_LOD_GUARD`, the forced `0x70052db828` flag.
+- The app pool size: 10.5 GiB changes nothing.
+- The Sound heap:
+  - "Sound" always reports 0 free (`getMaxAllocatableSize`), but that is normal: the heap is fully handed out to children, mainly the 128 MiB `SoundResource` (`f_7000bc8390` config + 0x198) and a 19 MiB pool (`f_7000bc4260`).
+  - `SLinkUserCreate` (0x60000 bytes) only ever has 3–91 KiB live.
+- The heap table: the game asks for `ProductME.Nin_Ounce_NVN2.HeapDef` (hard-coded in `nninitStartup` `f_7000084920`), which is not in the 1.8.0 RomFS, and falls back to `Default` (Product + about 8.8 GiB of debug heaps). Retail does the same, so this is not the cause by itself.
+- The missing loose Gyml / ActorInfo files are absent from the archives too, so they are normal misses.
+
+**Seen during these runs:** the known intermittent `VK_ERROR_DEVICE_LOST` ("upload submit failed (-4)", invalid instruction pointer) hit about 3 of ~35 headless runs, including builds before any of today's changes.
