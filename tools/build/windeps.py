@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 import urllib.request
 from pathlib import Path
 
@@ -39,6 +40,11 @@ PINS = {
             f"llvm-mingw-{LLVM_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz"
         ),
         "55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335",
+    )
+    if sys.platform != "win32"
+    else (  # THWOMP: built on Windows itself, with the Windows-hosted package of the same release
+        f"https://github.com/mstorsjo/llvm-mingw/releases/download/{LLVM_VERSION}/llvm-mingw-{LLVM_VERSION}-ucrt-x86_64.zip",
+        "fd5462b7f5d93b2ff981fcd3f9c7e427e47f3203c64ea91c27bcc444eebd74cd",
     ),
     "sdl3-src": (
         f"https://github.com/libsdl-org/SDL/releases/download/release-{SDL_VERSION}/SDL3-{SDL_VERSION}.tar.gz",
@@ -116,8 +122,12 @@ def unpack_llvm(archive: Path) -> None:
     shutil.rmtree(dst, ignore_errors=True)
     tmp = WIN / "llvm-mingw.tmp"
     shutil.rmtree(tmp, ignore_errors=True)
-    with tarfile.open(archive) as t:
-        t.extractall(tmp, filter="tar")
+    if archive.suffix == ".zip":
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(tmp)
+    else:
+        with tarfile.open(archive) as t:
+            t.extractall(tmp, filter="tar")
     (top,) = tmp.iterdir()
     top.rename(dst)
     tmp.rmdir()
@@ -154,15 +164,17 @@ def build_sdl(source: Path) -> None:
     with tarfile.open(source) as t:
         t.extractall(work, filter="tar")
     deps, cc = WIN / "deps", WIN / "llvm-mingw/bin/x86_64-w64-mingw32-"
+    exe = ".exe" if sys.platform == "win32" else ""
     src = work / f"SDL3-{SDL_VERSION}"
     configure = [
         "cmake", "-S", str(src), "-B", str(work / "build"), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_SYSTEM_NAME=Windows", "-DCMAKE_SYSTEM_PROCESSOR=x86_64", f"-DCMAKE_C_COMPILER={cc}clang",
-        f"-DCMAKE_CXX_COMPILER={cc}clang++", f"-DCMAKE_RC_COMPILER={cc}windres", f"-DCMAKE_INSTALL_PREFIX={deps}",
+        "-DCMAKE_SYSTEM_NAME=Windows", "-DCMAKE_SYSTEM_PROCESSOR=x86_64", f"-DCMAKE_C_COMPILER={cc}clang{exe}",
+        f"-DCMAKE_CXX_COMPILER={cc}clang++{exe}", f"-DCMAKE_RC_COMPILER={cc}windres{exe}", f"-DCMAKE_INSTALL_PREFIX={deps}",
         "-DSDL_STATIC=OFF", "-DSDL_TEST_LIBRARY=OFF", "-DSDL_TESTS=OFF", "-DSDL_EXAMPLES=OFF",
         "-DSDL_HIDAPI_LIBUSB=ON", "-DSDL_HIDAPI_LIBUSB_SHARED=ON",
         f"-DLibUSB_LIBRARY={deps / 'lib/libusb-1.0.dll.a'}", f"-DLibUSB_INCLUDE_PATH={deps / 'include/libusb-1.0'}",
     ]  # fmt: skip
+    configure = [c.replace("\\", "/") if c.startswith("-D") else c for c in configure]   # CMake: no backslashes
     subprocess.run(configure, check=True, stdout=subprocess.DEVNULL)
     subprocess.run(["cmake", "--build", str(work / "build"), "--target", "install"], check=True,
                    stdout=subprocess.DEVNULL)  # fmt: skip

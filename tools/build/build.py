@@ -101,6 +101,17 @@ WINDOWS = Target(
 
 
 def mem_total_gb() -> float:
+    if sys.platform == "win32":  # THWOMP: built on Windows itself
+        import ctypes
+
+        class MS(ctypes.Structure):
+            _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                        ("avail", ctypes.c_ulonglong), ("pt", ctypes.c_ulonglong), ("pa", ctypes.c_ulonglong),
+                        ("vt", ctypes.c_ulonglong), ("va", ctypes.c_ulonglong), ("ve", ctypes.c_ulonglong)]
+
+        m = MS(len=ctypes.sizeof(MS))
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return m.total / 1024**3
     with open("/proc/meminfo") as f:
         for line in f:
             if line.startswith("MemTotal:"):
@@ -295,6 +306,17 @@ def ninja_file(target: Target, gen: Path, out: Path, rt_extra: list[str], dist: 
     return "\n".join(lines) + "\n"
 
 
+def win_relative(text: str) -> str:
+    """THWOMP, built on Windows itself: Ninja cannot take a drive's colon or a space ("MKW PC") in a path, so every path
+    under the repository becomes relative to it (Ninja runs there), with forward slashes."""
+    if sys.platform != "win32":
+        return text
+    root = str(ROOT)
+    for prefix in (root + "\\", root.replace("\\", "/") + "/"):
+        text = text.replace(prefix, "")
+    return text
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gen", type=Path, default=ROOT / "build/generated")
@@ -362,15 +384,15 @@ def main() -> None:
     fp = ["-fno-omit-frame-pointer", "-mno-omit-leaf-frame-pointer"] if args.frame_pointers else []
     (args.out / "build.ninja").write_text(
         # the lifted code and its library take the sysroot only for another CPU: an x86-64 release's stay as they were
-        ninja_file(
+        win_relative(ninja_file(
             target, args.gen, args.out, fp + sys_flags, dist, args.runtime_only, sys_ld, sys_flags if cross else None
-        )
+        ))
     )
     if target is LINUX and not dist:
         write_compile_db(args.out / "build.ninja")
     cmd = ["ninja", "-f", str(args.out / "build.ninja"), "-j", str(jobs)] + (["-n"] if args.dry_run else [])
     print(f"{' '.join(cmd)}  ({jobs} jobs)")
-    sys.exit(subprocess.run(cmd, check=False).returncode)
+    sys.exit(subprocess.run(cmd, check=False, cwd=ROOT if sys.platform == "win32" else None).returncode)
 
 
 def write_compile_db(ninja: Path) -> None:
