@@ -214,6 +214,35 @@ static void row_quality(void) {
 }
 
 // What the graphics card draws and how much: each row defaults to the console's.
+// THWOMP colour profiles (gfx/vk/device/vk_color.c), as in STS78721's DKB build: a profile writes the four values;
+// moving one of them makes the profile Custom.
+static void rows_color(void) {
+    static const struct { const char *name, *b, *c, *s, *g; } presets[] = {
+        {"default", "0", "100", "100", "1"}, {"vivid", "0", "115", "135", "0.95"}, {"clarity", "2", "110", "115", "1"}};
+    static const UiTextId names[] = {UI_MENU_COLOR_DEFAULT, UI_MENU_COLOR_VIVID, UI_MENU_COLOR_CLARITY,
+                                     UI_MENU_COLOR_CUSTOM};
+    opt_group(UI_MENU_COLOR);
+    if (opt_choice("MKW_COLOR_PRESET", UI_MENU_COLOR_PRESET, names, 4, UI_MENU_COLOR_PRESET_DESC)) {
+        const char *p = cfg_value("MKW_COLOR_PRESET");
+        for (const auto &e : presets)
+            if (!strcmp(p, e.name)) {
+                cfg_set("MKW_COLOR_BRIGHTNESS", e.b), cfg_set("MKW_COLOR_CONTRAST", e.c);
+                cfg_set("MKW_COLOR_SATURATION", e.s), cfg_set("MKW_COLOR_GAMMA", e.g);
+                cfg_save();
+            }
+    }
+    bool moved = opt_slider("MKW_COLOR_BRIGHTNESS", UI_MENU_COLOR_BRIGHTNESS, -30, 30, UI_MENU_COLOR_BRIGHTNESS_DESC, 1,
+                            "%+.0f %%");
+    moved |= opt_slider("MKW_COLOR_CONTRAST", UI_MENU_COLOR_CONTRAST, 70, 150, UI_MENU_COLOR_CONTRAST_DESC, 5, "%.0f %%");
+    moved |= opt_slider("MKW_COLOR_SATURATION", UI_MENU_COLOR_SATURATION, 50, 200, UI_MENU_COLOR_SATURATION_DESC, 5,
+                        "%.0f %%");
+    moved |= opt_slider("MKW_COLOR_GAMMA", UI_MENU_COLOR_GAMMA, 0.8f, 1.2f, UI_MENU_COLOR_GAMMA_DESC, 0.02f, "%.2f");
+    if (moved && strcmp(cfg_value("MKW_COLOR_PRESET"), "custom")) {
+        cfg_set("MKW_COLOR_PRESET", "custom");
+        cfg_save();
+    }
+}
+
 static void tab_graphics(float scale) {
     opt_begin("##graphics", scale);
     {   // the game's internal render resolution (sdk/fs/romfs_res.c), read at start
@@ -251,6 +280,7 @@ static void tab_graphics(float scale) {
     }
     static const UiTextId mode[] = {UI_MENU_MODE_DOCKED, UI_MENU_MODE_HANDHELD};
     opt_choice("MKW_OPERATION_MODE", UI_MENU_OPERATION_MODE, mode, 2, UI_MENU_OPERATION_MODE_DESC);
+    rows_color();
     opt_end();
 }
 
@@ -325,7 +355,7 @@ static void tab_menu(float scale) {
         UI_MENU_LANGNAME_TH,
     };
     opt_choice("MKW_MENU_LANG", UI_MENU_MENU_LANG, langs, sizeof langs / sizeof *langs, UI_MENU_MENU_LANG_DESC);
-    static const UiTextId themes[] = {UI_MENU_THEME_LIGHT, UI_MENU_THEME_DARK};   // THWOMP: cfg.c's MENU_THEME order
+    static const UiTextId themes[] = {UI_MENU_THEME_DARK, UI_MENU_THEME_LIGHT};   // THWOMP: cfg.c's MENU_THEME order
     opt_choice("MKW_MENU_THEME", UI_MENU_THEME, themes, 2, UI_MENU_THEME_DESC);
     opt_toggle("MKW_UPDATE_CHECK", UI_MENU_UPDATE_CHECK, UI_MENU_UPDATE_CHECK_DESC);   // ui/launcher/launcher_update.cpp
     opt_end();

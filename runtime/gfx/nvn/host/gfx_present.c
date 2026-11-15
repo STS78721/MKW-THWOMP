@@ -679,9 +679,15 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                      VK_ACCESS_2_TRANSFER_WRITE_BIT);
     }
     vk_crumb_end(cb, VK_CRUMB_OP, prep);
+    // THWOMP colour profiles (MKW_COLOR_*, vk_color.c): a graded copy of the crop takes the game image's place below;
+    // not on an HDR10 swapchain (its picture is PQ, the grading is for SDR)
+    VkImage graded = src && general && !g_sc_hdr ? vk_color_record(cb, slot, src, fmt, rect) : VK_NULL_HANDLE;
+    const int grect[4] = {0, 0, cw, ch};
+    const int *prect = rect;
+    if (graded) src = graded, fmt = VK_FORMAT_R16G16B16A16_SFLOAT, w = cw, h = ch, prect = grect, cx = cy = 0;
     // FSR (MKW_UPSCALER) when the picture's rectangle is larger than the crop; else the bilinear blit
     uint32_t crumb = src ? vk_crumb_op(cb, "present scaling", (uint32_t)to[2], (uint32_t)to[3]) : 0;
-    int fsr = src && general && vk_fsr_record(cb, slot, src, fmt, w, h, rect, dst, to[0], to[1], (uint32_t)to[2], (uint32_t)to[3]);
+    int fsr = src && general && vk_fsr_record(cb, slot, src, fmt, w, h, prect, dst, to[0], to[1], (uint32_t)to[2], (uint32_t)to[3]);
     g_scaler = fsr ? 2 : cw != to[2] || ch != to[3];
     if (src && !fsr) {
         if (general)   // a GENERAL source (vk_texture.c images): earlier submissions' writes become visible to the blit here
@@ -835,6 +841,7 @@ void gfx_window_release_vk(void) {
         g_flip_n = 0;   // their blits are done (device idle); the swapchain goes away unpresented
         menu_vk_release();
         vk_fsr_release();
+        vk_color_release();
         vk_hdr_ui_release();
         vk_fg_release();
         free_capture();

@@ -269,7 +269,6 @@ msgid "could not save settings"
 msgstr "impossible d'enregistrer les paramètres"
 
 #. printf format: keep every %... conversion, in the same order.
-#, fuzzy
 msgctxt "UI_MENU_VERSION"
 msgid "PC %s  ·  update %s"
 msgstr ""
@@ -2266,6 +2265,70 @@ msgstr ""
 
 msgctxt "UI_MENU_HINT_BACK"
 msgid "Back"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR"
+msgid "Colour"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_PRESET"
+msgid "Colour profile"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_PRESET_DESC"
+msgid ""
+"Sets the four values below. Vivid: more contrast and saturation, shadows opened a little (made "
+"for OLED screens). Clarity: a little more contrast, saturation and brightness. Moving a value "
+"makes the profile Custom. The HUD changes with the picture; this menu does not. Not used on an "
+"HDR display."
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_DEFAULT"
+msgid "Game's own"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_VIVID"
+msgid "Vivid (OLED)"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_CLARITY"
+msgid "Clarity"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_CUSTOM"
+msgid "Custom"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_BRIGHTNESS"
+msgid "Brightness"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_BRIGHTNESS_DESC"
+msgid "Added to every colour; 0 leaves it."
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_CONTRAST"
+msgid "Contrast"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_CONTRAST_DESC"
+msgid "Spreads colours away from mid-grey (above 100 %) or towards it; 100 % leaves them."
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_SATURATION"
+msgid "Saturation"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_SATURATION_DESC"
+msgid "Colour strength against grey; 100 % leaves it."
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_GAMMA"
+msgid "Gamma"
+msgstr ""
+
+msgctxt "UI_MENU_COLOR_GAMMA_DESC"
+msgid "Below 1 brightens dark and middle tones, above 1 darkens them; 1 leaves them."
 msgstr ""
 
 msgctxt "UI_LAUNCH_PLAYERS"

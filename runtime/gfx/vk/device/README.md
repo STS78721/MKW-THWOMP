@@ -15,6 +15,7 @@ submits and fences, present.
 | `vk_sync.c` | Submits, fences, timeline semaphore and completion thread |
 | `vk_sync_ts.c`, `vk_sync_ts.h` | GPU time of each part of a submit (`MKW_TRACE=perf`), for `vk_sync.c` |
 | `vk_fsr.c` | AMD FSR 1 at present time when the window is larger than the game's output |
+| `vk_color.c` | THWOMP: the colour profiles (brightness, contrast, saturation, gamma) on the present, before FSR or the blit (from STS78721's DKB build) |
 | `vk_hdr_ui.c` | The F1 menu on an HDR10 swapchain: drawn into an RGBA8 image and blended onto the game's PQ picture at the system's paper white (`runtime/shaders/hdr_ui.frag`; from totk-pc-recomp, MIT) |
 | `vk_framegen.c` | Frame generation (`MKW_FRAMEGEN`): frames made between the game's from its last two (optical flow), on the present thread and the GPU; the present thread shows them evenly over the game's frame time |
 | `vk_guard.c` | `MKW_GPU_GUARD=1`: stops with `rt_fatal` before submitting what would fault the GPU (an object destroyed or queued for destruction before the last part that names it, a bind skipped by a cache the command buffer does not have, a pushed buffer address of 0); `MKW_GPU_GUARD_TEST=bind\|free` commits one on purpose |

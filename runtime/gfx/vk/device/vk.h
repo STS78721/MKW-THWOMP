@@ -98,6 +98,10 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
 int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int sw, int sh, const int crop[4],
                   VkImage dst, int dx, int dy, uint32_t dw, uint32_t dh);
 void vk_fsr_release(void);   // before the device goes away
+// THWOMP colour profiles (vk_color.c): the game's crop graded into an RGBA16F image of its size, or VK_NULL_HANDLE when
+// every MKW_COLOR_* value is "unchanged" (the present then reads the game's image as before)
+VkImage vk_color_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]);
+void vk_color_release(void);   // before the device goes away
 // The F1 menu on an HDR10 swapchain (vk_hdr_ui.c): vk_hdr_ui_target is the RGBA8 image of w x h the menu draws into
 // (COLOR_ATTACHMENT_OPTIMAL, to be cleared to 0; VK_NULL_HANDLE when it cannot be made), vk_hdr_ui_compose blends it
 // onto dst_view, a swapchain image of format fmt in COLOR_ATTACHMENT_OPTIMAL, at the system's paper white.
