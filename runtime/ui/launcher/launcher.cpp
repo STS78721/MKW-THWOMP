@@ -288,7 +288,7 @@ static void lastrun_row(float bw) {
     LastRun r = lastrun_state();
     if (r.kind == LASTRUN_NONE) return;
     const char *repo = getenv("MKW_UPDATE_REPO");
-    if (!repo || !*repo) repo = "adriadam10/mkw-recomp";
+    if (!repo || !*repo) repo = "STS78721/MKW-THWOMP";   // THWOMP: its releases and issues
     char text[700], button[160], url[300];
     url[0] = 0;
     if (r.kind == LASTRUN_KNOWN) {

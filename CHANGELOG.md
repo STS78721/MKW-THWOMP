@@ -4,6 +4,72 @@ Each version's section is that release's notes: `tools/build/notes.py` puts it i
 updating, known issues, reporting) for the GitHub release. A section has a summary paragraph, `### Changes` (each with
 its issue, #N), `### Tested` (what was run from the packages before publishing) and optionally `### Known issues`.
 
+## MKW-THWOMP 0.1.1
+
+THWOMP's releases come first, in the Pearl Abyss style of its other projects (■ sections, ○ groups); the GitHub release carries the same text. Upstream mkw-recomp's own notes follow from 0.1.12 down.
+
+MKW-THWOMP 0.1.1
+
+MKW-THWOMP now runs on mkw-recomp, the port that holds 60 fps in races. Trees and the world no longer pop in while you drive, lights no longer shine through rock, and lamp posts and guard rails collide again. The new setup installs the game in one step, in THWOMP's own dark look.
+
+■ Major Updates
+
+- Rebuilt MKW-THWOMP on mkw-recomp by Adrià (github.com/adriadam10/mkw-recomp, MIT). Races hold 60 fps at 3840×2160 on an RTX 5070 Ti with 4096 shadows.
+- Added MKW-THWOMP Setup (SteelTemple-MKW-THWOMP-0.1.1-Full-Setup-Wizard.exe). It installs the game in one window in the dark theme: choose a folder and the shortcuts, and it adds Mario Kart World PC to Windows' installed apps with its own uninstaller. No administrator rights are needed.
+- All 11,604 of the game's shader programs are now translated when the game is set up, before you race. Areas you drive into no longer wait for their shaders.
+
+■ New & Improvements
+
+○ Settings Menu
+
+- Brought back the Switch-2-style settings menu (F1 or Esc): a title bar, the categories in a list on the left with L and R to switch, and A and B hints at the bottom. The categories are Screen, Graphics, Game, Sound, Controls, Menu, Advanced and Hacks.
+- Added Menu theme to the Menu category. Dark, with red accents, is the default. Light is the Switch 2 system settings look with a cyan selection. A change applies at once.
+- Changed the FPS performance overlay to one panel in the top right corner: FPS, the 1% and 0.1% lows over the last 1,000 frames, and the frame time.
+
+○ Launcher
+
+- Restyled the start screen in THWOMP's look: the MKW icon, a red Play button and a red chequered flag behind it. It follows the menu theme.
+- Changed the update check to MKW-THWOMP's own releases. The start screen offers the next MKW-THWOMP update and installs it. Bug reports from the start screen now go to MKW-THWOMP.
+
+○ Controls
+
+- Added vibration strength and curve, trigger vibration, and Switch 2 controllers over Bluetooth to the Controls category, next to button rebinding.
+- Added motion controls and local multiplayer with one controller per player.
+
+○ Graphics
+
+- Added frame generation, AMD FSR 1, quality presets, HDR and ultrawide picture shapes to the Screen and Graphics categories. All of them are Off or at the console's look by default.
+
+○ For Modders and Testers
+
+- Added the Mods page to the start screen: mods from a zip or a folder, or from GameBanana.
+- MKW-THWOMP now builds natively on Windows: tools/build/windeps.py, build.py and dist.py run without Linux, and tools/installer/build.py makes the setup and the release zips.
+
+■ Bug Fixes
+
+- Fixed the issue where trees and parts of the world took a second or two to appear while driving.
+- Fixed the issue where lamp light showed through rock and walls.
+- Fixed the issue where some lamp posts and guard rails had no collision and could not be knocked over or ground on.
+- Fixed the issue where races ran in the low to mid 40s fps.
+- Fixed the issue where Crown City pedestrians and some animated objects could show as blue sheets or stretch.
+- Fixed the issue where NVIDIA graphics cards could lose the device at the loading screen or in some races.
+- Fixed the issue where the window, the start screen and the log named the game "MKW Recomp". They now say Mario Kart World PC.
+
+■ Other
+
+- Game versions 1.0.0 and the 1.8.0 update are supported. Online play is not.
+- The dark theme is the default for the menu, the start screen and the setup.
+- MKW-THWOMP is now under the MIT License, like mkw-recomp. The previous MKW-THWOMP build remains in the repository's history.
+
+■ Update
+
+- New install: run SteelTemple-MKW-THWOMP-0.1.1-Full-Setup-Wizard.exe, then open the start screen. Choose Game files, choose your dump, press Set up (about 5 minutes on an 8-core CPU), then press Play.
+- Portable: extract SteelTemple-MKW-THWOMP-0.1.1-Portable-StandAlone.zip anywhere, run mkw.exe and set the game up the same way.
+- From an MKW-THWOMP build before 0.1.1: install 0.1.1 fresh and set it up once from your dump. The old build's folder is not touched.
+- Later updates: the start screen offers them, or extract SteelTemple-MKW-THWOMP-<version>-Update.zip over the game folder.
+
+Your dump, saves, and personal settings stay on your PC.
+
 ## 0.1.12
 
 ### Changes

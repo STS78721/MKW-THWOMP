@@ -13,6 +13,7 @@ default, or `MKW_GAME=<dir>`, with `exefs/` and `romfs/` inside) and write to `b
 | [i18n/](i18n/README.md) | The menu's text catalogs: from `i18n/*.po` to the C the runtime compiles |
 | [github/](github/README.md) | Issue moderation: release and GPU labels, missing logs, known errors, replies that close |
 | [gpu/](gpu/README.md) | NVN2 functions: which ones the game uses, their address in the driver and object sizes |
+| [installer/](installer/README.md) | THWOMP: the Windows installer in the start screen's look, and the release assets |
 | [imagen/](imagen/README.md) | Flight recorder thumbnails, contact sheets and image comparison |
 | [romfs/](romfs/README.md) | RomFS overlays: the game's internal resolutions |
 | [prepare/](prepare/README.md) | Builds the game on the player's machine from their copy (started by the start screen) |

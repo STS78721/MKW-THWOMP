@@ -138,6 +138,20 @@ flowchart LR
 Developer documentation: [AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md), [docs/](docs/README.md) and the
 README in every folder.
 
+| Folder | Contents |
+|---|---|
+| [recomp/](recomp/README.md) | The generator: AArch64 → C |
+| [runtime/](runtime/README.md) | Kernel, memory, SDK replacements, NVN 2 over Vulkan, audio, input, menus and the start screen |
+| [sm86/](sm86/README.md) | The shader translator: SM86 SASS → GLSL → SPIR-V |
+| [i18n/](i18n/README.md) | The menu, start screen and setup texts in every language (gettext `.po`) |
+| [tools/](tools/README.md) | Analysis, setup, build, the installer, game runs and diagnostics |
+| [tests/](tests/README.md) | Tests without the game or a GPU |
+| [docs/](docs/README.md) | Research, sources and performance |
+| `.github/` | CI, release, issue and pull request templates |
+
+At the root: `pyproject.toml` and `uv.lock` (the Python environment of the tools), `.gitignore`, `LICENSE`,
+`CONTRIBUTING.md`, `CHANGELOG.md` (each release's notes, THWOMP's first) and `AGENTS.md`.
+
 ## 🙏 Credits & licence
 
 MKW-THWOMP is a fork of **[mkw-recomp](https://github.com/adriadam10/mkw-recomp)** by Adrià (MIT): the recompiler,
