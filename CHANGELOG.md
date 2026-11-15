@@ -4,9 +4,47 @@ Each version's section is that release's notes: `tools/build/notes.py` puts it i
 updating, known issues, reporting) for the GitHub release. A section has a summary paragraph, `### Changes` (each with
 its issue, #N), `### Tested` (what was run from the packages before publishing) and optionally `### Known issues`.
 
-## MKW-THWOMP 0.1.1
+## MKW-THWOMP 0.1.2
 
 THWOMP's releases come first, in the Pearl Abyss style of its other projects (■ sections, ○ groups); the GitHub release carries the same text. Upstream mkw-recomp's own notes follow from 0.1.12 down.
+
+MKW-THWOMP 0.1.2
+
+Colour profiles are here: make the picture punchier for an OLED screen, or tune brightness, contrast, saturation and gamma yourself. The Menu theme row now shows the theme you actually use.
+
+■ Major Updates
+
+- Added colour profiles to the Graphics category (F1 or Esc, Graphics, Colour). Choose Game's own, Vivid (OLED), Clarity or Custom. Vivid adds contrast and saturation and opens the shadows a little, made for OLED screens. Clarity adds a little contrast, saturation and brightness.
+
+■ New & Improvements
+
+○ Settings Menu
+
+- Added Brightness, Contrast, Saturation and Gamma under the colour profile. Moving one of them makes the profile Custom. A change shows at once.
+- The colour profile changes the game's picture and its HUD, frame generation's frames included. The settings menu keeps its own colours.
+
+○ Performance
+
+- At Game's own, the colour step is skipped entirely, so the picture costs exactly what it did before.
+
+■ Bug Fixes
+
+- Fixed the issue where Menu theme showed Light while the dark theme was in use.
+
+■ Other
+
+- Colour profiles are not used on an HDR display.
+- The dark theme stays the default for the menu, the start screen and the setup.
+
+■ Update
+
+- From 0.1.1: open the start screen. It offers 0.1.2 and installs it. You can also extract SteelTemple-MKW-THWOMP-0.1.2-Update.zip over the game folder.
+- New install: run SteelTemple-MKW-THWOMP-0.1.2-Full-Setup-Wizard.exe, then open the start screen. Choose Game files, choose your dump, press Set up (about 5 minutes on an 8-core CPU), then press Play.
+- Portable: extract SteelTemple-MKW-THWOMP-0.1.2-Portable-StandAlone.zip anywhere, run mkw.exe and set the game up the same way.
+
+Your dump, saves, and personal settings stay on your PC.
+
+## MKW-THWOMP 0.1.1
 
 MKW-THWOMP 0.1.1
 
