@@ -1,5 +1,8 @@
 # github
 
+> THWOMP: this fork does not run these: `issues.yml`, `archive.yml` and `labeler.yml` were removed; the scripts stay
+> for reference.
+
 Issue moderation (`moderate.py`, `classify.py`), run by `.github/workflows/issues.yml` on each issue event, once a day and on each release. The copy to the Internet Archive (`archive.py`) runs from `.github/workflows/archive.yml` once a day.
 
 | File | Contents |
