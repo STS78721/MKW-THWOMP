@@ -142,7 +142,7 @@ static void log_open(int game) {
     // the port's version as git describe gave it at build time (tools/build/build.py port_version): "-dirty" or a
     // commit no release has tells a report from a build with local changes (#88 on 11/11/2026: a log line of a
     // transcoder that is in no commit)
-    rt_log("log: %s (MKW Recomp %s)", g_log_path, rt_port_version);
+    rt_log("log: %s (Mario Kart World PC %s)", g_log_path, rt_port_version);
 }
 
 static void parse_trace(void) {

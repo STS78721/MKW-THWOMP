@@ -268,9 +268,10 @@ msgid "could not save settings"
 msgstr "no se pudo guardar la configuración"
 
 #. printf format: keep every %... conversion, in the same order.
+#, fuzzy
 msgctxt "UI_MENU_VERSION"
-msgid "MKW Recomp %s, game %s"
-msgstr "MKW Recomp %s, juego %s"
+msgid "PC %s  ·  update %s"
+msgstr ""
 
 msgctxt "UI_MENU_FULLSCREEN"
 msgid "Fullscreen"
@@ -2230,6 +2231,30 @@ msgid ""
 msgstr ""
 "Al arrancar, pregunta a GitHub si hay una versión más nueva del port y la ofrece en la pantalla "
 "de inicio (unos segundos como mucho, nada sin conexión)."
+
+msgctxt "UI_MENU_THEME"
+msgid "Menu theme"
+msgstr ""
+
+msgctxt "UI_MENU_THEME_DESC"
+msgid "The look of this menu: Light, like the Switch 2 system settings, or Dark, with red accents."
+msgstr ""
+
+msgctxt "UI_MENU_THEME_LIGHT"
+msgid "Light"
+msgstr ""
+
+msgctxt "UI_MENU_THEME_DARK"
+msgid "Dark"
+msgstr ""
+
+msgctxt "UI_MENU_HINT_OK"
+msgid "OK"
+msgstr ""
+
+msgctxt "UI_MENU_HINT_BACK"
+msgid "Back"
+msgstr ""
 
 msgctxt "UI_LAUNCH_PLAYERS"
 msgid "Profiles"

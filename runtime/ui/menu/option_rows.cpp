@@ -14,6 +14,7 @@
 #include "imgui_internal.h"   // SetKeyOwner, SetFocusID, NavCursorVisible
 
 #include "ui/menu/option_rows.h"
+#include "ui/menu/menu_theme.h"
 #include "ui/glyphs/pad_icons.h"
 
 extern "C" {
@@ -35,9 +36,23 @@ static const OptLook kMenuLook = {
     IM_COL32(237, 194, 84, 255), IM_COL32(242, 168, 102, 255),                                    // group, warn
     9,                                                                                             // radius
 };
-static const OptLook *g_look = &kMenuLook;
+// THWOMP: the in-game menu draws in the Mario Kart World PC theme (menu_theme.h), filled by opt_menu_look_refresh;
+// kMenuLook (upstream's gold on green) stays as the fallback before the first refresh.
+static OptLook g_menu_look = kMenuLook;
+static const OptLook *g_look = &g_menu_look;
 
-void opt_look(const OptLook *l) { g_look = l ? l : &kMenuLook; }
+void opt_look(const OptLook *l) { g_look = l ? l : &g_menu_look; }
+
+void opt_menu_look_refresh(void) {
+    using namespace mkw_theme;
+    g_menu_look = OptLook{kAccent, kAccentSoft, kDivider, kTextDim, kTextOff, kTextSoft,
+                          kText, kAccentText, kTextSoft, kAccentText, kTextDim,
+                          IM_COL32(0, 0, 0, 0), kRowSel, kDivider, kDivider, kDivider,
+                          kAccentText, kWarn, 10, kHelp, true};
+}
+
+static float g_right;   // opt_reserve_right
+void opt_reserve_right(float w) { g_right = w; }
 
 static float g_scale = 1;
 static bool g_focus_req, g_take_first;   // opt_focus_first: requested / this page's first row takes it
@@ -82,6 +97,7 @@ void opt_begin(const char *id, float scale) {
     g_hover.text[0] = g_focus.text[0] = g_first.text[0] = 0;
     ImVec2 avail = ImGui::GetContentRegionAvail();
     avail.y -= g_bottom;
+    avail.x -= g_right;
     ImGui::PushID(id);
     ImGui::BeginChild("##rows", ImVec2(avail.x * 0.58f, avail.y), ImGuiChildFlags_NavFlattened);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 5 * scale));
@@ -105,9 +121,14 @@ void opt_end(void) {
     float gap = 24 * g_scale;
     ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x + gap * 0.5f, p.y), ImVec2(p.x + gap * 0.5f, p.y + avail.y),
                                         g_look->divider, 1.0f);
+    if (g_look->desc_fill) {   // THWOMP: the description as a card
+        ImVec2 a(p.x + gap, p.y), b(p.x + avail.x - g_right, p.y + fminf(avail.y, 260 * g_scale));
+        ImGui::GetWindowDrawList()->AddRectFilled(a, b, g_look->desc_fill, 10 * g_scale);
+        ImGui::GetWindowDrawList()->AddRect(a, b, g_look->divider, 10 * g_scale);
+    }
     ImGui::SetCursorScreenPos(ImVec2(p.x + gap, p.y));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * g_scale, 6 * g_scale));
-    ImGui::BeginChild("##desc", ImVec2(0, avail.y), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoNav);
+    ImGui::BeginChild("##desc", ImVec2(-g_right, avail.y), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoNav);
     ImGui::PopStyleVar();
     ImGui::PushTextWrapPos(0);
     ImGui::TextUnformatted(g_shown.text);
@@ -170,10 +191,15 @@ static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v)
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImFont *font = ImGui::GetFont();
     float r = g_look->radius * g_scale, pad = 16 * g_scale, small = fs * 0.72f;
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), hov || foc ? g_look->fill_hot : g_look->fill, r);
-    dl->AddRect(p, ImVec2(p.x + w, p.y + h),
-                hov || foc ? (off ? g_look->select_off : g_look->select) : off ? g_look->border_off : g_look->border, r, 0,
-                hov || foc ? 2.0f : 1.0f);
+    if (g_look->underline && !hov && !foc) {   // THWOMP: a list row at rest, the Switch 2 settings' divider under it
+        dl->AddLine(ImVec2(p.x + pad * 0.5f, p.y + h - 0.5f), ImVec2(p.x + w - pad * 0.5f, p.y + h - 0.5f),
+                    g_look->border, 1.0f);
+    } else {
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), hov || foc ? g_look->fill_hot : g_look->fill, r);
+        dl->AddRect(p, ImVec2(p.x + w, p.y + h),
+                    hov || foc ? (off ? g_look->select_off : g_look->select) : off ? g_look->border_off : g_look->border,
+                    r, 0, hov || foc ? (g_look->underline ? 2.5f : 2.0f) : 1.0f);
+    }
     float ty = p.y + fs * 0.25f, ny = p.y + fs * 1.3f;   // the label line and the note line under it
     float right = p.x + w - pad;                         // the value's right edge
     float value_left = right;

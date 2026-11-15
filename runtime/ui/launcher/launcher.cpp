@@ -408,7 +408,7 @@ static void page_main(float w, float h) {
     fg->AddCircleFilled(ImVec2(left + r, y + lh * 0.5f), r, ready ? LOOK_OK : LOOK_WARN, 16);
     fg->AddText(ImVec2(left + r * 2 + 10 * s, y), ready ? LOOK_HEADING : LOOK_WARN, state);
     char ver[96];
-    snprintf(ver, sizeof ver, "MKW Recomp %s", rt_port_version);
+    snprintf(ver, sizeof ver, "Mario Kart World PC %s", rt_port_version);
     const char *note = menu_text(UI_LAUNCH_NO_GAME_DATA);
     float right = w - 56 * s;
     fg->AddText(ImVec2(right - ImGui::CalcTextSize(ver).x, y), LOOK_DIM, ver);
@@ -1095,7 +1095,7 @@ extern "C" int launcher_run(void) {
         const char *appimage = getenv("APPIMAGE");   // Linux: the AppImage, not the mounted copy inside it
         if (appimage && *appimage) snprintf(exe, sizeof exe, "%s", appimage);
         else if (!plat_exe_path(exe, sizeof exe)) exe[0] = 0;
-        if (exe[0] && !plat_url_scheme("mkw-recomp", "MKW Recomp mods", exe, "--gb-install"))
+        if (exe[0] && !plat_url_scheme("mkw-recomp", "Mario Kart World PC mods", exe, "--gb-install"))
             rt_log("launcher: the mkw-recomp: links (GameBanana 1-Click) could not be registered");
     }
     int updated = update_just_installed(L.exe_dir, L.updated, sizeof L.updated);

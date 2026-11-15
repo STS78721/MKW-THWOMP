@@ -16,7 +16,7 @@ typedef enum {
     UI_MENU_AFTER_RESTART,    // note on a setting that is read at start
     UI_MENU_SET_BY_ENV,       // note on a setting an environment variable fixes
     UI_MENU_SAVE_FAILED,
-    UI_MENU_VERSION,          // "MKW Recomp %s, game %s": the port version and the game update, beside the title
+    UI_MENU_VERSION,          // "PC %s  ·  update %s": the port version and the game update, beside the title
 
     // Screen
     UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC,
@@ -211,6 +211,7 @@ typedef enum {
     UI_LAUNCH_LASTRUN_KNOWN, UI_LAUNCH_LASTRUN_FIXED, UI_LAUNCH_LASTRUN_CRASH, UI_LAUNCH_LASTRUN_OPEN,
     UI_LAUNCH_LASTRUN_REPORT, UI_LAUNCH_LASTRUN_DISMISS,
     UI_MENU_UPDATE_CHECK, UI_MENU_UPDATE_CHECK_DESC,
+    UI_MENU_THEME, UI_MENU_THEME_DESC, UI_MENU_THEME_LIGHT, UI_MENU_THEME_DARK, UI_MENU_HINT_OK, UI_MENU_HINT_BACK,   // THWOMP: the menu theme
     // the Profiles page (ui/launcher/launcher_players.cpp): PLAYER "...: %s" (the main page's row, the name),
     // CONFIRM "... %s ..." (the name)
     UI_LAUNCH_PLAYERS, UI_LAUNCH_PLAYER, UI_PLAYER_NOTE, UI_PLAYER_NAME_HINT, UI_PLAYER_CHOOSE, UI_PLAYER_CHOSEN,

@@ -247,7 +247,7 @@ msgstr ""
 
 #. printf format: keep every %... conversion, in the same order.
 msgctxt "UI_MENU_VERSION"
-msgid "MKW Recomp %s, game %s"
+msgid "PC %s  ·  update %s"
 msgstr ""
 
 msgctxt "UI_MENU_FULLSCREEN"
@@ -2091,6 +2091,31 @@ msgctxt "UI_MENU_UPDATE_CHECK_DESC"
 msgid ""
 "At start, ask GitHub for a newer release of the port and offer it on the start screen (a few "
 "seconds at most, nothing offline)."
+msgstr ""
+
+msgctxt "UI_MENU_THEME"
+msgid "Menu theme"
+msgstr ""
+
+msgctxt "UI_MENU_THEME_DESC"
+msgid ""
+"The look of this menu: Light, like the Switch 2 system settings, or Dark, with red accents."
+msgstr ""
+
+msgctxt "UI_MENU_THEME_LIGHT"
+msgid "Light"
+msgstr ""
+
+msgctxt "UI_MENU_THEME_DARK"
+msgid "Dark"
+msgstr ""
+
+msgctxt "UI_MENU_HINT_OK"
+msgid "OK"
+msgstr ""
+
+msgctxt "UI_MENU_HINT_BACK"
+msgid "Back"
 msgstr ""
 
 msgctxt "UI_LAUNCH_PLAYERS"

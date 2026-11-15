@@ -325,6 +325,8 @@ static void tab_menu(float scale) {
         UI_MENU_LANGNAME_TH,
     };
     opt_choice("MKW_MENU_LANG", UI_MENU_MENU_LANG, langs, sizeof langs / sizeof *langs, UI_MENU_MENU_LANG_DESC);
+    static const UiTextId themes[] = {UI_MENU_THEME_LIGHT, UI_MENU_THEME_DARK};   // THWOMP: cfg.c's MENU_THEME order
+    opt_choice("MKW_MENU_THEME", UI_MENU_THEME, themes, 2, UI_MENU_THEME_DESC);
     opt_toggle("MKW_UPDATE_CHECK", UI_MENU_UPDATE_CHECK, UI_MENU_UPDATE_CHECK_DESC);   // ui/launcher/launcher_update.cpp
     opt_end();
 }
@@ -548,6 +550,37 @@ void settings_tabs(float scale, float bottom) {
         }
         g_tab_request = -1;
         ImGui::EndTabBar();
+    }
+}
+
+const char *settings_tab_label(int tab) { return menu_text(kTabNames[tab]); }
+int settings_tab_shown(void) { return g_tab_request >= 0 ? g_tab_request : g_tab; }
+
+void settings_page(float scale, float bottom) {
+    int step = settings_modal()                                                                          ? 0
+             : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
+             : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1
+                                                                                                         : 0;
+    if (step) g_tab_request = (g_tab + step + TAB_COUNT) % TAB_COUNT;
+    if (g_tab_request >= 0) {
+        g_tab = g_tab_request;
+        g_focus_page = g_tab_request;   // the new page's first row takes the cursor
+        g_tab_request = -1;
+    }
+    if (g_focus_page == g_tab) {
+        opt_focus_first();
+        g_focus_page = -1;
+    }
+    opt_reserve_bottom(bottom);
+    switch (g_tab) {
+    case TAB_SCREEN: tab_screen(scale); break;
+    case TAB_GRAPHICS: tab_graphics(scale); break;
+    case TAB_GAME: tab_game(scale); break;
+    case TAB_SOUND: tab_sound(scale); break;
+    case TAB_CONTROLS: tab_controls(scale); break;
+    case TAB_MENU: tab_menu(scale); break;
+    case TAB_ADVANCED: tab_advanced(scale); break;
+    case TAB_HACKS: tab_hacks(scale); break;
     }
 }
 

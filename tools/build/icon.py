@@ -7,6 +7,11 @@ writes the same drawing as vector shapes instead (the repo's logo, docs/logo.svg
 app_icon_set(SDL_Window *), which gives the window a 128-pixel copy (build.py, every target): Wayland compositors with
 xdg_toplevel_icon (KWin) show it in the taskbar instead of a generic icon when no desktop file matches the app id.
 
+THWOMP: when runtime/platform/thwomp_icon.png is there (the Mario Kart World PC icon: a red tile, "MKW" and a
+chequered band, 512 px RGBA, drawn by the old tools/make_icon.py), every raster output is that picture scaled down
+(area mean) instead of the flag; the .svg logo stays the flag. The PNG is read here (zlib and the five row filters), so
+the build needs no imaging library.
+
 Usage: uv run tools/build/icon.py OUT.ico | OUT.svg | OUT.png | OUT.c
 """
 
@@ -39,8 +44,72 @@ def coverage(x: float, y: float) -> tuple[int, int, int, int]:
     return (*[int(a + (b - a) * t) for a, b in zip(BG_TOP, BG_BOTTOM)], 255)
 
 
+ART = Path(__file__).resolve().parents[2] / "runtime/platform/thwomp_icon.png"
+
+
+def read_png(path: Path) -> tuple[int, bytes]:
+    """(size, RGBA pixels) of a square 8-bit RGBA PNG without interlacing."""
+    data = path.read_bytes()
+    pos, idat, w = 8, b"", 0
+    while pos < len(data):
+        n, kind = struct.unpack(">I4s", data[pos : pos + 8])
+        body = data[pos + 8 : pos + 8 + n]
+        if kind == b"IHDR":
+            w, h, depth, ctype, _, _, inter = struct.unpack(">IIBBBBB", body)
+            if (w, depth, ctype, inter) != (h, 8, 6, 0):
+                raise SystemExit(f"{path}: a square 8-bit RGBA PNG without interlacing is needed")
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + n
+    raw, stride, out, prev = zlib.decompress(idat), w * 4, bytearray(), bytearray(w * 4)
+    for y in range(w):
+        f, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1 : (y + 1) * (stride + 1)])
+        for i in range(stride):
+            a = line[i - 4] if i >= 4 else 0
+            b = prev[i]
+            c = prev[i - 4] if i >= 4 else 0
+            if f == 1:
+                line[i] = (line[i] + a) & 255
+            elif f == 2:
+                line[i] = (line[i] + b) & 255
+            elif f == 3:
+                line[i] = (line[i] + (a + b) // 2) & 255
+            elif f == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        out += line
+        prev = line
+    return w, bytes(out)
+
+
+def render_art(size: int) -> bytes:
+    """RGBA rows of the THWOMP icon at size: each pixel the alpha-weighted mean of the source pixels it covers."""
+    n, src = read_png(ART)
+    rows = bytearray()
+    for py in range(size):
+        rows.append(0)
+        y0, y1 = py * n // size, max(py * n // size + 1, (py + 1) * n // size)
+        for px in range(size):
+            x0, x1 = px * n // size, max(px * n // size + 1, (px + 1) * n // size)
+            acc = [0, 0, 0, 0]
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    i = (y * n + x) * 4
+                    a = src[i + 3]
+                    acc[0] += src[i] * a
+                    acc[1] += src[i + 1] * a
+                    acc[2] += src[i + 2] * a
+                    acc[3] += a
+            a, k = acc[3], (y1 - y0) * (x1 - x0)
+            rows += bytes([acc[0] // a, acc[1] // a, acc[2] // a, a // k] if a else [0, 0, 0, 0])
+    return bytes(rows)
+
+
 def render(size: int, ss: int = 4) -> bytes:
     """RGBA rows, each pixel the mean of ss x ss samples (antialiasing)."""
+    if ART.exists():
+        return render_art(size)
     rows = bytearray()
     for py in range(size):
         rows.append(0)   # PNG filter: none

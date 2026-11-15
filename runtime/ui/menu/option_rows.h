@@ -29,9 +29,13 @@ struct OptLook {
     ImU32 cell_off;             // the border of a binding cell that takes no input
     ImU32 group, warn;          // opt_group's heading, opt_text's warning
     float radius;               // a row's corners, at 1080 lines
+    ImU32 desc_fill;            // THWOMP: the description pane's card (0: none)
+    bool underline;             // THWOMP: rows at rest are a list (a divider under each), not filled cards
 };
 // The rows' look from now on; NULL: the in-game menu's. Kept by pointer: l must outlive the rows drawn with it.
 void opt_look(const OptLook *l);
+void opt_menu_look_refresh(void);   // THWOMP: the in-game menu's look from the menu theme (menu_look_style)
+void opt_reserve_right(float w);    // THWOMP: kept free right of the page (the menu's margin)
 
 void opt_begin(const char *id, float scale);
 void opt_end(void);

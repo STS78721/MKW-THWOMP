@@ -10,7 +10,9 @@
 // SavageWindRecomp's runtime/ui/menu.mm (https://github.com/Revivedx/SavageWindRecomp @
 // 575ad88e02f9a89a9a885d90039d48af33c982f4, MIT, Copyright (c) 2026 Revivedx and the Savage Wind Recomp contributors,
 // Copyright (c) 2026 Peiikai); the pages are rows of option_rows.cpp.
+#include <algorithm>
 #include <atomic>
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +23,7 @@
 #include "backends/imgui_impl_vulkan.h"
 #include "ui/menu/binds_page.h"
 #include "ui/menu/menu_look.h"
+#include "ui/menu/menu_theme.h"
 #include "ui/menu/menu_notice.h"
 #include "ui/menu/settings_tabs.h"
 #include "ui/menu/option_rows.h"
@@ -296,39 +299,130 @@ static void test_apply_sets(uint64_t frame) {
 
 // ---- the window: title, tabs (L / R or Q / E switch), the page, and the bottom row with "Continue" and "Quit game".
 // B on the gamepad and Esc close it.
+// THWOMP: the Mario Kart World PC menu (ui/menu/menu_theme.h): a title bar, the categories in a list on the left, the
+// page, and the A / B hints with Continue and Quit at the bottom, in the light or dark theme.
+static void hint_glyph(ImDrawList *dl, ImVec2 c, float rad, const char *letter) {
+    using namespace mkw_theme;
+    dl->AddCircleFilled(c, rad, kText);
+    ImFont *font = ImGui::GetFont();
+    float fs = rad * 1.25f;
+    ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0, letter);
+    dl->AddText(font, fs, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), kHeader, letter);
+}
+
+// A pill glyph (L, R) for the category switch.
+static float hint_pill(ImDrawList *dl, ImVec2 p, float h, const char *letter) {
+    using namespace mkw_theme;
+    ImFont *font = ImGui::GetFont();
+    float fs = h * 0.62f;
+    ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0, letter);
+    float w = ts.x + h * 0.9f;
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), kText, h * 0.5f);
+    dl->AddText(font, fs, ImVec2(p.x + (w - ts.x) * 0.5f, p.y + (h - ts.y) * 0.5f), kHeader, letter);
+    return w;
+}
+
 static void layout_menu(uint32_t w, uint32_t h, float scale) {
-    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, (float)h), IM_COL32(0, 0, 0, 120));
-    float ww = fminf(w * 0.88f, 1400 * scale), wh = fminf(h * 0.86f, 820 * scale);
+    using namespace mkw_theme;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, (float)h), kBackdrop);
+    float ww = fminf(w * 0.86f, 1500 * scale), wh = fminf(h * 0.88f, 880 * scale);
     ImGui::SetNextWindowPos(ImVec2(w * 0.5f, h * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ww, wh), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("##menu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                        ImGuiWindowFlags_NoSavedSettings);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", menu_text(UI_MENU_TITLE));
-    // the port version and the game update, right-aligned on the title line: what a bug report needs first
+                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImFont *font = ImGui::GetFont();
+    const ImGuiStyle &st = ImGui::GetStyle();
+    ImVec2 o = ImGui::GetWindowPos();
+    float W = ImGui::GetWindowWidth(), H = ImGui::GetWindowHeight(), fs = ImGui::GetFontSize();
+    float pad = 30 * scale, rounding = st.WindowRounding;
+    float head_h = floorf(fs * 3.1f), foot_h = floorf(fs * 3.3f), side_w = floorf(fminf(W * 0.26f, 380 * scale));
+    float body_y = o.y + head_h, body_h = H - head_h - foot_h;
+
+    // title bar: an accent bar, "Mario Kart World", the page title, and the version on the right
+    dl->AddRectFilled(o, ImVec2(o.x + W, o.y + head_h), kHeader, rounding, ImDrawFlags_RoundCornersTop);
+    dl->AddLine(ImVec2(o.x, o.y + head_h - 0.5f), ImVec2(o.x + W, o.y + head_h - 0.5f), kDivider, 1.0f);
+    float tfs = fs * 1.3f, ty = o.y + (head_h - tfs) * 0.5f;
+    dl->AddRectFilled(ImVec2(o.x + pad, o.y + head_h * 0.27f), ImVec2(o.x + pad + 6 * scale, o.y + head_h * 0.73f),
+                      kAccent, 3 * scale);
+    float tx = o.x + pad + 20 * scale;
+    const char *brand = "Mario Kart World";
+    dl->AddText(font, tfs, ImVec2(tx, ty), kText, brand);
+    tx += font->CalcTextSizeA(tfs, FLT_MAX, 0, brand).x + 14 * scale;
+    dl->AddText(font, fs, ImVec2(tx, o.y + (head_h - fs) * 0.5f + fs * 0.08f), kTextSoft, menu_text(UI_MENU_TITLE));
+    // the port version and the game update, right-aligned: what a bug report needs first
     char game[16], version[96];
     int gv = rt_game_version();
     snprintf(game, sizeof game, "%d.%d.%d", gv / 100, gv / 10 % 10, gv % 10);
     snprintf(version, sizeof version, menu_text(UI_MENU_VERSION), rt_port_version, game);
-    ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
-    ImGui::TextDisabled("%s", version);
+    float vw = font->CalcTextSizeA(fs * 0.85f, FLT_MAX, 0, version).x;
+    dl->AddText(font, fs * 0.85f, ImVec2(o.x + W - pad - vw, o.y + (head_h - fs * 0.85f) * 0.5f), kTextDim, version);
 
-    const ImGuiStyle &st = ImGui::GetStyle();
-    float bottom = ImGui::GetFrameHeight() + st.ItemSpacing.y * 2;
-    settings_tabs(scale, bottom);
+    // category list
+    dl->AddRectFilled(ImVec2(o.x, body_y), ImVec2(o.x + side_w, body_y + body_h), kSidebar);
+    dl->AddLine(ImVec2(o.x + side_w - 0.5f, body_y), ImVec2(o.x + side_w - 0.5f, body_y + body_h), kDivider, 1.0f);
+    int shown = settings_tab_shown();
+    float gapy = 6 * scale, ih = floorf(fminf(fs * 2.4f, (body_h - 36 * scale - fs * 2.2f) / TAB_COUNT - gapy));
+    float ix = o.x + 14 * scale, iw = side_w - 28 * scale, iy = body_y + 18 * scale;
+    for (int k = 0; k < TAB_COUNT; k++) {
+        ImVec2 a(ix, iy + k * (ih + gapy)), b(ix + iw, a.y + ih);
+        ImGui::SetCursorScreenPos(a);
+        ImGui::PushID(k);
+        // not in the D-pad navigation (L / R switch pages); the mouse picks one
+        if (ImGui::InvisibleButton("##cat", ImVec2(iw, ih)) && !settings_modal()) settings_select(k);
+        bool hov = ImGui::IsItemHovered();
+        ImGui::PopID();
+        bool sel = k == shown;
+        if (sel) {
+            dl->AddRectFilled(a, b, kRowSel, 8 * scale);
+            dl->AddRectFilled(ImVec2(a.x + 8 * scale, a.y + ih * 0.22f), ImVec2(a.x + 13 * scale, b.y - ih * 0.22f),
+                              kAccent, 3 * scale);
+        } else if (hov) {
+            dl->AddRectFilled(a, b, kRowHover, 8 * scale);
+        }
+        dl->AddText(ImVec2(a.x + 26 * scale, a.y + (ih - fs) * 0.5f), sel ? kAccentText : kText, settings_tab_label(k));
+    }
+    // L / R under the list: the controller's page switch
+    {
+        float ph = fs * 1.1f, py = body_y + body_h - ph - 20 * scale, px = ix + 12 * scale;
+        px += hint_pill(dl, ImVec2(px, py), ph, "L") + 8 * scale;
+        hint_pill(dl, ImVec2(px, py), ph, "R");
+    }
 
-    // bottom row: the save status on the left, the two buttons on the right
-    ImGui::Spacing();
-    float y = ImGui::GetCursorPosY();
+    // the page: a direct NavFlattened child of this window (option_rows.cpp), so the D-pad moves between its rows and
+    // the footer buttons without a second child level in between
+    ImGui::SetCursorScreenPos(ImVec2(o.x + side_w + pad, body_y + pad * 0.7f));
+    opt_reserve_right(pad);
+    settings_page(scale, foot_h + pad * 0.5f);
+    opt_reserve_right(0);   // the start screen's pages keep their full width
+
+    // footer: the hints (or the save failure) on the left, "Continue" and "Quit game" on the right
+    float fy = o.y + H - foot_h;
+    dl->AddRectFilled(ImVec2(o.x, fy), ImVec2(o.x + W, o.y + H), kHeader, rounding, ImDrawFlags_RoundCornersBottom);
+    dl->AddLine(ImVec2(o.x, fy + 0.5f), ImVec2(o.x + W, fy + 0.5f), kDivider, 1.0f);
+    float cy = fy + foot_h * 0.5f, rad = fs * 0.62f, hx = o.x + pad;
     if (!cfg_last_save_ok()) {   // stays until a save succeeds; the settings hold for the session
-        ImGui::SetCursorPosY(y + st.FramePadding.y);
-        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "%s", menu_text(UI_MENU_SAVE_FAILED));
+        dl->AddText(ImVec2(hx, cy - fs * 0.5f), kWarn, menu_text(UI_MENU_SAVE_FAILED));
+    } else {
+        const struct { const char *glyph; UiTextId text; } hints[] = {
+            {"A", UI_MENU_HINT_OK}, {"B", UI_MENU_HINT_BACK}};
+        for (const auto &e : hints) {
+            hint_glyph(dl, ImVec2(hx + rad, cy), rad, e.glyph);
+            hx += rad * 2 + 8 * scale;
+            dl->AddText(ImVec2(hx, cy - fs * 0.5f), kTextSoft, menu_text(e.text));
+            hx += ImGui::CalcTextSize(menu_text(e.text)).x + 26 * scale;
+        }
     }
     const char *cont = menu_text(UI_MENU_CONTINUE), *quit = menu_text(UI_MENU_QUIT);
     float bw = fmaxf(ImGui::CalcTextSize(cont).x, ImGui::CalcTextSize(quit).x) + st.FramePadding.x * 4;
-    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - st.WindowPadding.x - bw * 2 - st.ItemSpacing.x, y));
+    float bh = ImGui::GetFrameHeight();
+    ImGui::SetCursorScreenPos(ImVec2(o.x + W - pad - bw * 2 - 14 * scale, cy - bh * 0.5f));
     if (ImGui::Button(cont, ImVec2(bw, 0))) set_open(0);
-    ImGui::SameLine();
+    ImGui::SameLine(0, 14 * scale);
     if (ImGui::Button(quit, ImVec2(bw, 0))) gfx_window_request_close();
+
     bool was_modal = settings_modal();
     settings_tabs_done();
     if (!was_modal && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
@@ -385,12 +479,34 @@ static void perf_gpu_once(const MenuTarget *t) {
                     (float)(vram >> 20));
 }
 
+// THWOMP: the FPS line also shows the 1 % and 0.1 % lows over the last 1000 frames and the mean frame time.
+static uint32_t g_dt_ring[1000];
+static int g_dt_head, g_dt_count;
+static char g_perf_1pct[24], g_perf_01pct[24], g_perf_ms[24];
+
+static void perf_lows(double mean_ns) {
+    snprintf(g_perf_ms, sizeof g_perf_ms, "%.1f ms", mean_ns / 1e6);
+    if (g_dt_count < 10) {
+        g_perf_1pct[0] = g_perf_01pct[0] = 0;
+        return;
+    }
+    uint32_t sorted[1000];
+    int n = g_dt_count;
+    memcpy(sorted, g_dt_ring, n * sizeof *sorted);
+    std::sort(sorted, sorted + n);
+    int i1 = std::min((int)(n * 0.99f), n - 1), i01 = std::min((int)(n * 0.999f), n - 1);
+    snprintf(g_perf_1pct, sizeof g_perf_1pct, "1%% %.0f", sorted[i1] ? 1e9 / sorted[i1] : 0.0);
+    snprintf(g_perf_01pct, sizeof g_perf_01pct, "0.1%% %.0f", sorted[i01] ? 1e9 / sorted[i01] : 0.0);
+}
+
 static void perf_tick(uint64_t now, uint64_t frame, const MenuTarget *t) {
     if (cfg_version() != g_perf_ver) {
         g_perf_ver = cfg_version();
         int m = perf_mode_of(cfg_value("MKW_PERF_OVERLAY"));
         if (m != g_perf_mode) {
             g_perf_last_ns = 0, g_perf_text[0] = 0;
+            g_dt_head = g_dt_count = 0;
+            g_perf_1pct[0] = g_perf_01pct[0] = g_perf_ms[0] = 0;
             if (m == 2) perf_gpu_once(t);
             perfmon_mode(m);
         }
@@ -408,12 +524,17 @@ static void perf_tick(uint64_t now, uint64_t frame, const MenuTarget *t) {
         g_perf_frames++;
         g_perf_game += game;
         if (d > g_perf_max_ns) g_perf_max_ns = d;
+        g_dt_ring[g_dt_head] = (uint32_t)d;   // d <= 2 s here
+        g_dt_head = (g_dt_head + 1) % 1000;
+        if (g_dt_count < 1000) g_dt_count++;
         if (g_perf_win_ns >= 500000000ull) {
             double s = 1e9 / (double)g_perf_win_ns;
+            perf_lows((double)g_perf_win_ns / g_perf_frames);
             if (strcmp(cfg_value("MKW_FRAMEGEN"), "off"))
                 snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS_FG), g_perf_game * s, g_perf_frames * s);
-            else
-                snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS), g_perf_frames * s);
+            else   // THWOMP: "45.9 FPS" (whole numbers from 100)
+                snprintf(g_perf_text, sizeof g_perf_text, g_perf_frames * s >= 100 ? "%.0f FPS" : "%.1f FPS",
+                         g_perf_frames * s);
             g_perf_win_ns = g_perf_max_ns = 0;
             g_perf_frames = g_perf_game = 0;
         }
@@ -586,11 +707,25 @@ static void perf_draw(const MenuTarget *t, float scale) {
     if (!g_perf_mode || !g_perf_text[0]) return;
     // with the menu open: under its window, over the dimming layout_menu drew before
     ImDrawList *dl = g_open.load(std::memory_order_relaxed) ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
-    ImVec2 sz = ImGui::CalcTextSize(g_perf_text);
-    float pad = 6 * scale;
-    ImVec2 p(w - 12 * scale - sz.x - pad * 2, 12 * scale);   // the top right corner: the game's HUD leaves it empty
-    dl->AddRectFilled(p, ImVec2(p.x + sz.x + pad * 2, p.y + sz.y + pad * 2), IM_COL32(0, 0, 0, 150), 4 * scale);
-    dl->AddText(ImVec2(p.x + pad, p.y + pad), IM_COL32(255, 255, 255, 235), g_perf_text);
+    // THWOMP: one pill in the top right corner (the game's HUD leaves it empty): FPS, the lows, the frame time
+    ImFont *font = ImGui::GetFont();
+    float font_sz = 14.5f * scale, pad_x = 9.0f * scale, pad_y = 5.0f * scale, gap = 8.0f * scale;
+    const char *parts[4] = {g_perf_text, g_perf_1pct, g_perf_01pct, g_perf_ms};
+    static const ImU32 cols[4] = {IM_COL32(255, 255, 255, 255), IM_COL32(210, 225, 245, 225),
+                                  IM_COL32(180, 205, 235, 200), IM_COL32(160, 185, 215, 230)};
+    float tw = 0;
+    int n = 0;
+    for (const char *s : parts)
+        if (s[0]) tw += (n++ ? gap : 0) + font->CalcTextSizeA(font_sz, FLT_MAX, -1.0f, s).x;
+    ImVec2 p_min(w - 12.0f * scale - tw - pad_x * 2, 10.0f * scale);
+    ImVec2 p_max(p_min.x + tw + pad_x * 2, p_min.y + font_sz + pad_y * 2);
+    dl->AddRectFilled(p_min, p_max, IM_COL32(12, 16, 24, 210), 4.0f * scale);
+    float x = p_min.x + pad_x;
+    for (int i = 0; i < 4; i++) {
+        if (!parts[i][0]) continue;
+        dl->AddText(font, font_sz, ImVec2(x, p_min.y + pad_y), cols[i], parts[i]);
+        x += font->CalcTextSizeA(font_sz, FLT_MAX, -1.0f, parts[i]).x + gap;
+    }
 }
 
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
@@ -624,6 +759,12 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
         g_failed.store(1);
         set_open(0);
         return 0;
+    }
+    static int theme_dark = -1;   // THWOMP: a theme change restyles at once
+    if (theme_dark != menu_theme_dark()) {
+        theme_dark = menu_theme_dark();
+        menu_look_style(g_base_style);
+        g_style_scale = 0;
     }
     if (g_style_scale != scale) {
         ImGui::GetStyle() = g_base_style;

@@ -6,8 +6,11 @@
 #include <string.h>
 
 #include "ui/menu/menu_look.h"
+#include "ui/menu/menu_theme.h"
+#include "ui/menu/option_rows.h"
 
 extern "C" {
+#include "cfg.h"
 #include "platform/platform.h"
 #include "ui_text.h"
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -28,27 +31,43 @@ extern "C" const unsigned char *menu_look_font_data(void) { return roboto_ttf; }
 
 float menu_look_scale(uint32_t h) { return (h >= 720 ? h : 720) / 1080.0f; }
 
-// SavageWindRecomp's colours: dark green panels, gold accents.
+int menu_theme_dark(void) { return !strcmp(cfg_value("MKW_MENU_THEME"), "dark"); }
+
+// THWOMP: the Mario Kart World PC theme (ui/menu/menu_theme.h): light, the Switch 2 system settings with a cyan
+// selection, or dark with red accents (MKW_MENU_THEME). The menu re-runs this when the setting changes.
 void menu_look_style(ImGuiStyle &s) {
-    ImGui::StyleColorsDark(&s);
-    s.WindowRounding = 14; s.FrameRounding = 8; s.GrabRounding = 8; s.TabRounding = 8; s.ChildRounding = 10;
-    s.WindowPadding = ImVec2(28, 22); s.FramePadding = ImVec2(14, 8); s.ItemSpacing = ImVec2(14, 12);
-    s.WindowBorderSize = 0; s.ScrollbarSize = 18;
+    using namespace mkw_theme;
+    bool dark = menu_theme_dark();
+    apply(dark);
+    opt_menu_look_refresh();
+    if (dark) ImGui::StyleColorsDark(&s);
+    else ImGui::StyleColorsLight(&s);
+    s.WindowRounding = 18; s.FrameRounding = 20; s.GrabRounding = 8; s.TabRounding = 8; s.ChildRounding = 10;
+    s.PopupRounding = 14;
+    s.WindowPadding = ImVec2(28, 22); s.FramePadding = ImVec2(18, 9); s.ItemSpacing = ImVec2(14, 12);
+    s.WindowBorderSize = 0; s.PopupBorderSize = 1; s.FrameBorderSize = 1; s.ScrollbarSize = 14; s.ScrollbarRounding = 7;
     ImVec4 *c = s.Colors;
-    ImVec4 gold(0.93f, 0.76f, 0.33f, 1), green(0.15f, 0.36f, 0.25f, 1);
-    c[ImGuiCol_WindowBg] = ImVec4(0.06f, 0.09f, 0.08f, 0.94f);
+    c[ImGuiCol_WindowBg] = v4(kPanel);
     c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_Text] = ImVec4(0.96f, 0.94f, 0.88f, 1);
-    c[ImGuiCol_TextDisabled] = ImVec4(0.62f, 0.64f, 0.58f, 1);
-    c[ImGuiCol_Button] = ImVec4(0.14f, 0.22f, 0.18f, 1);
-    c[ImGuiCol_ButtonHovered] = green;
-    c[ImGuiCol_ButtonActive] = ImVec4(0.21f, 0.50f, 0.34f, 1);
-    c[ImGuiCol_Tab] = ImVec4(0.12f, 0.18f, 0.15f, 1);
-    c[ImGuiCol_TabHovered] = green;
-    c[ImGuiCol_TabSelected] = ImVec4(0.21f, 0.44f, 0.31f, 1);
-    c[ImGuiCol_TabSelectedOverline] = gold;
-    c[ImGuiCol_NavCursor] = gold;
-    c[ImGuiCol_Separator] = ImVec4(0.30f, 0.36f, 0.30f, 1);
+    c[ImGuiCol_PopupBg] = v4(kHeader);
+    c[ImGuiCol_Border] = v4(kDivider);
+    c[ImGuiCol_Text] = v4(kText);
+    c[ImGuiCol_TextDisabled] = v4(kTextDim);
+    c[ImGuiCol_FrameBg] = v4(kRowSel);
+    c[ImGuiCol_Button] = v4(kRowSel);
+    c[ImGuiCol_ButtonHovered] = v4(kButtonHover);
+    c[ImGuiCol_ButtonActive] = v4(kButtonActive);
+    c[ImGuiCol_Tab] = v4(kSidebar);
+    c[ImGuiCol_TabHovered] = v4(kRowHover);
+    c[ImGuiCol_TabSelected] = v4(kRowSel);
+    c[ImGuiCol_TabSelectedOverline] = v4(kAccent);
+    c[ImGuiCol_NavCursor] = v4(kAccent);
+    c[ImGuiCol_Separator] = v4(kDivider);
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ScrollbarGrab] = v4(kScroll);
+    c[ImGuiCol_ScrollbarGrabHovered] = v4(kTextDim);
+    c[ImGuiCol_ScrollbarGrabActive] = v4(kAccent);
+    c[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, 0.30f);
 }
 
 // Roboto Medium (Latin with Latin Extended-A for Polish, Turkish and Catalan, Cyrillic, dashes and quotes) at 26 px

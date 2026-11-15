@@ -282,7 +282,7 @@ static void open_window(void *arg) {
     const char *bg = cfg_get("MKW_BACKGROUND_WINDOW");
     int background = bg && strcmp(bg, "0"), hidden = bg && !strcmp(bg, "hidden");
     if (background) SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
-    g_win = SDL_CreateWindow("MKW Recomp", w, h,
+    g_win = SDL_CreateWindow("Mario Kart World", w, h,
                              SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
                                  (background ? SDL_WINDOW_NOT_FOCUSABLE : 0) | (hidden ? SDL_WINDOW_HIDDEN : 0));
     if (!g_win) {
