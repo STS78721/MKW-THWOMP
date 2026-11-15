@@ -12,7 +12,8 @@
 // SDL_Renderer back ends (runtime/third_party/imgui, MIT) and Roboto (runtime/ui/fonts, Apache-2.0).
 // Test hooks: THWOMP_SETUP_SHOT=<frame>:<page> saves that page as THWOMP_SETUP_SHOT_OUT and quits (pages welcome,
 // folder, copy, done, uninstall); THWOMP_SETUP_DIR=<folder> with THWOMP_SETUP_AUTO=1 installs there without input (as
-// uninstall.exe: uninstalls without input); THWOMP_SETUP_NO_SHORTCUTS=1 makes no shortcuts.
+// uninstall.exe: uninstalls without input); THWOMP_SETUP_NO_SHORTCUTS=1 is a test install: no shortcuts made or
+// removed, and its own Windows apps entry (MKW-THWOMP-test).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -51,7 +52,11 @@ static const unsigned char kRoboto[] = {
 
 static const char kName[] = "Mario Kart World PC";
 static const wchar_t kNameW[] = L"Mario Kart World PC";
-static const wchar_t kUninstKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MKW-THWOMP";
+// A test install (THWOMP_SETUP_NO_SHORTCUTS) registers apart, so a test never touches the player's real install.
+static const wchar_t *uninst_key(void) {
+    return getenv("THWOMP_SETUP_NO_SHORTCUTS") ? L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MKW-THWOMP-test"
+                                               : L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MKW-THWOMP";
+}
 static const char kMagic[8] = {'T', 'H', 'W', 'O', 'M', 'P', 'V', '1'};
 
 // ---- the dark theme (ui/launcher/launcher_look.cpp's dark palette)
@@ -252,7 +257,7 @@ static void install_run(Payload pl, std::wstring exe, std::wstring dir, bool des
     if (desk) shortcut(desktop_lnk(), game, dir);
     if (menu) shortcut(menu_lnk(), game, dir);
     HKEY k;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kUninstKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, uninst_key(), 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
         reg_str(k, L"DisplayName", kNameW);
         reg_str(k, L"DisplayVersion", wide(pl.version));
         reg_str(k, L"Publisher", L"MKW-THWOMP");
@@ -358,10 +363,12 @@ static void uninstall_run(std::wstring dir, bool everything) {
         for (const auto &d : dirs) RemoveDirectoryW(d.c_str());   // only the ones left empty
     }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    DeleteFileW(desktop_lnk().c_str());
-    DeleteFileW(menu_lnk().c_str());
+    if (!getenv("THWOMP_SETUP_NO_SHORTCUTS")) {   // a test uninstall leaves the player's shortcuts alone
+        DeleteFileW(desktop_lnk().c_str());
+        DeleteFileW(menu_lnk().c_str());
+    }
     CoUninitialize();
-    RegDeleteKeyW(HKEY_CURRENT_USER, kUninstKey);
+    RegDeleteKeyW(HKEY_CURRENT_USER, uninst_key());
     g_job.done = 1;
     g_job.state = 2;
 }
