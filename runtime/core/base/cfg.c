@@ -118,7 +118,7 @@ static const CfgMeta metas[] = {
     {"BUTTON_ICONS", "auto", "auto|nintendo|xbox|playstation|keyboard", LIVE},
     {"MOUSE_SENS", "1", "0..10", LIVE}, {"STICK_DEADZONE", "8", "0..40", LIVE}, {"SWITCH2", "0", "0|1|2", RESTART},
     {"MENU_LANG", "", "en|ja|fr|de|it|es|nl|pt|pt-BR|ru|zh-Hans|zh-Hant|ko|es-419|ca|gl|eu|pl|tr|uk|th", LIVE}, {"UPDATE_CHECK", "1", "0|1", LIVE},
-    {"MENU_THEME", "dark", "dark|light", LIVE},
+    {"MENU_THEME", "steeltemple", "dark|light|steeltemple", LIVE},
     {"COLOR_PRESET", "default", "default|vivid|clarity|custom", LIVE}, {"COLOR_BRIGHTNESS", "0", "-30..30", LIVE},
     {"COLOR_CONTRAST", "100", "70..150", LIVE}, {"COLOR_SATURATION", "100", "50..200", LIVE},
     {"COLOR_GAMMA", "1", "0.8..1.2", LIVE},

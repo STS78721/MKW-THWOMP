@@ -31,7 +31,8 @@ extern "C" const unsigned char *menu_look_font_data(void) { return roboto_ttf; }
 
 float menu_look_scale(uint32_t h) { return (h >= 720 ? h : 720) / 1080.0f; }
 
-int menu_theme_dark(void) { return !strcmp(cfg_value("MKW_MENU_THEME"), "dark"); }
+int menu_theme_dark(void) { return strcmp(cfg_value("MKW_MENU_THEME"), "light") != 0; }   // dark and SteelTemple
+int menu_theme_steeltemple(void) { return !strcmp(cfg_value("MKW_MENU_THEME"), "steeltemple"); }
 
 // THWOMP: the Mario Kart World PC theme (ui/menu/menu_theme.h): light, the Switch 2 system settings with a cyan
 // selection, or dark with red accents (MKW_MENU_THEME). The menu re-runs this when the setting changes.

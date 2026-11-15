@@ -1,7 +1,8 @@
-// THWOMP: the Mario Kart World PC menu theme. Light (default): the look of the Switch 2 system settings, light grey
-// panels and a cyan selection. Dark (MKW_MENU_THEME=dark): near-black panels with red accents. menu_look_style()
+// THWOMP: the Mario Kart World PC menu theme. Dark (MKW_MENU_THEME=dark): near-black panels with red accents. Light: the Switch 2 system settings, light grey
+// panels and a cyan selection. menu_look_style()
 // applies the set for the current setting (ui/menu/menu_look.cpp); the menu layout (ui/menu/menu.cpp) and the option
-// rows (ui/menu/option_rows.cpp, opt_menu_look_refresh) draw with these.
+// rows (ui/menu/option_rows.cpp, opt_menu_look_refresh) draw with these. SteelTemple (the default, MKW_MENU_THEME=steeltemple):
+// the dark palette, with a chequered racing band across the top and the bottom of the in-game menu.
 #pragma once
 #include "imgui.h"
 
@@ -59,4 +60,5 @@ inline void apply(bool dark) {
 inline ImVec4 v4(ImU32 c) { return ImGui::ColorConvertU32ToFloat4(c); }
 }  // namespace mkw_theme
 
-int menu_theme_dark(void);   // MKW_MENU_THEME is dark (ui/menu/menu_look.cpp)
+int menu_theme_dark(void);          // MKW_MENU_THEME is dark or steeltemple: the dark palette (ui/menu/menu_look.cpp)
+int menu_theme_steeltemple(void);   // the SteelTemple theme: the dark palette with chequered racing bands (menu.cpp)

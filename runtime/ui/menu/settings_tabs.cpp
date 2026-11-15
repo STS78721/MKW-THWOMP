@@ -355,8 +355,8 @@ static void tab_menu(float scale) {
         UI_MENU_LANGNAME_TH,
     };
     opt_choice("MKW_MENU_LANG", UI_MENU_MENU_LANG, langs, sizeof langs / sizeof *langs, UI_MENU_MENU_LANG_DESC);
-    static const UiTextId themes[] = {UI_MENU_THEME_DARK, UI_MENU_THEME_LIGHT};   // THWOMP: cfg.c's MENU_THEME order
-    opt_choice("MKW_MENU_THEME", UI_MENU_THEME, themes, 2, UI_MENU_THEME_DESC);
+    static const UiTextId themes[] = {UI_MENU_THEME_DARK, UI_MENU_THEME_LIGHT, UI_MENU_THEME_STEELTEMPLE};   // cfg.c order
+    opt_choice("MKW_MENU_THEME", UI_MENU_THEME, themes, 3, UI_MENU_THEME_DESC);
     opt_toggle("MKW_UPDATE_CHECK", UI_MENU_UPDATE_CHECK, UI_MENU_UPDATE_CHECK_DESC);   // ui/launcher/launcher_update.cpp
     opt_end();
 }

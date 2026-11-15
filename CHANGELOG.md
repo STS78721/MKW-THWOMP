@@ -4,9 +4,47 @@ Each version's section is that release's notes: `tools/build/notes.py` puts it i
 updating, known issues, reporting) for the GitHub release. A section has a summary paragraph, `### Changes` (each with
 its issue, #N), `### Tested` (what was run from the packages before publishing) and optionally `### Known issues`.
 
-## MKW-THWOMP 0.1.2
+## MKW-THWOMP 0.2.1b
 
 THWOMP's releases come first, in the Pearl Abyss style of its other projects (■ sections, ○ groups); the GitHub release carries the same text. Upstream mkw-recomp's own notes follow from 0.1.12 down.
+
+MKW-THWOMP 0.2.1b
+
+A small update: the SteelTemple theme, chequered racing bands across the top and the bottom of the settings menu, is now the default look. The touchpad on PS4 and PS5 controllers opens the menu, and the start screen makes a new update hard to miss.
+
+■ Major Updates
+
+- Added the SteelTemple menu theme and made it the default: the dark theme with two rows of black and white racing checks and a red line across the top and the bottom of the settings menu (F1 or Esc).
+
+■ New & Improvements
+
+○ Settings Menu
+
+- Menu theme (Menu category) now offers SteelTemple, Dark and Light. If you chose Dark or Light before, your choice stays.
+
+○ Controls
+
+- Added the touchpad to open and close the settings menu on DualShock 4 (PS4) and DualSense (PS5) controllers. Minus + Plus, F1 and Esc still work.
+
+○ Launcher
+
+- Changed the update offer on the start screen to a large card above Play: "Update available" with the version and its size, a download badge, an arrow and a soft red glow that pulses. The whole card starts the update.
+- Changed the update check to understand small updates with a letter, so 0.2.1b comes after 0.2.1 and before 0.2.2.
+
+■ Other
+
+- The start screen and the setup keep the dark look with the SteelTemple theme.
+- The new update card shows from this version on: 0.1.1 and 0.1.2 offer 0.2.1b with their own button.
+
+■ Update
+
+- From 0.1.1 or 0.1.2: open the start screen. It offers 0.2.1b and installs it. You can also extract SteelTemple-MKW-THWOMP-0.2.1b-Update.zip over the game folder.
+- New install: run SteelTemple-MKW-THWOMP-0.2.1b-Full-Setup-Wizard.exe, then open the start screen. Choose Game files, choose your dump, press Set up (about 5 minutes on an 8-core CPU), then press Play.
+- Portable: extract SteelTemple-MKW-THWOMP-0.2.1b-Portable-StandAlone.zip anywhere, run mkw.exe and set the game up the same way.
+
+Your dump, saves, and personal settings stay on your PC.
+
+## MKW-THWOMP 0.1.2
 
 MKW-THWOMP 0.1.2
 

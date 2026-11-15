@@ -3,7 +3,7 @@
 // (gfx_present.c). The menu core calls no window system: events come in through menu_event_*, the drawing happens in the
 // present path's command buffer.
 //
-// F1 or Esc on the keyboard and Minus and Plus held together (consumed in poll_merged, input_menu_gate in input.h) open it;
+// F1 or Esc on the keyboard, Minus and Plus held together, or a touchpad press (PS4, PS5) (consumed in poll_merged, input_menu_gate in input.h) open it;
 // F1, Esc, B or "Continue" close it. While it is open the game gets no input (input_menu, input.h) and keeps running; the
 // cursor is released from the mouse camera. Tabs Screen, Game, Sound, Controls and Menu (L / R or Q / E switch them) hold
 // option rows (ui/menu/option_rows.h) over the cfg settings; the bottom row has "Continue" and "Quit game".
@@ -23,7 +23,7 @@ extern "C" {
 
 // ---- state, any thread
 int menu_is_open(void);
-void menu_toggle(void);                   // F1 / Esc on the keyboard, Minus+Plus on the pad
+void menu_toggle(void);                   // F1 / Esc on the keyboard, Minus+Plus or the PS4/PS5 touchpad on the pad
 void menu_perf_cycle(void);               // F10: the performance overlay off, fps, full
 void menu_notice(const char *text, int seconds);   // a line at the top of the picture for that long, menu closed or not
 

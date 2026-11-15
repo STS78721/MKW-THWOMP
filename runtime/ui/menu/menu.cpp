@@ -322,6 +322,20 @@ static float hint_pill(ImDrawList *dl, ImVec2 p, float h, const char *letter) {
     return w;
 }
 
+// The SteelTemple theme's racing band: two rows of black and white checks from x0 to x1 (whole checks, centred), with a
+// red line of thickness `edge` under it (red_below, the title bar's) or over it (the footer's).
+static void chequer_band(ImDrawList *dl, float x0, float x1, float y, float cell, float edge, bool red_below) {
+    using namespace mkw_theme;
+    int cols = (int)((x1 - x0) / cell);
+    float w = cols * cell, xs = x0 + ((x1 - x0) - w) * 0.5f;
+    for (int r = 0; r < 2; r++)
+        for (int c = 0; c < cols; c++)
+            dl->AddRectFilled(ImVec2(xs + c * cell, y + r * cell), ImVec2(xs + (c + 1) * cell, y + (r + 1) * cell),
+                              (r + c) % 2 ? IM_COL32(16, 16, 18, 255) : IM_COL32(238, 238, 242, 255));
+    float ly = red_below ? y + 2 * cell : y - edge;
+    dl->AddRectFilled(ImVec2(xs, ly), ImVec2(xs + w, ly + edge), kAccent);
+}
+
 static void layout_menu(uint32_t w, uint32_t h, float scale) {
     using namespace mkw_theme;
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, (float)h), kBackdrop);
@@ -339,26 +353,33 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     float W = ImGui::GetWindowWidth(), H = ImGui::GetWindowHeight(), fs = ImGui::GetFontSize();
     float pad = 30 * scale, rounding = st.WindowRounding;
     float head_h = floorf(fs * 3.1f), foot_h = floorf(fs * 3.3f), side_w = floorf(fminf(W * 0.26f, 380 * scale));
+    // the SteelTemple theme: a chequered racing band across the top of the title bar and the bottom of the footer,
+    // each with a red edge; the title bar and the footer grow by it, so their contents keep their spacing
+    bool steel = menu_theme_steeltemple();
+    float cell = floorf(fs * 0.42f), band = steel ? cell * 2 + 3 * scale : 0;
+    head_h += band, foot_h += band;
     float body_y = o.y + head_h, body_h = H - head_h - foot_h;
+    float hy = o.y + band, hh = head_h - band;   // the title bar's contents, under the band
 
     // title bar: an accent bar, "Mario Kart World", the page title, and the version on the right
     dl->AddRectFilled(o, ImVec2(o.x + W, o.y + head_h), kHeader, rounding, ImDrawFlags_RoundCornersTop);
     dl->AddLine(ImVec2(o.x, o.y + head_h - 0.5f), ImVec2(o.x + W, o.y + head_h - 0.5f), kDivider, 1.0f);
-    float tfs = fs * 1.3f, ty = o.y + (head_h - tfs) * 0.5f;
-    dl->AddRectFilled(ImVec2(o.x + pad, o.y + head_h * 0.27f), ImVec2(o.x + pad + 6 * scale, o.y + head_h * 0.73f),
-                      kAccent, 3 * scale);
+    if (steel) chequer_band(dl, o.x + rounding, o.x + W - rounding, o.y, cell, 3 * scale, true);
+    float tfs = fs * 1.3f, ty = hy + (hh - tfs) * 0.5f;
+    dl->AddRectFilled(ImVec2(o.x + pad, hy + hh * 0.27f), ImVec2(o.x + pad + 6 * scale, hy + hh * 0.73f), kAccent,
+                      3 * scale);
     float tx = o.x + pad + 20 * scale;
     const char *brand = "Mario Kart World";
     dl->AddText(font, tfs, ImVec2(tx, ty), kText, brand);
     tx += font->CalcTextSizeA(tfs, FLT_MAX, 0, brand).x + 14 * scale;
-    dl->AddText(font, fs, ImVec2(tx, o.y + (head_h - fs) * 0.5f + fs * 0.08f), kTextSoft, menu_text(UI_MENU_TITLE));
+    dl->AddText(font, fs, ImVec2(tx, hy + (hh - fs) * 0.5f + fs * 0.08f), kTextSoft, menu_text(UI_MENU_TITLE));
     // the port version and the game update, right-aligned: what a bug report needs first
     char game[16], version[96];
     int gv = rt_game_version();
     snprintf(game, sizeof game, "%d.%d.%d", gv / 100, gv / 10 % 10, gv % 10);
     snprintf(version, sizeof version, menu_text(UI_MENU_VERSION), rt_port_version, game);
     float vw = font->CalcTextSizeA(fs * 0.85f, FLT_MAX, 0, version).x;
-    dl->AddText(font, fs * 0.85f, ImVec2(o.x + W - pad - vw, o.y + (head_h - fs * 0.85f) * 0.5f), kTextDim, version);
+    dl->AddText(font, fs * 0.85f, ImVec2(o.x + W - pad - vw, hy + (hh - fs * 0.85f) * 0.5f), kTextDim, version);
 
     // category list
     dl->AddRectFilled(ImVec2(o.x, body_y), ImVec2(o.x + side_w, body_y + body_h), kSidebar);
@@ -402,7 +423,8 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     float fy = o.y + H - foot_h;
     dl->AddRectFilled(ImVec2(o.x, fy), ImVec2(o.x + W, o.y + H), kHeader, rounding, ImDrawFlags_RoundCornersBottom);
     dl->AddLine(ImVec2(o.x, fy + 0.5f), ImVec2(o.x + W, fy + 0.5f), kDivider, 1.0f);
-    float cy = fy + foot_h * 0.5f, rad = fs * 0.62f, hx = o.x + pad;
+    if (steel) chequer_band(dl, o.x + rounding, o.x + W - rounding, o.y + H - cell * 2, cell, 3 * scale, false);
+    float cy = fy + (foot_h - band) * 0.5f, rad = fs * 0.62f, hx = o.x + pad;
     if (!cfg_last_save_ok()) {   // stays until a save succeeds; the settings hold for the session
         dl->AddText(ImVec2(hx, cy - fs * 0.5f), kWarn, menu_text(UI_MENU_SAVE_FAILED));
     } else {

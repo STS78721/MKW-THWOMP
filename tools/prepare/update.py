@@ -79,10 +79,11 @@ def get(url: str, timeout: int) -> urllib.request.addinfourl:
     return urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
 
 
-def version_key(v: str) -> tuple[int, int, int] | None:
-    """(major, minor, patch) of a tag or of rt_port_version ("0.1.2-12-g1c15097" counts as 0.1.2); None for "dev"."""
-    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", v)
-    return (int(m[1]), int(m[2]), int(m[3])) if m else None
+def version_key(v: str) -> tuple[int, int, int, int] | None:
+    """(major, minor, patch, letter) of a tag or of rt_port_version ("0.1.2-12-g1c15097" counts as 0.1.2); a small
+    update's letter counts after its base (THWOMP: 0.2.1 < 0.2.1b < 0.2.1c < 0.2.2); None for "dev"."""
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)([a-z]?)", v)
+    return (int(m[1]), int(m[2]), int(m[3]), ord(m[4]) - 96 if m[4] else 0) if m else None
 
 
 def latest_asset(os_name: str) -> tuple[str, dict]:

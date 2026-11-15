@@ -51,8 +51,8 @@ races hold 60 fps on current GPUs. Frame generation and FSR are there when you w
 <td width="50%" valign="top">
 
 ### 🎮 A real PC settings menu
-Press **F1** or **Esc** (or **Minus + Plus** on a controller) for a Switch-2-style menu with a category list:
-Screen, Graphics, Game, Sound, Controls, Menu, Advanced and Hacks, in a **light** or **dark (red)** theme.
+Press **F1** or **Esc** (or **Minus + Plus** on a controller, or the **touchpad** on a PS4 or PS5 controller) for a Switch-2-style menu with a category list:
+Screen, Graphics, Game, Sound, Controls, Menu, Advanced and Hacks, in the **SteelTemple** theme (dark with chequered racing bands, the default), **dark (red)** or **light**.
 
 ### 📈 Performance overlay
 FPS with the **1 % and 0.1 % lows** and the frame time in one pill in the corner, or a full panel with CPU, GPU

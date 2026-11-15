@@ -258,6 +258,60 @@ static void make_shortcut(void) {
     rt_log("launcher: desktop shortcut %s %s", ok ? "made:" : "failed", ok ? made : "");
 }
 
+// THWOMP: the update offered, as a card that cannot be missed: a glow in the accent that breathes around it, a bar
+// and a download badge on the left, "Update available" over the version and its size, and an "Update now" pill on the
+// right (a chevron where the card is too narrow for it). The whole card is the button. During a shot the glow holds still (a frame would differ from run to run).
+static bool update_card(const char *detail, float bw) {
+    float s = L.scale, hf = L.head->FontSize, lh = ImGui::GetTextLineHeight(), pad = 14 * s;
+    ImVec2 size(bw, fmaxf(item_height(), hf + lh + pad * 2 + 4 * s));
+    ImVec2 a = ImGui::GetCursorScreenPos(), b(a.x + size.x, a.y + size.y);
+    bool hit = ImGui::InvisibleButton("##update", size);
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    bool held = ImGui::IsItemActive(), cursor = ImGui::IsItemFocused() && ImGui::GetIO().NavVisible;
+    float hot = eased(ImGui::GetItemID(), ImGui::IsItemHovered() || cursor);
+    float pulse = L.shot_at ? 1.0f : 0.5f + 0.5f * sinf((float)ImGui::GetTime() * 3.2f);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec4 ac = col4(LOOK_ACCENT);
+    for (int i = 3; i >= 1; i--) {   // the glow: three rings, fainter further out
+        float o = i * 3 * s, al = (0.10f + 0.22f * pulse) * (4 - i) / 3.0f;
+        dl->AddRect(ImVec2(a.x - o, a.y - o), ImVec2(b.x + o, b.y + o), ImGui::GetColorU32(ImVec4(ac.x, ac.y, ac.z, al)),
+                    6 * s + o, 0, 2 * s);
+    }
+    ImU32 fill = held ? mix(LOOK_RAISED, LOOK_ACCENT_DOWN, 0.45f) : mix(LOOK_RAISED, LOOK_ACCENT, 0.16f + 0.14f * hot);
+    dl->AddRectFilled(a, b, fill, 6 * s);
+    dl->AddRect(a, b, mix(LOOK_ACCENT, LOOK_ACCENT_HOT, hot), 6 * s, 0, 2 * s);
+    dl->AddRectFilled(a, ImVec2(a.x + 6 * s, b.y), LOOK_ACCENT, 6 * s, ImDrawFlags_RoundCornersLeft);
+    if (cursor) dl->AddRect(ImVec2(a.x - 5 * s, a.y - 5 * s), ImVec2(b.x + 5 * s, b.y + 5 * s), LOOK_FOCUS, 8 * s, 0, 2 * s);
+    // the badge: a red disc with a white arrow down onto a bar
+    float r = (size.y - pad * 2) * 0.5f, cx = a.x + 6 * s + pad + r, cy = (a.y + b.y) * 0.5f;
+    dl->AddCircleFilled(ImVec2(cx, cy), r, mix(LOOK_ACCENT, LOOK_ACCENT_HOT, pulse * 0.5f), 32);
+    ImU32 white = IM_COL32(255, 255, 255, 255);
+    float k = r * 0.42f;
+    dl->AddRectFilled(ImVec2(cx - k * 0.22f, cy - k * 1.05f), ImVec2(cx + k * 0.22f, cy + k * 0.05f), white);
+    dl->AddTriangleFilled(ImVec2(cx - k * 0.7f, cy - k * 0.05f), ImVec2(cx + k * 0.7f, cy - k * 0.05f),
+                          ImVec2(cx, cy + k * 0.7f), white);
+    dl->AddRectFilled(ImVec2(cx - k * 0.8f, cy + k * 0.95f), ImVec2(cx + k * 0.8f, cy + k * 1.2f), white);
+    // the pill, when the card is wide enough for it next to the text
+    const char *go = menu_text(UI_LAUNCH_UPDATE_GO);
+    ImVec2 gs = ImGui::CalcTextSize(go);
+    float pw = gs.x + 28 * s, ph = lh + 12 * s, tx = cx + r + 16 * s, px = b.x - pad - pw;
+    float tw = fmaxf(L.head->CalcTextSizeA(hf, FLT_MAX, 0, menu_text(UI_LAUNCH_UPDATE_TITLE)).x, ImGui::CalcTextSize(detail).x);
+    if (tx + tw + 16 * s < px) {
+        dl->AddRectFilled(ImVec2(px, cy - ph * 0.5f), ImVec2(px + pw, cy + ph * 0.5f),
+                          held ? LOOK_ACCENT_DOWN : mix(LOOK_ACCENT, LOOK_ACCENT_HOT, hot), ph * 0.5f);
+        dl->AddText(ImVec2(px + 14 * s, cy - gs.y * 0.5f), white, go);
+    } else {   // a narrow card (the main page's column): a chevron at the right edge says it is a button
+        float c = lh * 0.32f, x = b.x - pad - c + hot * 4 * s;
+        ImU32 col = mix(LOOK_ACCENT_HOT, white, hot);
+        dl->AddLine(ImVec2(x - c, cy - c * 1.4f), ImVec2(x + c * 0.4f, cy), col, 3 * s);
+        dl->AddLine(ImVec2(x + c * 0.4f, cy), ImVec2(x - c, cy + c * 1.4f), col, 3 * s);
+    }
+    float ty = cy - (hf + 4 * s + lh) * 0.5f;
+    dl->AddText(L.head, hf, ImVec2(tx, ty), LOOK_TEXT, menu_text(UI_LAUNCH_UPDATE_TITLE));
+    dl->AddText(ImVec2(tx, ty + hf + 4 * s), LOOK_HEADING, detail);
+    return hit;
+}
+
 // The update offered (launcher_update.h): its button, then the download's progress; once downloaded, installed and
 // the program started again. A failed check shows nothing, a failed download says why.
 static void update_row(float bw) {
@@ -265,7 +319,7 @@ static void update_row(float bw) {
     char text[700];
     if (u.phase == UPDATE_OFFER) {
         snprintf(text, sizeof text, menu_text(UI_LAUNCH_UPDATE), u.tag, (int)((u.bytes + (1 << 19)) >> 20));
-        if (ImGui::Button(text, ImVec2(bw, 0)) || getenv("MKW_LAUNCHER_UPDATE")) update_fetch_start(L.exe_dir);
+        if (update_card(text, bw) || getenv("MKW_LAUNCHER_UPDATE")) update_fetch_start(L.exe_dir);
     } else if (u.phase == UPDATE_FETCHING) {
         snprintf(text, sizeof text, menu_text(UI_LAUNCH_UPDATE_FETCHING), u.tag);
         ImGui::ProgressBar(u.total > 0 ? (float)u.done / (float)u.total : 0, ImVec2(bw, 0), text);

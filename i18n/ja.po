@@ -2078,6 +2078,16 @@ msgctxt "UI_LAUNCH_UPDATE"
 msgid "Update to %s (%d MB)"
 msgstr "%sに更新 (%d MB)"
 
+#. THWOMP: the update card on the start screen, over "Update to %s (%d MB)".
+msgctxt "UI_LAUNCH_UPDATE_TITLE"
+msgid "Update available"
+msgstr ""
+
+#. The update card's button.
+msgctxt "UI_LAUNCH_UPDATE_GO"
+msgid "Update now"
+msgstr ""
+
 #. printf format: keep every %... conversion, in the same order.
 msgctxt "UI_LAUNCH_UPDATE_FETCHING"
 msgid "Downloading %s"
@@ -2141,7 +2151,9 @@ msgid "Menu theme"
 msgstr ""
 
 msgctxt "UI_MENU_THEME_DESC"
-msgid "The look of this menu: Light, like the Switch 2 system settings, or Dark, with red accents."
+msgid ""
+"The look of this menu: Dark, with red accents; Light, like the Switch 2 system settings; or "
+"SteelTemple, dark with chequered racing bands along the top and the bottom."
 msgstr ""
 
 msgctxt "UI_MENU_THEME_LIGHT"
@@ -2150,6 +2162,10 @@ msgstr ""
 
 msgctxt "UI_MENU_THEME_DARK"
 msgid "Dark"
+msgstr ""
+
+msgctxt "UI_MENU_THEME_STEELTEMPLE"
+msgid "SteelTemple"
 msgstr ""
 
 msgctxt "UI_MENU_HINT_OK"
