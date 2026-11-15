@@ -40,6 +40,7 @@
 #include "ui/launcher/launcher_backdrop.h"
 #include "ui/launcher/launcher_logo.h"
 #include "ui/launcher/launcher_look.h"
+#include "ui/menu/menu_theme.h"
 #include "ui/launcher/launcher_players.h"
 #include "ui/launcher/launcher_setup.h"
 #include "ui/launcher/launcher_lastrun.h"
@@ -147,6 +148,15 @@ static void parse_test(void) {
 }
 
 static void restyle(float scale) {
+    static int theme_dark = -1;   // THWOMP: a theme change (Settings > Menu) restyles at once
+    if (theme_dark != menu_theme_dark()) {
+        if (theme_dark >= 0) launcher_look_style(L.base_style);
+        theme_dark = menu_theme_dark();
+        if (L.scale == scale) {
+            ImGui::GetStyle() = L.base_style;
+            ImGui::GetStyle().ScaleAllSizes(scale);
+        }
+    }
     if (scale == L.scale && !menu_look_fonts_stale()) return;
     ImGui::GetStyle() = L.base_style;
     ImGui::GetStyle().ScaleAllSizes(scale);

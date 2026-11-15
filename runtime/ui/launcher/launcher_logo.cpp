@@ -2,10 +2,15 @@
 #include <math.h>
 
 #include "ui/launcher/launcher_logo.h"
+#include "ui/launcher/launcher_backdrop.h"
 
 // The same shapes as the .svg: a chequered flag on a pole, on a blue rounded square; each check a quad strip whose edges
 // follow the wave.
 void launcher_logo(ImDrawList *dl, ImVec2 p, float size) {
+    if (SDL_Texture *icon = backdrop_icon()) {   // THWOMP: the MKW icon
+        dl->AddImage((ImTextureID)(intptr_t)icon, p, ImVec2(p.x + size, p.y + size));
+        return;
+    }
     auto at = [&](float x, float y) { return ImVec2(p.x + x * size, p.y + y * size); };
     auto wave = [](float x) { return 0.045f * sinf(x * 2 * 3.14159265f * 1.1f); };
     ImU32 top = IM_COL32(36, 84, 196, 255), bottom = IM_COL32(18, 38, 110, 255);

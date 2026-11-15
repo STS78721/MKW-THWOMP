@@ -8,3 +8,4 @@ void backdrop_load(SDL_Renderer *ren, const char *exe_dir);   // splash.png next
 void backdrop_draw(ImDrawList *dl, float w, float h, bool picture);
 void backdrop_free(void);
 bool backdrop_has_picture(void);   // there is a splash.png
+SDL_Texture *backdrop_icon(void);  // THWOMP: the MKW icon, after backdrop_load (NULL: none)
