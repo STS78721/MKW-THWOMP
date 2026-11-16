@@ -69,8 +69,8 @@ void main() {
     float b = texture(bias, uv).r;
     vec2 src_uv = (pc.crop.xy + uv * pc.crop.zw) / pc.tex;
     vec3 cur = texture(final_pic, src_uv).rgb;
-    // Reject only hard mask hits so a speckled bias does not bilinear the whole frame.
-    float reject = smoothstep(0.55, 0.85, b);
+    // Reject hard mask hits (UI panels + contact shadows). Gate stays above soft noise.
+    float reject = smoothstep(0.35, 0.70, b);
     vec3 o = mix(F, cur, reject);
     // MKW_DLSS_MASK: 1 = split DLSS|source, 2 = tint reactive mask red, 3 = show source only (ghosts in cur?).
     if (pc.view > 2.5) o = cur;
@@ -85,10 +85,10 @@ void main() {
         float d_bg = max(diff_bg.r, max(diff_bg.g, diff_bg.b));
         // Hard UI from finished-vs-scene gap only. Do not promote raw bias→UI: bias also marks soft shadows /
         // thin edges for ParticleHint, and flooding UI broke FG (and left shadow ghosts in the warped layer).
-        float ui_w = clamp(smoothstep(0.02, 0.09, d_bg), 0.0, 1.0);
-        if (d_bg > 0.07) ui_w = 1.0;
-        // Bias reinforces UI where the gap already looks like an overlay (title logo, Free Roam icons).
-        if (b > 0.4 && d_bg > 0.025) ui_w = max(ui_w, 0.95);
+        float ui_w = clamp(smoothstep(0.015, 0.06, d_bg), 0.0, 1.0);
+        // Character-select / Free Roam panels are semi-transparent — catch them early.
+        if (d_bg > 0.04) ui_w = 1.0;
+        if (b > 0.35 && d_bg > 0.02) ui_w = max(ui_w, 0.95);
 
         vec3 H = mix(F, H_bg, ui_w);
         vec4 U = vec4(0.0);

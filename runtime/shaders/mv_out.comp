@@ -146,10 +146,13 @@ void main() {
         if (pc.has_scene > 0.5) {
             float sc = tone_scene(texelFetch(cur_scene, p, 0).rgb);
             float ui_gap = abs(ct - sc) / (max(ct, sc) + 0.08);
-            if (ui_gap > 0.20) bias = 1.0;
+            // Semi-transparent Free Roam / character-select panels need a lower gate than opaque logos.
+            if (ui_gap > 0.10) bias = 1.0;
         }
     }
 
+    // Hard reactive hits: kill history fetch by zeroing MVs (disocclusion) in addition to ParticleHint / compose reject.
+    if (bias > 0.5) mv = vec2(0.0);
     imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
     imageStore(bias_out, p, vec4(clamp(bias, 0.0, 1.0)));
 }
