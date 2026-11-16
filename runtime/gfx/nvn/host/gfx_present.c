@@ -26,6 +26,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "ui/menu/menu.h"
+#include "sl_shim.h"
 #include "vk.h"
 #include "platform/platform.h"
 
@@ -697,7 +698,9 @@ VkImage vk_present_dlss_first(VkImage src, VkFormat fmt, int w, int h, const int
     g_dlss_done = 0;
     static int mv_debug = -1;   // MKW_MV_DEBUG's picture replaces the game's in the present: DLSS stays there
     if (mv_debug < 0) mv_debug = getenv("MKW_MV_DEBUG") && atoi(getenv("MKW_MV_DEBUG")) > 0;
-    if (!src || mv_debug || !vk_fg_wanted() || !vk_dlss_active()) return VK_NULL_HANDLE;
+    // Ahead of the blit when THWOMP FG or DLSS-G needs the upscaled picture first (not only THWOMP).
+    if (!src || mv_debug || !vk_dlss_active()) return VK_NULL_HANDLE;
+    if (!vk_fg_wanted() && vk_dlssg_frames() == 0) return VK_NULL_HANDLE;
     gfx_window_start();
     VkCtx *c = vk_ctx();
     VkImage out = VK_NULL_HANDLE;
@@ -738,7 +741,19 @@ VkImage vk_present_dlss_first(VkImage src, VkFormat fmt, int w, int h, const int
     vkEndCommandBuffer(cb);
     vkResetFences(c->device, 1, &g_dfence[s]);
     VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi};
+    // GPU wait on Streamline's FG inputs fence (no present-thread CPU stall under race load).
+    VkSemaphoreSubmitInfo waits[1];
+    uint32_t nw = 0;
+    VkSemaphore isem;
+    uint64_t ival;
+    if (sl_shim_fg_inputs_take(&isem, &ival))
+        waits[nw++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = isem,
+                                              .value = ival, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                        .waitSemaphoreInfoCount = nw,
+                        .pWaitSemaphoreInfos = nw ? waits : NULL,
+                        .commandBufferInfoCount = 1,
+                        .pCommandBufferInfos = &cbi};
     vk_queue_lock();
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_dfence[s]);
     vk_queue_unlock();
@@ -931,12 +946,21 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     vkEndCommandBuffer(cb);
     vk_dlssg_present(vk_dlssg_frames(), g_sc_hdr);   // THWOMP DLSS frame generation: on or off for this present
 
-    VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_acquire[slot],
-                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSemaphoreSubmitInfo waits[2];
+    uint32_t nw = 0;
+    waits[nw++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_acquire[slot],
+                                          .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    {
+        VkSemaphore isem;
+        uint64_t ival;
+        if (sl_shim_fg_inputs_take(&isem, &ival))   // 0 if dlss_first already took it
+            waits[nw++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = isem,
+                                                  .value = ival, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    }
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_render_done[idx],
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1, .pWaitSemaphoreInfos = &wait,
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = nw, .pWaitSemaphoreInfos = waits,
                         .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
     vk_queue_lock();
@@ -951,7 +975,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         // (NX2navi's idea). The image acquired goes unpresented, so the swapchain is made again.
         rt_log("gfx: present submit failed (%d)", (int)r);
         VkSubmitInfo2 empty = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1,
-                               .pWaitSemaphoreInfos = &wait};
+                               .pWaitSemaphoreInfos = waits};
         vk_queue_lock();
         VkResult re = vkQueueSubmit2(c->gfx_queue, 1, &empty, g_fence[slot]);
         vk_queue_unlock();

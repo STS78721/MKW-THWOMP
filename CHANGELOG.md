@@ -40,15 +40,22 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 - Stopped forcing Presentation to immediate whenever DLSS-G is on (that caused tearing and fought driver G-Sync/VRR). Mailbox, VSync (fifo) and Immediate follow the player's setting; fifo+FG logs an advisory only.
 - G-Sync/VRR is left to the player and the driver — the game does not force it on or off.
 
-○ Base FPS with DLSS-G (after `886ab25` / tip when this ships)
+○ Base FPS with DLSS-G (`718149e`)
 
-- Stopped Streamline's default present-queue block for FG work (`eBlockNoClientQueues`): FG no longer holds the graphics/present queue until it finishes. Wait on the inputs-processing timeline semaphore before rewriting FG-tagged buffers.
+- Stopped Streamline's default present-queue block for FG work (`eBlockNoClientQueues`): FG no longer holds the graphics/present queue until it finishes.
 - Gave the DLSS-G swapchain the same spare images / present fence depth as THWOMP FG (mailbox was starving under 3×+ and showing up as fence/present wait).
 - Passes `numBackBuffers` into `slDLSSGSetOptions`. Presentation mode and G-Sync remain player-controlled; safe defaults unchanged.
 
+○ Race base FPS + DLSS models (after `718149e` / tip when this ships)
+
+- Moved the FG inputs fence from a present-thread CPU wait to a GPU wait on the DLSS/present submit (race load was stalling behind FG).
+- Ping-pong HUD-less/UI buffers so FG can still read last frame while this frame writes.
+- Run `vk_present_dlss_first` for DLSS-G as well as THWOMP FG so upscale is not stuck in the blit CB.
+- Added CNN (legacy Preset F) beside Transformer / Transformer 2nd gen in settings; all qualities (DLAA → Ultra Performance) honour `MKW_DLSS_QUALITY` and log when they engage. Safe default remains FSR / Transformer when DLSS is chosen.
+
 ■ Other
 
-- Prior tip for ghosting quality: `8c14f2a`. Present/FG-policy tip: `886ab25`. Base-FPS tip: this section's newest commit.
+- Prior tips: ghosting `8c14f2a`, present/FG `886ab25`, FG queue parallel `718149e`. This section's newest commit is the race+models tip.
 - Headless offscreen still reports FG 2× on with 600 presents / 600 game frames (overlay 60/60); interactive 120 Hz sessions previously showed 60/120 — FG verify needs a real display.
 - Personal settings, dumps and logs are not part of any release package.
 

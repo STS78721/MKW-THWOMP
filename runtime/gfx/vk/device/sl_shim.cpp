@@ -299,15 +299,26 @@ extern "C" int sl_shim_evaluate(VkCommandBuffer cb, const SlShimFrame *f) {
     o.colorBuffersHDR = sl::Boolean::eFalse;   // the game's finished picture, read through sRGB: linear, within 0..1
     // No exposure texture: auto-exposure. useAutoExposure=false without a 1x1 exposure map ghosts moving contrast.
     o.useAutoExposure = sl::Boolean::eTrue;
-    sl::DLSSPreset gen1 = sl::DLSSPreset::ePresetK, gen2 = sl::DLSSPreset::ePresetM;
-    sl::DLSSPreset p = f->model == 2 ? gen2 : gen1;
+    // CNN = legacy Preset F (still in the SDK; A–D removed). Transformer = K, Transformer 2 = M (L for ultra).
+    sl::DLSSPreset p = f->model == 0   ? sl::DLSSPreset::ePresetF
+                       : f->model == 2 ? sl::DLSSPreset::ePresetM
+                                       : sl::DLSSPreset::ePresetK;
     o.dlaaPreset = o.qualityPreset = o.balancedPreset = o.performancePreset = p;
-    o.ultraPerformancePreset = f->model == 2 ? sl::DLSSPreset::ePresetL : gen1;
-    static int fails;
+    o.ultraPerformancePreset = f->model == 0 ? sl::DLSSPreset::ePresetF : sl::DLSSPreset::ePresetL;
+    static int fails, said_model = -1, said_mode = -1;
     sl::Result rr = p_options(vp, o);
     if (rr != sl::Result::eOk) {
         if (fails++ < 4) rt_log("dlss: slDLSSSetOptions failed (%d)", (int)rr);
         return 0;
+    }
+    if (f->model != said_model || (int)o.mode != said_mode) {
+        static const char *models[] = {"cnn (preset F)", "transformer (preset K)", "transformer2 (preset M/L)"};
+        static const char *modes[] = {"dlaa", "quality", "balanced", "performance", "ultra"};
+        int mi = f->model >= 0 && f->model < 3 ? f->model : 1;
+        int qi = f->mode < 5 ? f->mode : 1;
+        rt_log("dlss: Streamline options set — model %s, quality %s, out %ux%u", models[mi], modes[qi], f->out_w,
+               f->out_h);
+        said_model = f->model, said_mode = (int)o.mode;
     }
 
     sl::Constants c{};
@@ -489,21 +500,13 @@ extern "C" int sl_shim_fg_state(uint32_t *max_frames, uint32_t *status, uint32_t
     return 1;
 }
 
-extern "C" void sl_shim_fg_inputs_wait(VkDevice device) {
-    if (!device || !g_fg_inputs_sem || !g_fg_inputs_val) return;
-    VkSemaphore sem = g_fg_inputs_sem;
-    uint64_t val = g_fg_inputs_val;
+extern "C" int sl_shim_fg_inputs_take(VkSemaphore *sem, uint64_t *val) {
+    if (!g_fg_inputs_sem || !g_fg_inputs_val) return 0;
+    if (sem) *sem = g_fg_inputs_sem;
+    if (val) *val = g_fg_inputs_val;
     g_fg_inputs_sem = VK_NULL_HANDLE;
     g_fg_inputs_val = 0;
-    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &sem,
-                              .pValues = &val};
-    uint64_t p0 = perf_begin();
-    VkResult r = vkWaitSemaphores(device, &wi, 100000000ull);   // 100 ms: FG should have finished long before
-    perf_end(PERF_FENCE, p0);
-    if (r != VK_SUCCESS) {
-        static int said;
-        if (said++ < 4) rt_log("dlss: frame generation inputs still in use after 100 ms (%d)", (int)r);
-    }
+    return 1;
 }
 
 extern "C" void sl_shim_fg_loaded(int on) {

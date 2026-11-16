@@ -642,7 +642,8 @@ msgstr ""
 msgctxt "UI_MENU_DLSS_MODEL_DESC"
 msgid ""
 "NVIDIA's AI model for DLSS. Transformer: sharp and stable. Transformer 2nd gen: sharper still, "
-"with less ghosting, at a little more cost on the graphics card."
+"with less ghosting, at a little more cost. CNN: the older network, lighter on the graphics card "
+"(for older or less capable GPUs)."
 msgstr ""
 
 msgctxt "UI_MENU_DLSS_TRANSFORMER"
@@ -651,6 +652,10 @@ msgstr ""
 
 msgctxt "UI_MENU_DLSS_TRANSFORMER2"
 msgid "Transformer 2nd gen"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_CNN"
+msgid "CNN"
 msgstr ""
 
 msgctxt "UI_MENU_DLSS_QUALITY"

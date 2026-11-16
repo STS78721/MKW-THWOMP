@@ -20,7 +20,7 @@ typedef struct {
     uint32_t frame_index;
     int reset, ortho;
     int mode;    // 0 DLAA, 1 quality, 2 balanced, 3 performance, 4 ultra performance
-    int model;   // 1 transformer (presets K), 2 transformer 2nd generation (M; L for ultra performance)
+    int model;   // 0 CNN (preset F), 1 transformer (K), 2 transformer 2nd gen (M; L for ultra performance)
     uint32_t in_w, in_h, out_w, out_h;
     SlShimImage depth, mvec, color_in, color_out, bias, hudless, ui;   // bias: R16F; hudless+ui: RGBA8_UNORM out size
     float view_to_clip[16], clip_to_view[16], clip_to_prev_clip[16], prev_clip_to_clip[16], identity[16];   // row-major
@@ -58,11 +58,11 @@ int sl_shim_fg_set(uint32_t frames, uint32_t mvec_w, uint32_t mvec_h, uint32_t c
                    uint32_t num_back_buffers);
 // The plugin's state: the most frames it can make (numFramesToGenerateMax), its status bits (DLSSGStatus), the frames
 // presented since the last call and the smallest swapchain side it works at. 0: not loaded.
-// Also keeps the inputs-processing timeline semaphore from GetState for sl_shim_fg_inputs_wait.
+// Also keeps the inputs-processing timeline semaphore from GetState for sl_shim_fg_inputs_take.
 int sl_shim_fg_state(uint32_t *max_frames, uint32_t *status, uint32_t *presented, uint32_t *min_side);
-// Before rewriting FG-tagged inputs (HUD-less / UI / depth / MVs): wait until Streamline finished reading the last set.
-// Required with eBlockNoClientQueues so the present/graphics queue is not held for the whole FG workload.
-void sl_shim_fg_inputs_wait(VkDevice device);
+// Take the pending FG inputs timeline wait for the next submit that rewrites tagged buffers (GPU wait, not CPU).
+// Returns 1 with *sem/*val set; 0 if none. Required with eBlockNoClientQueues.
+int sl_shim_fg_inputs_take(VkSemaphore *sem, uint64_t *val);
 void sl_shim_fg_loaded(int on);   // before a swapchain is made: on, the next one goes through DLSS-G
 void sl_shim_fg_free(void);       // after turning it off for good: its memory back
 

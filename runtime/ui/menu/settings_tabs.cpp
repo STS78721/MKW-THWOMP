@@ -297,8 +297,8 @@ static void rows_upscaler(void) {
     opt_choice("MKW_UPSCALER", UI_MENU_UPSCALER, names, dlss ? 3 : 2, UI_MENU_UPSCALER_DESC, note);
     if (!strcmp(up, "fsr")) opt_slider("MKW_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
     if (!dlss || strcmp(up, "dlss")) return;
-    static const UiTextId models[] = {UI_MENU_DLSS_TRANSFORMER, UI_MENU_DLSS_TRANSFORMER2};
-    opt_choice("MKW_DLSS_MODEL", UI_MENU_DLSS_MODEL, models, 2, UI_MENU_DLSS_MODEL_DESC);
+    static const UiTextId models[] = {UI_MENU_DLSS_TRANSFORMER, UI_MENU_DLSS_TRANSFORMER2, UI_MENU_DLSS_CNN};
+    opt_choice("MKW_DLSS_MODEL", UI_MENU_DLSS_MODEL, models, 3, UI_MENU_DLSS_MODEL_DESC);
     // the game resolution follows at the next start (romfs_res.c romfs_dlss_lines): the size it renders at, below
     static const UiTextId qn[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_Q, UI_MENU_DLSS_BALANCED, UI_MENU_DLSS_PERF,
                                   UI_MENU_DLSS_ULTRA};

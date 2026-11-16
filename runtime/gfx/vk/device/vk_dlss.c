@@ -1,4 +1,4 @@
-// THWOMP: NVIDIA DLSS super resolution (MKW_UPSCALER=dlss, MKW_DLSS_MODEL=transformer|transformer2) through Streamline
+// THWOMP: NVIDIA DLSS super resolution (MKW_UPSCALER=dlss, MKW_DLSS_MODEL=cnn|transformer|transformer2) through Streamline
 // (sl_shim.cpp). The game renders at the lines MKW_DLSS_QUALITY gives (sdk/fs/romfs_res.c: Quality two thirds of the
 // window's, Balanced 58 %, Performance half, Ultra Performance a third, DLAA all); on the present, in place of FSR 1 or
 // the blit's scale, DLSS upscales the game's finished picture (tone-mapped, HUD included: MKW's picture without the HUD
@@ -47,10 +47,10 @@ static struct {
     VkPipelineLayout layout;
     VkPipeline pipe;
     VkSampler linear, nearest;
-    VkImage out, comp, hudless, ui, in[2];
-    VmaAllocation out_a, comp_a, hudless_a, ui_a, in_a[2];
-    VkImageView out_v, comp_v, hudless_v, ui_v, in_v[2];
-    uint32_t w, h, fg_img_w, fg_img_h, in_w, in_h, in_n;   // in[in_n % 2]: this frame's picture, the other last frame's
+    VkImage out, comp, hudless[2], ui[2], in[2];
+    VmaAllocation out_a, comp_a, hudless_a[2], ui_a[2], in_a[2];
+    VkImageView out_v, comp_v, hudless_v[2], ui_v[2], in_v[2];
+    uint32_t w, h, fg_img_w, fg_img_h, fg_i, in_w, in_h, in_n;   // fg_*: ping-pong HUD-less/UI; in[in_n%2]: this frame
     uint64_t in_frame, sl_eval_frame;                      // the game frame in[(in_n - 1) % 2] / last SL eval holds
     VkImageView src_view[8];
     uint64_t frames, fails, smaller, fmt_said;
@@ -301,9 +301,13 @@ static int images(VkCtx *c, uint32_t w, uint32_t h) {
     vk_queue_unlock();
     if (D.out) vkDestroyImageView(c->device, D.out_v, NULL), vmaDestroyImage(c->vma, D.out, D.out_a);
     if (D.comp) vkDestroyImageView(c->device, D.comp_v, NULL), vmaDestroyImage(c->vma, D.comp, D.comp_a);
-    if (D.hudless) vkDestroyImageView(c->device, D.hudless_v, NULL), vmaDestroyImage(c->vma, D.hudless, D.hudless_a);
-    if (D.ui) vkDestroyImageView(c->device, D.ui_v, NULL), vmaDestroyImage(c->vma, D.ui, D.ui_a);
-    D.out = D.comp = D.hudless = D.ui = VK_NULL_HANDLE;
+    for (int i = 0; i < 2; i++) {
+        if (D.hudless[i])
+            vkDestroyImageView(c->device, D.hudless_v[i], NULL), vmaDestroyImage(c->vma, D.hudless[i], D.hudless_a[i]);
+        if (D.ui[i]) vkDestroyImageView(c->device, D.ui_v[i], NULL), vmaDestroyImage(c->vma, D.ui[i], D.ui_a[i]);
+        D.hudless[i] = D.ui[i] = VK_NULL_HANDLE;
+    }
+    D.out = D.comp = VK_NULL_HANDLE;
     D.fg_img_w = D.fg_img_h = 0;
     if (!make(c, VK_FORMAT_R16G16B16A16_SFLOAT, OUT_USAGE, w, h, &D.out, &D.out_a, &D.out_v) ||
         !make(c, VK_FORMAT_R8G8B8A8_UNORM, COMP_USAGE, w, h, &D.comp, &D.comp_a, &D.comp_v))
@@ -313,20 +317,25 @@ static int images(VkCtx *c, uint32_t w, uint32_t h) {
     return 1;
 }
 
+// Two HUD-less/UI pairs so race FG can still read last frame's tags while we write this frame's (no present-thread stall).
 static int fg_images(VkCtx *c, uint32_t w, uint32_t h) {
-    if (D.hudless && D.ui && D.fg_img_w == w && D.fg_img_h == h) return 1;
-    if (D.hudless || D.ui) {
+    if (D.hudless[0] && D.hudless[1] && D.ui[0] && D.ui[1] && D.fg_img_w == w && D.fg_img_h == h) return 1;
+    if (D.hudless[0] || D.hudless[1] || D.ui[0] || D.ui[1]) {
         vk_queue_lock();
         vk_wait_device_idle(c->device);
         vk_queue_unlock();
     }
-    if (D.hudless) vkDestroyImageView(c->device, D.hudless_v, NULL), vmaDestroyImage(c->vma, D.hudless, D.hudless_a);
-    if (D.ui) vkDestroyImageView(c->device, D.ui_v, NULL), vmaDestroyImage(c->vma, D.ui, D.ui_a);
-    D.hudless = D.ui = VK_NULL_HANDLE;
-    if (!make(c, VK_FORMAT_R8G8B8A8_UNORM, COMP_USAGE, w, h, &D.hudless, &D.hudless_a, &D.hudless_v) ||
-        !make(c, VK_FORMAT_R8G8B8A8_UNORM, COMP_USAGE, w, h, &D.ui, &D.ui_a, &D.ui_v))
-        return 0;
-    D.fg_img_w = w, D.fg_img_h = h;
+    for (int i = 0; i < 2; i++) {
+        if (D.hudless[i])
+            vkDestroyImageView(c->device, D.hudless_v[i], NULL), vmaDestroyImage(c->vma, D.hudless[i], D.hudless_a[i]);
+        if (D.ui[i]) vkDestroyImageView(c->device, D.ui_v[i], NULL), vmaDestroyImage(c->vma, D.ui[i], D.ui_a[i]);
+        D.hudless[i] = D.ui[i] = VK_NULL_HANDLE;
+    }
+    for (int i = 0; i < 2; i++)
+        if (!make(c, VK_FORMAT_R8G8B8A8_UNORM, COMP_USAGE, w, h, &D.hudless[i], &D.hudless_a[i], &D.hudless_v[i]) ||
+            !make(c, VK_FORMAT_R8G8B8A8_UNORM, COMP_USAGE, w, h, &D.ui[i], &D.ui_a[i], &D.ui_v[i]))
+            return 0;
+    D.fg_img_w = w, D.fg_img_h = h, D.fg_i = 0;
     return 1;
 }
 
@@ -427,10 +436,13 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     static int inited = -1;
     if (inited < 0) inited = init(c);
     if (!inited) return VK_NULL_HANDLE;
-    // FG parallel mode: do not rewrite depth/MV/HUD-less/UI until Streamline finished reading the last tagged set
-    if (vk_dlssg_frames() > 0) sl_shim_fg_inputs_wait(c->device);
+    // FG inputs wait is GPU-side on the present/DLSS submit (sl_shim_fg_inputs_take), not a CPU stall here.
     unsigned v = cfg_version();
-    if (v != D.seen) D.seen = v, D.model = !strcmp(cfg_value("MKW_DLSS_MODEL"), "transformer2") ? 2 : 1;
+    if (v != D.seen) {
+        D.seen = v;
+        const char *mod = cfg_value("MKW_DLSS_MODEL");
+        D.model = !strcmp(mod, "cnn") ? 0 : !strcmp(mod, "transformer2") ? 2 : 1;
+    }
     // DLSS's colour: the game's finished picture (tone-mapped, HUD included), its crop copied out of the larger present
     // image; the bias hint compares it with last frame's (vk_mv_set_pictures)
     if (fmt != VK_FORMAT_R8G8B8A8_UNORM && fmt != VK_FORMAT_R8G8B8A8_SRGB) {
@@ -527,8 +539,18 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     static int always_reset = -1;
     if (always_reset < 0) always_reset = getenv("MKW_DLSS_ALWAYS_RESET") && atoi(getenv("MKW_DLSS_ALWAYS_RESET")) > 0;
     if (always_reset) s.reset = 1;
-    float ratio = (float)out_w / (float)f.w;   // the mode whose scale is nearest
-    s.mode = ratio < 1.2f ? 0 : ratio < 1.6f ? 1 : ratio < 1.85f ? 2 : ratio < 2.5f ? 3 : 4;
+    // Prefer the player's quality setting; fall back to scale if the string is unknown.
+    {
+        const char *q = cfg_value("MKW_DLSS_QUALITY");
+        float ratio = (float)out_w / (float)f.w;
+        int by_scale = ratio < 1.2f ? 0 : ratio < 1.6f ? 1 : ratio < 1.85f ? 2 : ratio < 2.5f ? 3 : 4;
+        s.mode = !strcmp(q, "dlaa")          ? 0
+                 : !strcmp(q, "quality")     ? 1
+                 : !strcmp(q, "balanced")    ? 2
+                 : !strcmp(q, "performance") ? 3
+                 : !strcmp(q, "ultra")       ? 4
+                                             : by_scale;
+    }
     s.model = D.model;
     s.in_w = f.w, s.in_h = f.h, s.out_w = out_w, s.out_h = out_h;
     s.depth = (SlShimImage){f.depth, f.depth_view, f.depth_fmt, f.w, f.h,
@@ -575,7 +597,8 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     if (!skip) D.sl_eval_frame = f.frame;
     // FG must not run without HUD-less + UI tags: otherwise Streamline warps menus/HUD with scene MVs (smear).
     // Ortho / 2D menus: keep DLSS SR but pause FG for this present.
-    int write_fg = s.fg && !skip && !s.ortho && D.hudless && D.ui && f.color_view;
+    unsigned fi = D.fg_i & 1;
+    int write_fg = s.fg && !skip && !s.ortho && D.hudless[fi] && D.ui[fi] && f.color_view;
     if (s.fg && !skip && !write_fg) {
         sl_shim_fg_clear_tags(cb, s.frame_index, out_w, out_h, s.bb_rect);
         static uint64_t skip_n, skip_log;
@@ -588,8 +611,8 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     barrier(cb, D.out, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cb, D.comp, VK_IMAGE_LAYOUT_UNDEFINED);
     if (write_fg) {
-        barrier(cb, D.hudless, VK_IMAGE_LAYOUT_UNDEFINED);
-        barrier(cb, D.ui, VK_IMAGE_LAYOUT_UNDEFINED);
+        barrier(cb, D.hudless[fi], VK_IMAGE_LAYOUT_UNDEFINED);
+        barrier(cb, D.ui[fi], VK_IMAGE_LAYOUT_UNDEFINED);
     }
     VkDescriptorImageInfo di[8] = {
         {D.linear, skip ? D.in_v[cur] : D.out_v, VK_IMAGE_LAYOUT_GENERAL},
@@ -598,8 +621,8 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
         {D.linear, f.bias_view, VK_IMAGE_LAYOUT_GENERAL},
         {D.linear, f.color_view ? f.color_view : D.in_v[cur], VK_IMAGE_LAYOUT_GENERAL},
         {D.linear, D.in_v[cur], VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, write_fg ? D.hudless_v : D.comp_v, VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, write_fg ? D.ui_v : D.comp_v, VK_IMAGE_LAYOUT_GENERAL}};
+        {VK_NULL_HANDLE, write_fg ? D.hudless_v[fi] : D.comp_v, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, write_fg ? D.ui_v[fi] : D.comp_v, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet w[8];
     for (uint32_t i = 0; i < 8; i++)
         w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1,
@@ -624,16 +647,30 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     vkCmdDispatch(cb, (out_w + 7) / 8, (out_h + 7) / 8, 1);
     barrier(cb, D.comp, VK_IMAGE_LAYOUT_GENERAL);
     if (write_fg) {
-        barrier(cb, D.hudless, VK_IMAGE_LAYOUT_GENERAL);
-        barrier(cb, D.ui, VK_IMAGE_LAYOUT_GENERAL);
-        s.hudless = (SlShimImage){D.hudless, D.hudless_v, VK_FORMAT_R8G8B8A8_UNORM, out_w, out_h, COMP_USAGE};
-        s.ui = (SlShimImage){D.ui, D.ui_v, VK_FORMAT_R8G8B8A8_UNORM, out_w, out_h, COMP_USAGE};
+        barrier(cb, D.hudless[fi], VK_IMAGE_LAYOUT_GENERAL);
+        barrier(cb, D.ui[fi], VK_IMAGE_LAYOUT_GENERAL);
+        s.hudless = (SlShimImage){D.hudless[fi], D.hudless_v[fi], VK_FORMAT_R8G8B8A8_UNORM, out_w, out_h, COMP_USAGE};
+        s.ui = (SlShimImage){D.ui[fi], D.ui_v[fi], VK_FORMAT_R8G8B8A8_UNORM, out_w, out_h, COMP_USAGE};
         if (sl_shim_tag_fg(cb, &s))
-            D.fg_tagged = 1, D.fg_in_w = f.w, D.fg_in_h = f.h, D.fg_out_w = out_w, D.fg_out_h = out_h;
+            D.fg_tagged = 1, D.fg_in_w = f.w, D.fg_in_h = f.h, D.fg_out_w = out_w, D.fg_out_h = out_h,
+            D.fg_i++;
     }
     if (D.qp) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, D.qp, qs * 2 + 1);
     D.last_bias = f.bias_view;
-    if (++D.frames == 1)
-        rt_log("dlss: first frame upscaled (%ux%u to %ux%u, mode %d, model %d)", f.w, f.h, out_w, out_h, s.mode, s.model);
+    if (++D.frames == 1) {
+        static const char *modes[] = {"dlaa", "quality", "balanced", "performance", "ultra"};
+        static const char *models[] = {"cnn", "transformer", "transformer2"};
+        rt_log("dlss: first frame upscaled (%ux%u to %ux%u, quality %s, model %s)", f.w, f.h, out_w, out_h,
+               modes[s.mode < 5 ? s.mode : 1], models[s.model < 3 ? s.model : 1]);
+    } else {
+        static int last_mode = -1, last_model = -1;
+        if (s.mode != last_mode || s.model != last_model) {
+            static const char *modes[] = {"dlaa", "quality", "balanced", "performance", "ultra"};
+            static const char *models[] = {"cnn", "transformer", "transformer2"};
+            rt_log("dlss: quality %s, model %s (%ux%u to %ux%u)", modes[s.mode < 5 ? s.mode : 1],
+                   models[s.model < 3 ? s.model : 1], f.w, f.h, out_w, out_h);
+            last_mode = s.mode, last_model = s.model;
+        }
+    }
     return D.comp;
 }

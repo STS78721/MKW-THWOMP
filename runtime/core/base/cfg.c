@@ -103,7 +103,8 @@ static const CfgMeta metas[] = {
     // multiplier, with DLSS; vk_dlss.c), whose plugins load at start; the preset goes into the driver profile
     {"FRAMEGEN_TYPE", "thwomp", "thwomp|dlss", RESTART}, {"DLSSG", "off", "off|2|3|4|6", LIVE},
     {"DLSSG_PRESET", "default", "default|a|b|c", RESTART},
-    {"UPSCALER", "fsr", "fsr|bilinear|dlss", LIVE}, {"DLSS_MODEL", "transformer", "transformer|transformer2", LIVE},
+    {"UPSCALER", "fsr", "fsr|bilinear|dlss", LIVE},
+    {"DLSS_MODEL", "transformer", "transformer|transformer2|cnn", LIVE},   // cnn: legacy Preset F for older GPUs
     {"DLSS_QUALITY", "quality", "dlaa|quality|balanced|performance|ultra", RESTART}, {"SHARPNESS", "80", "0..100", LIVE},
     {"PICTURE_FIT", "keep", "keep|stretch", LIVE}, {"HDR", "auto", "auto|off", LIVE},   // auto: HDR when the display is (hdr6c, 12/11/2026)
     {"DEVICE_PROFILE", "auto", "auto|desktop|deck", RESTART},
