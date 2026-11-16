@@ -514,9 +514,9 @@ static void portable_paths(RtConfig *c) {
 }
 
 // The start screen (ui/launcher/launcher.cpp) comes first in the player's build (no linked game code) on a plain start, and in
-// build/mkw with --launcher. --play, MKW_NO_LAUNCHER=1 or any other mode skip it; Play runs the process again with
-// MKW_LAUNCHED=1, so the game claims its address space in a fresh process (and on Windows the window's libraries are
-// gone).
+// build/mkw with --launcher. --play, MKW_NO_LAUNCHER=1, MKW_SHOW_LAUNCHER=0 or any other mode skip it; Play runs the
+// process again with MKW_LAUNCHED=1, so the game claims its address space in a fresh process (and on Windows the
+// window's libraries are gone). --launcher still opens it when SHOW_LAUNCHER is off (Menu tab / F1 can turn it back on).
 static int want_launcher(int argc, char **argv) {
     const char *done = getenv("MKW_LAUNCHED"), *off = getenv("MKW_NO_LAUNCHER");
     if ((done && *done) || (off && !strcmp(off, "1"))) return 0;
@@ -529,7 +529,10 @@ static int want_launcher(int argc, char **argv) {
             i++;
         else return 0;   // --play, a mode, --seconds: straight in
     }
-    return asked || !rt_game_builtin();
+    if (asked) return 1;
+    cfg_init();   // mkw.ini before the start-screen decision (SHOW_LAUNCHER lives under [launcher])
+    if (!cfg_bool("MKW_SHOW_LAUNCHER")) return 0;
+    return !rt_game_builtin();
 }
 
 static int run_launcher(int argc, char **argv) {

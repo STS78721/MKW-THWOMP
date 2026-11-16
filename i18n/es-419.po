@@ -2499,6 +2499,16 @@ msgstr ""
 "Al arrancar, pregunta a GitHub si hay una versión más nueva del port y la ofrece en la pantalla "
 "de inicio (unos segundos como mucho, nada sin conexión)."
 
+msgctxt "UI_MENU_SHOW_LAUNCHER"
+msgid "Show launcher on startup"
+msgstr ""
+
+msgctxt "UI_MENU_SHOW_LAUNCHER_DESC"
+msgid ""
+"Open the start screen when the port is launched. Turn Off to go straight into the game; use "
+"--launcher or this setting to bring the start screen back."
+msgstr ""
+
 msgctxt "UI_MENU_THEME"
 msgid "Menu theme"
 msgstr ""

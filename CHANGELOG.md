@@ -15,6 +15,10 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 
 ■ New & Improvements
 
+○ Show launcher on startup (`pending`)
+
+- Menu tab (launcher + F1): **Show launcher on startup** On/Off. Off skips the start screen on the next plain start and goes straight into the game. Default On. Persists as `MKW_SHOW_LAUNCHER` under `[launcher]`. `--launcher` still opens the start screen when it is Off.
+
 ○ Keyboard On / Off (`7bd6ab1`)
 
 - Controls tab (F1): **Keyboard** toggle enables or disables keyboard game controls. Controllers and mouse stay as they are; F1 / Esc still open the menu. Persists as `MKW_KEYBOARD` (default On).

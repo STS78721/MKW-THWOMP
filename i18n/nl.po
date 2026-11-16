@@ -2503,6 +2503,16 @@ msgstr ""
 "Vraagt bij het starten aan GitHub of er een nieuwere versie van de port is en biedt die aan op "
 "het startscherm (hooguit een paar seconden, offline niets)."
 
+msgctxt "UI_MENU_SHOW_LAUNCHER"
+msgid "Show launcher on startup"
+msgstr ""
+
+msgctxt "UI_MENU_SHOW_LAUNCHER_DESC"
+msgid ""
+"Open the start screen when the port is launched. Turn Off to go straight into the game; use "
+"--launcher or this setting to bring the start screen back."
+msgstr ""
+
 msgctxt "UI_MENU_THEME"
 msgid "Menu theme"
 msgstr ""

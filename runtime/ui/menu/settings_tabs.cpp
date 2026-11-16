@@ -576,6 +576,7 @@ static void tab_menu(float scale) {
     static const UiTextId themes[] = {UI_MENU_THEME_DARK, UI_MENU_THEME_LIGHT, UI_MENU_THEME_STEELTEMPLE};   // cfg.c order
     opt_choice("MKW_MENU_THEME", UI_MENU_THEME, themes, 3, UI_MENU_THEME_DESC);
     opt_toggle("MKW_UPDATE_CHECK", UI_MENU_UPDATE_CHECK, UI_MENU_UPDATE_CHECK_DESC);   // ui/launcher/launcher_update.cpp
+    opt_toggle("MKW_SHOW_LAUNCHER", UI_MENU_SHOW_LAUNCHER, UI_MENU_SHOW_LAUNCHER_DESC);   // core/boot/main.c want_launcher
     opt_end();
 }
 
