@@ -4,6 +4,41 @@ Each version's section is that release's notes: `tools/build/notes.py` puts it i
 updating, known issues, reporting) for the GitHub release. A section has a summary paragraph, `### Changes` (each with
 its issue, #N), `### Tested` (what was run from the packages before publishing) and optionally `### Known issues`.
 
+## Unreleased — DLSS ghosting (branch `cursor/dlssg-triage-b00c`)
+
+Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation ghosting (menu smear, kart/world shadow trails). Not a numbered release yet. **Test build tip:** `8c14f2a` → `build/dist/windows/mkw.exe`. Safe shipped defaults stay FSR / FG off; opt into DLSS+FG yourself to verify.
+
+■ Major Updates
+
+- Fixed DLSS transformer ghosting that BiasCurrentColorHint could not clear: modern presets (K/M/L) ignore that hint, so reactive pixels now go to Particle and AnimatedTexture masks, with a host-side lerp back to the current frame where the mask is hard.
+
+■ Bug Fixes
+
+○ DLSS Super Resolution (`fc1f07a`)
+
+- Enabled auto-exposure when no exposure texture is provided (missing exposure was a known ghosting cause).
+- Dilated motion vectors toward closer depth (thin lamps/poles) and told Streamline `motionVectorsDilated`.
+- Replaced soft full-frame bias with a sparse reactive mask (contact-shadow darken, hard thin edges, finished-vs-scene UI gap).
+- Stopped promoting raw shadow bias into the FG UI layer (that flooded HUD-less and broke recomposition).
+
+○ DLSS Super Resolution (`c49b545` — after `fc1f07a`)
+
+- Zeroed motion vectors on hard reactive hits so history cannot warp those pixels.
+- Lowered the finished-vs-scene UI gap so semi-transparent Free Roam and character-select panels are marked for reject.
+- Tightened compose history reject so hard mask hits replace DLSS output with the current game picture more readily.
+
+○ DLSS Super Resolution (`8c14f2a` — after `c49b545`, tip)
+
+- Reset DLSS history when the HUD-less scene capture is missing (character-select and some Free Roam panes).
+- Without HUD-less, rejected finished-picture temporal diffs so menu icons do not trail in SR history.
+- Added `MKW_DLSS_ALWAYS_RESET=1` for diagnosis (optional; not a player default).
+
+■ Other
+
+- Commit chain for this tip: `fc1f07a` → `c49b545` → `8c14f2a`.
+- Headless offscreen still reports FG 2× on with 600 presents / 600 game frames (overlay 60/60); interactive 120 Hz sessions previously showed 60/120 — FG verify needs a real display.
+- Personal settings, dumps and logs are not part of any release package.
+
 ## MKW-THWOMP 0.2.1b
 
 THWOMP's releases come first, in the Pearl Abyss style of its other projects (■ sections, ○ groups); the GitHub release carries the same text. Upstream mkw-recomp's own notes follow from 0.1.12 down.
