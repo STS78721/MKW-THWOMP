@@ -346,14 +346,20 @@ extern "C" int sl_shim_evaluate(VkCommandBuffer cb, const SlShimFrame *f) {
     sl::Extent ebb{};
     int have_ebb = to_sl_ebb(f->bb_rect, f->out_w, f->out_h, &ebb);
     sl::ResourceLifecycle fg_life = f->fg ? sl::ResourceLifecycle::eOnlyValidNow : sl::ResourceLifecycle::eValidUntilEvaluate;
-    sl::ResourceTag tags[6] = {
-        sl::ResourceTag(&depth, sl::kBufferTypeDepth, fg_life, &ein),
-        sl::ResourceTag(&mvec, sl::kBufferTypeMotionVectors, fg_life, &ein),
-        sl::ResourceTag(&in, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &ein),
-        sl::ResourceTag(&out, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &eout),
-        sl::ResourceTag(&bias, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilEvaluate, &ein),
-        {}};
-    uint32_t nt = f->bias.image ? 5 : 4;
+    // Bias also feeds ShadowHint + ReactiveMask + InvalidDepthMotion (UI overlays): same 0..1 mask, high = unstable.
+    sl::ResourceTag tags[10];
+    uint32_t nt = 0;
+    tags[nt++] = sl::ResourceTag(&depth, sl::kBufferTypeDepth, fg_life, &ein);
+    tags[nt++] = sl::ResourceTag(&mvec, sl::kBufferTypeMotionVectors, fg_life, &ein);
+    tags[nt++] = sl::ResourceTag(&in, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &ein);
+    tags[nt++] = sl::ResourceTag(&out, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &eout);
+    if (f->bias.image) {
+        sl::ResourceLifecycle bl = sl::ResourceLifecycle::eValidUntilEvaluate;
+        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeBiasCurrentColorHint, bl, &ein);
+        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeReactiveMaskHint, bl, &ein);
+        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeShadowHint, bl, &ein);
+        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeInvalidDepthMotionHint, bl, &ein);
+    }
     // Backbuffer extent: pass a real subrect, or nullptr for the full swapchain — never 0x0.
     if (f->fg)
         tags[nt++] = sl::ResourceTag(nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle{},

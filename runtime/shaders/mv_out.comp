@@ -1,31 +1,31 @@
 #version 450
-// THWOMP motion vectors for DLSS (runtime/gfx/vk/device/vk_mv.c vk_mv_frame_inputs): per pixel of the render size, in
-// pixels, from this frame to the previous one (previous minus current, x right, y down), without the camera jitter.
-// Where an object's own vertex shader gave its motion (the velocity pass, alpha 1) that is used, less the jitter's
-// change it carries; elsewhere the camera's motion from the depth and the two view-projections.
-//
-// Also DLSS's bias-current-colour hint (0 keep the history, 1 drop it):
-// - camera-motion pixels: soft shadows / disocclusions (kart shadow on bright sand) -> high bias
-// - finished vs scene-without-HUD: menus and race HUD -> bias 1
-// - previous sample off-screen: disocclusion -> bias 1
+// THWOMP motion vectors + DLSS bias/shadow/UI hints (vk_mv.c).
+// MVs: object velocity where drawn, else camera from depth. Pixels, prev-minus-cur, unjittered.
+// Bias (R): reject DLSS history. Also tagged as ReactiveMask / ShadowHint / InvalidDepthMotion for UI.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D depth;
 layout(binding = 1) uniform sampler2D vel;
 layout(binding = 2, rg16f) uniform writeonly image2D mv_out;
-layout(binding = 3) uniform sampler2D cur_pic;      // this frame's finished picture (HUD included with DLSS)
-layout(binding = 4) uniform sampler2D prev_pic;     // last frame's
+layout(binding = 3) uniform sampler2D cur_pic;      // finished picture (sRGB view -> linear)
+layout(binding = 4) uniform sampler2D prev_pic;
 layout(binding = 5, r16f) uniform writeonly image2D bias_out;
-layout(binding = 6) uniform sampler2D cur_scene;    // this frame's scene without the HUD (has_scene)
-layout(binding = 7) uniform sampler2D prev_scene;   // last frame's
+layout(binding = 6) uniform sampler2D cur_scene;    // pre-tonemap scene without HUD (B10G11R11)
+layout(binding = 7) uniform sampler2D prev_scene;
 layout(push_constant) uniform P {
-    mat4 m;       // NDC (this frame) -> clip (last frame), column-major
-    vec2 size;    // render size
-    vec2 jd;      // this frame's jitter minus last frame's, pixels
+    mat4 m;
+    vec2 size;
+    vec2 jd;
     float has_prev;
     float has_scene;
 } pc;
 
 float tone(vec3 c) { return sqrt(max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0)); }
+// Match finished SDR-ish range before comparing to cur_pic (fixes HUD detection on HDR scene copy).
+vec3 approx_tm(vec3 c) {
+    c = max(c, vec3(0.0));
+    return c / (c + vec3(1.0));
+}
+float tone_scene(vec3 c) { return tone(approx_tm(c)); }
 
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -47,45 +47,51 @@ void main() {
     vec2 prev_uv = uv + (mv - pc.jd) / pc.size;
     bool prev_ok = pc.has_prev > 0.5 && all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
     if (pc.has_prev > 0.5 && !prev_ok) {
-        // Newly revealed pixels (screen-edge / large motion): drop history — stops lamp/world ghost flashes.
         bias = 1.0;
     } else if (prev_ok) {
         float ct = tone(texelFetch(cur_pic, p, 0).rgb);
         float pt = tone(texture(prev_pic, prev_uv).rgb);
         float diff = abs(ct - pt);
+        // Soft shadows: do NOT clamp with a 3x3 history box (that hid gradual shadow motion on bright sand).
+        // Dilate the raw darken/lighten signal so blocky trails get full history reject.
         if (cam) {
-            float pmin = pt, pmax = pt;
+            float shadow_raw = 0.0;
             vec2 texel = 1.0 / pc.size;
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    if (dx == 0 && dy == 0) continue;
-                    float nt = tone(texture(prev_pic, clamp(prev_uv + vec2(dx, dy) * texel, vec2(0.0), vec2(1.0))).rgb);
-                    pmin = min(pmin, nt);
-                    pmax = max(pmax, nt);
+            ivec2 max_p = ivec2(pc.size) - 1;
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dx = -2; dx <= 2; dx++) {
+                    ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
+                    vec2 puv = clamp(prev_uv + vec2(dx, dy) * texel, vec2(0.0), vec2(1.0));
+                    float c = tone(texelFetch(cur_pic, q, 0).rgb);
+                    float pv = tone(texture(prev_pic, puv).rgb);
+                    float darken = max(0.0, pv - c);
+                    float lighten = max(0.0, c - pv);
+                    // Darkening (shadow arrives) weighted higher — the common kart-shadow trail case.
+                    shadow_raw = max(shadow_raw, max(darken * 1.6, lighten));
                 }
             }
-            float box_diff = max(0.0, max(ct - pmax, pmin - ct));
-            float rdiff = box_diff / (max(ct, pmax) + 0.05);
-            // Soft shadow on bright sand: small absolute delta — catch with absolute + relative curves.
-            float shadow = max(smoothstep(0.008, 0.035, rdiff), smoothstep(0.012, 0.045, box_diff));
-            bias = max(bias, shadow);
+            bias = max(bias, smoothstep(0.006, 0.028, shadow_raw));
             float mlen = length(mv);
-            if (mlen > 2.0)
-                bias = max(bias, smoothstep(0.006, 0.025, box_diff) * smoothstep(2.0, 10.0, mlen));
+            if (mlen > 1.5)
+                bias = max(bias, smoothstep(0.004, 0.02, shadow_raw) * smoothstep(1.5, 8.0, mlen));
         } else {
-            bias = max(bias, smoothstep(0.04, 0.12, diff));
+            bias = max(bias, smoothstep(0.03, 0.10, diff));
         }
         if (pc.has_scene > 0.5) {
-            float sc = tone(texelFetch(cur_scene, p, 0).rgb);
-            float sp = tone(texture(prev_scene, prev_uv).rgb);
+            float sc = tone_scene(texelFetch(cur_scene, p, 0).rgb);
+            float sp = tone_scene(texture(prev_scene, prev_uv).rgb);
             float sdiff = abs(sc - sp) / (max(sc, sp) + 0.05);
-            // Finished moved, pre-HUD scene did not => menu / race HUD / prompts.
-            float hud = smoothstep(0.012, 0.04, diff) * (1.0 - smoothstep(0.015, 0.07, sdiff));
-            if (hud > 0.45) bias = 1.0;
+            // Finished moved, tonemapped-scene did not => menu / HUD / prompts.
+            float hud = smoothstep(0.008, 0.03, diff) * (1.0 - smoothstep(0.01, 0.06, sdiff));
+            if (hud > 0.35) bias = 1.0;
             else bias = max(bias, hud);
-            // Strong finished-vs-scene gap this frame (UI sitting on the scene).
-            float ui_gap = abs(ct - sc) / (max(ct, sc) + 0.08);
-            if (ui_gap > 0.12 && sdiff < 0.08) bias = max(bias, smoothstep(0.12, 0.28, ui_gap));
+            // Same-frame finished vs scene (UI composited on 3D) — both in ~0..1 after approx_tm.
+            float ui_gap = abs(ct - sc) / (max(ct, sc) + 0.06);
+            if (ui_gap > 0.08 && sdiff < 0.10) {
+                float u = smoothstep(0.08, 0.22, ui_gap);
+                if (u > 0.5) bias = 1.0;
+                else bias = max(bias, u);
+            }
         }
     }
     imageStore(mv_out, p, vec4(mv, 0.0, 0.0));

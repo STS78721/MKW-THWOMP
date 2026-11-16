@@ -1,24 +1,21 @@
 #version 450
-// THWOMP DLSS (runtime/gfx/vk/device/vk_dlss.c): DLSS's output (linear: the game's finished picture, HUD included,
-// upscaled to the window's size) encoded to sRGB as the game's own picture is, into the RGBA8 picture the present
-// takes; with DLSS-G, also outputs HUD-less background and premultiplied UI + alpha for UI recomposition.
-// MKW_DLSS_MASK=1 (diagnosis): DLSS's picture on the left half, the game's own bilinearly scaled on the right;
-// 2: DLSS's picture with the bias hint in red (where DLSS takes this frame's pixels: the HUD, the menus, shadows).
+// THWOMP DLSS compose: encode DLSS linear -> sRGB present; with DLSS-G, split HUD-less + premultiplied UI.
+// UI must never remain inside HUD-less (that made Streamline warp Multiplayer text with scene MVs).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D dlss;
 layout(binding = 1) uniform sampler2D final_pic;
 layout(binding = 2, rgba8) uniform writeonly image2D dst;
-layout(binding = 3) uniform sampler2D bias;         // DLSS's bias hint, the render size (MKW_DLSS_MASK=2)
-layout(binding = 4) uniform sampler2D hudless_in;   // pre-tonemap scene without UI (B10G11R11), render size
-layout(binding = 5) uniform sampler2D in_cur;       // linear Scene+UI (R8G8B8A8_SRGB), render size
+layout(binding = 3) uniform sampler2D bias;
+layout(binding = 4) uniform sampler2D hudless_in;   // pre-tonemap scene without UI
+layout(binding = 5) uniform sampler2D in_cur;       // linear Scene+UI
 layout(binding = 6, rgba8) uniform writeonly image2D dst_hudless;
 layout(binding = 7, rgba8) uniform writeonly image2D dst_ui;
 layout(push_constant) uniform P {
-    vec4 crop;       // the final picture's crop rectangle in its texture (x, y, w, h), texels
-    vec2 tex;        // that texture's size
-    vec2 size;       // dst's size
-    float view;      // MKW_DLSS_MASK
-    float write_fg;  // > 0.5: also split out dst_hudless + dst_ui
+    vec4 crop;
+    vec2 tex;
+    vec2 size;
+    float view;
+    float write_fg;
 } pc;
 
 vec3 enc(vec3 c) {
@@ -26,7 +23,6 @@ vec3 enc(vec3 c) {
     return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
 }
 
-// Approximate tone map for the pre-tonemap HUD-less float: comparison / FG background only.
 vec3 approx_tm(vec3 c) {
     c = max(c, vec3(0.0));
     return c / (c + vec3(1.0));
@@ -75,40 +71,47 @@ void main() {
 
     if (pc.write_fg > 0.5) {
         ivec2 rsize = textureSize(in_cur, 0);
-        ivec2 i0 = ivec2(floor(uv * vec2(rsize) - 0.5));
-        ivec2 max_p = rsize - 1;
         float b = texture(bias, uv).r;
-        float ui_present = b;
-        for (int dy = 0; dy <= 1; dy++) {
-            for (int dx = 0; dx <= 1; dx++) {
-                ivec2 q = clamp(i0 + ivec2(dx, dy), ivec2(0), max_p);
-                vec3 a_ui = clamp(enc(texelFetch(in_cur, q, 0).rgb), 0.0, 1.0);
-                vec3 a_hl = clamp(enc(approx_tm(texelFetch(hudless_in, q, 0).rgb)), 0.0, 1.0);
-                vec3 df = abs(a_ui - a_hl);
-                ui_present = max(ui_present, max(df.r, max(df.g, df.b)));
-            }
-        }
-        // CRITICAL: never leave UI inside HUD-less. Defaulting H=F made Streamline warp menus/HUD with scene MVs.
         vec3 H_bg = sample_hudless_srgb(rsize, uv);
-        float ui_w = clamp(max(b * 1.25, smoothstep(0.04, 0.18, ui_present)), 0.0, 1.0);
-        // Non-UI: keep F (matches what DLSS produced). UI: strip to scene background.
+        vec3 diff_bg = abs(F - H_bg);
+        float d_bg = max(diff_bg.r, max(diff_bg.g, diff_bg.b));
+        // Hard UI: any strong finished-vs-scene gap (menu text, minimap) — do not require bias alone.
+        float ui_w = clamp(max(b, smoothstep(0.03, 0.12, d_bg)), 0.0, 1.0);
+        if (d_bg > 0.10) ui_w = 1.0;
+        if (b > 0.55) ui_w = 1.0;
+
         vec3 H = mix(F, H_bg, ui_w);
         vec4 U = vec4(0.0);
         if (ui_w > 0.02) {
-            vec3 diff = F - H;
-            float d = max(abs(diff.r), max(abs(diff.g), abs(diff.b)));
             float ax = 0.0;
             for (int k = 0; k < 3; k++) {
-                float req = F[k] < H[k] ? (H[k] - F[k]) / max(H[k], 1e-4)
-                                         : (F[k] - H[k]) / max(1.0 - H[k], 1e-4);
+                float req = F[k] < H_bg[k] ? (H_bg[k] - F[k]) / max(H_bg[k], 1e-4)
+                                           : (F[k] - H_bg[k]) / max(1.0 - H_bg[k], 1e-4);
                 ax = max(ax, req);
             }
-            // Bias-driven floor so menu text / minimap always get a real UI layer even if tonemap mismatch is mild.
-            float alpha = clamp(max(ax, ui_w * 0.85), 0.0, 1.0) * smoothstep(0.02, 0.55, ui_w);
-            if (d < 0.008 && b < 0.35) alpha = 0.0;
+            float alpha = clamp(max(ax, ui_w), 0.0, 1.0);
+            // Menu panels / text: force full UI layer so FG never warps them.
+            if (ui_w >= 0.95) alpha = max(alpha, 0.92);
             if (alpha > 0.002) {
-                // Re-resolve H against alpha so FG composites cleanly: H + U*(premult) ~= F.
                 H = mix(F, H_bg, alpha);
+                U = vec4(clamp(F - (1.0 - alpha) * H, vec3(0.0), vec3(alpha)), alpha);
+            }
+        }
+        // Reactive shadows for FG: high bias on ground (soft shadow) stays in current game frame's colour —
+        // put a non-warped overlay so interpolated frames do not drag old shadow blocks.
+        if (b > 0.4 && ui_w < 0.5) {
+            float sa = smoothstep(0.4, 0.85, b);
+            // Keep H as scene-ish; add current F as a short-lived overlay (shadow update).
+            vec3 Hs = mix(H, H_bg, sa * 0.65);
+            float ax = 0.0;
+            for (int k = 0; k < 3; k++) {
+                float req = F[k] < Hs[k] ? (Hs[k] - F[k]) / max(Hs[k], 1e-4)
+                                         : (F[k] - Hs[k]) / max(1.0 - Hs[k], 1e-4);
+                ax = max(ax, req);
+            }
+            float alpha = clamp(ax * sa, 0.0, 1.0);
+            if (alpha > U.a) {
+                H = Hs;
                 U = vec4(clamp(F - (1.0 - alpha) * H, vec3(0.0), vec3(alpha)), alpha);
             }
         }
