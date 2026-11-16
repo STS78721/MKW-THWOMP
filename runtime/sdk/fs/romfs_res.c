@@ -188,6 +188,14 @@ int romfs_dlss_lines(const char *mode) {
     for (int i = 0; i < 5; i++) {
         if (strcmp(mode, q[i])) continue;
         int lines = (int)(h * s[i] / 18.0f + 0.5f) * 18;
+        // Odd multiples of 18 (e.g. 1080p Balanced → 630) make width a multiple of 32 but the game's
+        // scene depth often comes back 2 lines short (630→628). Motion-vector inputs then refuse the
+        // frame (cam size ≠ present crop) and DLSS never evaluates. Prefer a multiple of 36.
+        if (lines >= 360 && (lines % 36) == 18) {
+            float target = h * s[i];
+            int up = lines + 18, down = lines - 18;
+            lines = (down >= 360 && fabsf((float)down - target) <= fabsf((float)up - target)) ? down : up;
+        }
         return lines < 360 ? 360 : lines;
     }
     return 0;

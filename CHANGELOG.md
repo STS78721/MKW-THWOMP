@@ -46,16 +46,20 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 - Gave the DLSS-G swapchain the same spare images / present fence depth as THWOMP FG (mailbox was starving under 3×+ and showing up as fence/present wait).
 - Passes `numBackBuffers` into `slDLSSGSetOptions`. Presentation mode and G-Sync remain player-controlled; safe defaults unchanged.
 
-○ Race base FPS + DLSS models (after `718149e` / tip when this ships)
+○ Race base FPS + DLSS models (`5437c09`)
 
 - Moved the FG inputs fence from a present-thread CPU wait to a GPU wait on the DLSS/present submit (race load was stalling behind FG).
 - Ping-pong HUD-less/UI buffers so FG can still read last frame while this frame writes.
 - Run `vk_present_dlss_first` for DLSS-G as well as THWOMP FG so upscale is not stuck in the blit CB.
 - Added CNN (legacy Preset F) beside Transformer / Transformer 2nd gen in settings; all qualities (DLAA → Ultra Performance) honour `MKW_DLSS_QUALITY` and log when they engage. Safe default remains FSR / Transformer when DLSS is chosen.
 
+○ DLSS Balanced at 1080p (after `5437c09` / tip when this ships)
+
+- Snap DLSS render lines that land on odd multiples of 18 (1080p Balanced was 630) up/down to a multiple of 36. At 630 the game’s scene depth came back 1120×628 vs a 1120×630 crop, so motion vectors refused the frame and DLSS never evaluated.
+
 ■ Other
 
-- Prior tips: ghosting `8c14f2a`, present/FG `886ab25`, FG queue parallel `718149e`. This section's newest commit is the race+models tip.
+- Prior tips: ghosting `8c14f2a`, present/FG `886ab25`, FG queue parallel `718149e`, race+models `5437c09`. This section's newest commit is the Balanced-1080p tip.
 - Headless offscreen still reports FG 2× on with 600 presents / 600 game frames (overlay 60/60); interactive 120 Hz sessions previously showed 60/120 — FG verify needs a real display.
 - Personal settings, dumps and logs are not part of any release package.
 
