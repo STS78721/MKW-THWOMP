@@ -15,6 +15,12 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 
 ■ New & Improvements
 
+○ DLSS-G FG split matches presented picture (`ac0e5d3`)
+
+- Frame generation HUD-less/UI split is built from the post-reject compose colour (`o`), not raw DLSS `F`, so Streamline’s UI+(1−α)×HUD-less matches what is drawn.
+- While DLSS-G tags a frame, colour profiles are applied in compose before that split (same ops as the present grade pass); the post-compose grade is skipped so Default and non-Default profiles stay consistent with generated frames.
+- **Test build tip:** `ac0e5d3` — `build/dist/windows/mkw.exe` SHA256 `EED1C0571FEF26F849B946D1700E0B65D0230D0F6EAF0E89FAE95C7C0D73EB5B` (34444288 bytes; +2560 vs `bd70085` / `16b540e`).
+
 ○ DLSS-G 5x multiplier (`16b540e`)
 
 - Frame generation (DLSS type): **5x** restored alongside 2x–6x. NVIDIA Fixed FG Mode lists 5x; the UI and Streamline path no longer remap or omit it. Default remains Off.
