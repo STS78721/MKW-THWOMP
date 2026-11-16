@@ -133,7 +133,6 @@ void vk_dlss_post_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, u
 int vk_dlssg_loaded(void) { return (D.have & SL_SHIM_FG) != 0; }       // its plugin runs on this device
 int vk_dlssg_reflex(void) { return (D.have & SL_SHIM_REFLEX) != 0; }   // Streamline's Reflex replaces the driver's
 uint32_t vk_dlssg_max(void) { return D.fg_max ? D.fg_max + 1 : 0; }    // the highest multiplier, 0 unknown
-int vk_dlssg_compose_graded(void) { return D.fg_tagged != 0; }         // present: skip post colour grade
 
 // The frames per game frame the settings ask for and this GPU makes (multiplier - 1), 0 off. Needs DLSS super
 // resolution running (its depth and motion vectors). Honours MKW_DLSSG (2/3/4/5/6); only clamps to the GPU's
@@ -252,7 +251,7 @@ static int init(VkCtx *c) {
     VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
                                            .bindingCount = 8, .pBindings = b};
-    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 56};   // +vec4 colour adj for FG-before-split grade
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 40};
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR,
                               .minFilter = VK_FILTER_LINEAR, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
                               .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
@@ -631,14 +630,10 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
                                       .pImageInfo = &di[i]};
     static int mask = -1;   // MKW_DLSS_MASK=1 (diagnosis): DLSS's picture left, the game's (bilinear) right
     if (mask < 0) mask = getenv("MKW_DLSS_MASK") ? atoi(getenv("MKW_DLSS_MASK")) : 0;
-    float adj[4] = {0.0f, 1.0f, 1.0f, 1.0f};
-    if (write_fg) vk_color_adj(adj);   // grade inside compose before FG split; present skips vk_color_record
-    // Layout matches GLSL std430: vec4 adj at offset 32 (after crop/tex/size), then view/write_fg.
-    struct { float crop[4], tex[2], size[2], adj[4], view, write_fg; } pc = {
+    struct { float crop[4], tex[2], size[2], view, write_fg; } pc = {
         {(float)crop[0], (float)crop[1], (float)crop[2], (float)crop[3]},
         {(float)src_w, (float)src_h},
         {(float)out_w, (float)out_h},
-        {adj[0], adj[1], adj[2], adj[3]},
         (float)mask,
         write_fg ? 1.0f : 0.0f};
     // Manual Streamline hooking: route CmdBindPipeline through the interposer after slEvaluateFeature so

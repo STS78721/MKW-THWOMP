@@ -103,8 +103,6 @@ void vk_fsr_release(void);   // before the device goes away
 // every MKW_COLOR_* value is "unchanged" (the present then reads the game's image as before)
 VkImage vk_color_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]);
 void vk_color_release(void);   // before the device goes away
-// Fills adj[4] = brightness, contrast, saturation, gamma (identity 0,1,1,1). 1 if any differs from identity.
-int vk_color_adj(float adj[4]);
 // The F1 menu on an HDR10 swapchain (vk_hdr_ui.c): vk_hdr_ui_target is the RGBA8 image of w x h the menu draws into
 // (COLOR_ATTACHMENT_OPTIMAL, to be cleared to 0; VK_NULL_HANDLE when it cannot be made), vk_hdr_ui_compose blends it
 // onto dst_view, a swapchain image of format fmt in COLOR_ATTACHMENT_OPTIMAL, at the system's paper white.
@@ -165,7 +163,6 @@ int vk_dlssg_loaded(void);         // its plugin runs on this device (loaded at 
 int vk_dlssg_reflex(void);         // Streamline's Reflex and PCL run (vk_reflex.c goes through them)
 uint32_t vk_dlssg_max(void);       // the highest multiplier this GPU makes, 0 unknown
 uint32_t vk_dlssg_frames(void);    // frames per game frame the settings ask for and the GPU makes, 0 off
-int vk_dlssg_compose_graded(void); // last vk_dlss_record wrote FG tags (colour already graded in compose)
 uint32_t vk_dlssg_running(void);   // the multiplier in effect now, 0 none
 uint32_t vk_dlssg_take_presented(void);   // frames actually presented by DLSS-G since the last call
 void vk_dlssg_swapchain(int on);   // before a swapchain is made: through DLSS-G or not

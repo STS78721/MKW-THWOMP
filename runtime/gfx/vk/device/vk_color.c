@@ -124,12 +124,6 @@ static int adjusting(void) {
     return C.adj[0] != 0.0f || C.adj[1] != 1.0f || C.adj[2] != 1.0f || C.adj[3] != 1.0f;
 }
 
-int vk_color_adj(float adj[4]) {
-    int on = adjusting();
-    if (adj) adj[0] = C.adj[0], adj[1] = C.adj[1], adj[2] = C.adj[2], adj[3] = C.adj[3];
-    return on;
-}
-
 static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkPipelineStageFlags2 ss, VkAccessFlags2 sa,
                     VkPipelineStageFlags2 ds, VkAccessFlags2 da) {
     VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = ss, .srcAccessMask = sa,

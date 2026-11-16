@@ -874,11 +874,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                      ? vk_dlss_record(cb, slot, src, fmt, prect, w, h, (uint32_t)to[2], (uint32_t)to[3], to)
                      : VK_NULL_HANDLE;
     if (dl) src = dl, fmt = VK_FORMAT_R8G8B8A8_UNORM, w = to[2], h = to[3], prect = drect, cx = cy = 0, cw = to[2], ch = to[3];
-    // DLSS-G tagged this frame: colour grade already applied in dlss_compose before the HUD-less/UI split.
-    // A second pass here would grade the screen only and break UI+(1-α)H vs the backbuffer.
-    VkImage graded = src && general && !g_sc_hdr && !vk_dlssg_compose_graded()
-                         ? vk_color_record(cb, slot, src, fmt, prect)
-                         : VK_NULL_HANDLE;
+    VkImage graded = src && general && !g_sc_hdr ? vk_color_record(cb, slot, src, fmt, prect) : VK_NULL_HANDLE;
     if (graded) src = graded, fmt = VK_FORMAT_R16G16B16A16_SFLOAT, w = cw, h = ch, prect = grect, cx = cy = 0;
     // FSR (MKW_UPSCALER) when the picture's rectangle is larger than the crop; else the bilinear blit
     uint32_t crumb = src ? vk_crumb_op(cb, "present scaling", (uint32_t)to[2], (uint32_t)to[3]) : 0;
