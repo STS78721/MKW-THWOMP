@@ -15,12 +15,13 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 
 ■ New & Improvements
 
-○ DLSS-G FG split matches presented picture (`a8d54d3`)
+○ DLSS-G FG split matches presented picture (`12b9c66`)
 
 - Frame generation HUD-less/UI split is built from the post-reject compose colour (`o`), not raw DLSS `F`, so Streamline’s UI+(1−α)×HUD-less matches what is drawn.
 - While DLSS-G tags a frame, colour profiles are applied in compose before that split (same ops as the present grade pass); the post-compose grade is skipped so Default and non-Default profiles stay consistent with generated frames.
 - Fixed white-screen regression on `ac0e5d3`: push-constant `adj` was misaligned (host offset 40 vs GLSL std430 offset 48), so brightness read as ~1 and blew the picture to white under FG. Host/GLSL now share the same layout; identity adj skips the grade.
-- **Test build tip:** `a8d54d3` — `build/dist/windows/mkw.exe` SHA256 `4C71EEC986180A7561BB9517E488B21A2BB4003A7AECE4A03C1F89875868C6E1` (34444288 bytes; same size as `ac0e5d3`, layout fix only).
+- Fixed flicker when `MKW_FRAMEGEN_TYPE=dlss` but a leftover `MKW_FRAMEGEN=2|3|4` was still set: THWOMP `mult_now()` now respects `vk_fg_wanted()` so it does not interpolate under DLSS-G.
+- **Test build tip:** `12b9c66` — `build/dist/windows/mkw.exe` SHA256 `39B407659B47430ED37E93250B34208F1B94B6E93CABE98E4D6D60A97EB0F7D5` (34444288 bytes).
 
 ○ DLSS-G 5x multiplier (`16b540e`)
 
