@@ -6,7 +6,7 @@ its issue, #N), `### Tested` (what was run from the packages before publishing) 
 
 ## Unreleased — DLSS ghosting (branch `cursor/dlssg-triage-b00c`)
 
-Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not a numbered release yet. **Test build tip:** see the newest Bug Fixes / New & Improvements blocks below for the hash and `build/dist/windows/mkw.exe`. Safe shipped defaults stay FSR / FG off / Presentation mailbox; opt into DLSS+FG yourself to verify. G-Sync/VRR is not forced on or off — use the NVIDIA Control Panel (and Presentation) as you like.
+Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not a numbered release yet. **Test build tip:** see the newest Bug Fixes / New & Improvements blocks below for the hash and `build/dist/windows/mkw.exe`. Safe shipped defaults stay FSR / FG off / Presentation **VSync (fifo)**; opt into DLSS+FG and Mailbox yourself to verify. G-Sync/VRR is not forced on or off — use the NVIDIA Control Panel (and Presentation) as you like.
 
 ■ Major Updates
 
@@ -14,6 +14,10 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 - Restored player control of DLSS frame-generation multipliers and Presentation mode (no hard 2× refresh lock; no forced immediate present for FG).
 
 ■ New & Improvements
+
+○ Presentation default VSync (`pending`)
+
+- Default Presentation is **VSync (fifo)** so the in-game map no longer tears while panning on a fresh install. Mailbox and Immediate stay in the menu. When Mailbox is not offered by the driver, fall back to plain FIFO (not FIFO_RELAXED). G-Sync/VRR stay under your control.
 
 ○ DLSS-G FG split matches presented picture (`07a8c55`)
 

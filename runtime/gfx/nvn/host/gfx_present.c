@@ -261,16 +261,17 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd, g_surface, &n, m);
     VkPresentModeKHR got = VK_PRESENT_MODE_FIFO_KHR;
     for (uint32_t i = 0; i < n; i++) if (m[i] == want) got = want;
-    // Mailbox missing (several AMD drivers): relaxed FIFO, where a frame that misses its vblank is shown at once (a
-    // tear) instead of waiting for the next one, which halves a 60 fps game near its budget (NX2navi's idea).
-    for (uint32_t i = 0; got != want && want == VK_PRESENT_MODE_MAILBOX_KHR && i < n; i++)
-        if (m[i] == VK_PRESENT_MODE_FIFO_RELAXED_KHR) got = m[i];
+    // Mailbox missing (several AMD drivers): stay on plain FIFO (tear-free). Do not use FIFO_RELAXED — that shows a
+    // late frame immediately and tears (map pan especially). Mailbox and Immediate remain selectable when offered.
+    // G-Sync/VRR stay player/driver controlled; this path never forces them.
+    if (got != want && want == VK_PRESENT_MODE_MAILBOX_KHR)
+        rt_log("gfx: mailbox not offered; using VSync (fifo)");
     const char *name = got == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : got == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo";
     __atomic_store_n(&g_present_got, name, __ATOMIC_RELEASE);
     static int logged = -1;   // the mode last logged: a change from the menu shows in the log
     if ((int)got != logged) {
         logged = (int)got;
-        rt_log("gfx: present mode %s%s (MKW_VK_PRESENT=%s)", name, got == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? " relaxed" : "", e);
+        rt_log("gfx: present mode %s (MKW_VK_PRESENT=%s)", name, e);
         if (dlssg && got == VK_PRESENT_MODE_FIFO_KHR)
             rt_log("gfx: DLSS frame generation with VSync (fifo): Streamline may warn; mailbox or immediate if needed");
     }
