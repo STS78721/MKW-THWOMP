@@ -42,6 +42,8 @@ extern "C" {
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
 void vk_queue_unlock(void);
+uint32_t vk_dlssg_running(void);
+uint32_t vk_dlssg_take_presented(void);
 extern const char rt_port_version[];
 int rt_game_version(void);
 }
@@ -466,6 +468,7 @@ static uint64_t g_perf_last_ns, g_perf_win_ns, g_perf_max_ns;
 static int g_perf_frames, g_perf_game;   // presents and game frames in the window
 static uint64_t g_perf_last_frame;
 static char g_perf_text[96];
+static double g_perf_fg_game, g_perf_fg_shown;   // THWOMP: the last window's game frames and presents a second ("full")
 
 static int perf_mode_of(const char *s) { return !strcmp(s, "full") ? 2 : !strcmp(s, "fps") ? 1 : 0; }
 
@@ -521,6 +524,8 @@ static void perf_lows(double mean_ns) {
     snprintf(g_perf_01pct, sizeof g_perf_01pct, "0.1%% %.0f", sorted[i01] ? 1e9 / sorted[i01] : 0.0);
 }
 
+static int g_perf_dlssg;   // Streamline proxy presents accumulated in the current window
+
 static void perf_tick(uint64_t now, uint64_t frame, const MenuTarget *t) {
     if (cfg_version() != g_perf_ver) {
         g_perf_ver = cfg_version();
@@ -529,22 +534,27 @@ static void perf_tick(uint64_t now, uint64_t frame, const MenuTarget *t) {
             g_perf_last_ns = 0, g_perf_text[0] = 0;
             g_dt_head = g_dt_count = 0;
             g_perf_1pct[0] = g_perf_01pct[0] = g_perf_ms[0] = 0;
+            g_perf_dlssg = 0;
+            (void)vk_dlssg_take_presented();
             if (m == 2) perf_gpu_once(t);
             perfmon_mode(m);
         }
         g_perf_mode = m;
     }
-    if (g_perf_mode != 1) return;
+    if (g_perf_mode < 1) return;   // (the full panel shows the frame-generation rates counted here too)
+    uint32_t dlssg_dp = vk_dlssg_take_presented();
+    bool dlssg = vk_dlssg_running() > 0;
     uint64_t d = now - g_perf_last_ns;
     bool game = frame != g_perf_last_frame;   // (each present of frame generation's made frames has the same number)
     g_perf_last_frame = frame;
     if (!g_perf_last_ns || d > 2000000000ull) {   // first frame, or a stall the window should not average in
         g_perf_win_ns = g_perf_max_ns = 0;
-        g_perf_frames = g_perf_game = 0;
+        g_perf_frames = g_perf_game = g_perf_dlssg = 0;
     } else {
         g_perf_win_ns += d;
         g_perf_frames++;
         g_perf_game += game;
+        if (dlssg) g_perf_dlssg += (int)dlssg_dp;
         if (d > g_perf_max_ns) g_perf_max_ns = d;
         g_dt_ring[g_dt_head] = (uint32_t)d;   // d <= 2 s here
         g_dt_head = (g_dt_head + 1) % 1000;
@@ -552,13 +562,15 @@ static void perf_tick(uint64_t now, uint64_t frame, const MenuTarget *t) {
         if (g_perf_win_ns >= 500000000ull) {
             double s = 1e9 / (double)g_perf_win_ns;
             perf_lows((double)g_perf_win_ns / g_perf_frames);
-            if (strcmp(cfg_value("MKW_FRAMEGEN"), "off"))
-                snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS_FG), g_perf_game * s, g_perf_frames * s);
+            double shown_n = dlssg && g_perf_dlssg > 0 ? (double)g_perf_dlssg : (double)g_perf_frames;
+            g_perf_fg_game = g_perf_game * s, g_perf_fg_shown = shown_n * s;
+            if (dlssg || strcmp(cfg_value("MKW_FRAMEGEN"), "off"))
+                snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS_FG), g_perf_fg_game, g_perf_fg_shown);
             else   // THWOMP: "45.9 FPS" (whole numbers from 100)
-                snprintf(g_perf_text, sizeof g_perf_text, g_perf_frames * s >= 100 ? "%.0f FPS" : "%.1f FPS",
-                         g_perf_frames * s);
+                snprintf(g_perf_text, sizeof g_perf_text, g_perf_fg_shown >= 100 ? "%.0f FPS" : "%.1f FPS",
+                         g_perf_fg_shown);
             g_perf_win_ns = g_perf_max_ns = 0;
-            g_perf_frames = g_perf_game = 0;
+            g_perf_frames = g_perf_game = g_perf_dlssg = 0;
         }
     }
     g_perf_last_ns = now;
@@ -575,8 +587,9 @@ static float perf_text_w(UiTextId fmt, float v) {
 }
 
 // A fixed column as wide as the widest of the formats (with their samples) and labels given.
-static void perf_column(const char *id, const PerfCol *cols, int n, const UiTextId *labels = nullptr, int nl = 0) {
-    float w = ImGui::CalcTextSize(menu_text(UI_MENU_OV_NONE)).x;
+static void perf_column(const char *id, const PerfCol *cols, int n, const UiTextId *labels = nullptr, int nl = 0,
+                        float min_w = 0.0f) {
+    float w = fmaxf(min_w, ImGui::CalcTextSize(menu_text(UI_MENU_OV_NONE)).x);
     for (int i = 0; i < n; i++) w = fmaxf(w, perf_text_w(cols[i].fmt, cols[i].sample));
     for (int i = 0; i < nl; i++) w = fmaxf(w, ImGui::CalcTextSize(menu_text(labels[i])).x);
     ImGui::TableSetupColumn(id, ImGuiTableColumnFlags_WidthFixed, w);
@@ -661,7 +674,13 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
         static const PerfCol c2[] = {{UI_MENU_OV_FMT_TEMP, 188}, {UI_MENU_OV_FMT_GB_OF, 888.8f}, {UI_MENU_OV_MAX_MS, 8888.8f}};
         static const PerfCol c3[] = {{UI_MENU_OV_FMT_POWER, 888}, {UI_MENU_OV_FMT_MHZ, 8888}, {UI_MENU_OV_GAME_PCT, 100},
                                      {UI_MENU_OV_GAME_GB, 888.8f}};
-        perf_column("##c0", c0, 1, labels, 4);
+        float fg_w = 0.0f;
+        if (vk_dlssg_running() || strcmp(cfg_value("MKW_FRAMEGEN"), "off")) {
+            char fgb[64];
+            snprintf(fgb, sizeof fgb, menu_text(UI_PERF_LINE_FPS_FG), 888.0, 888.0);
+            fg_w = ImGui::CalcTextSize(fgb).x;
+        }
+        perf_column("##c0", c0, 1, labels, 4, fg_w);
         perf_column("##c1", c1, 3);
         perf_column("##c2", c2, 3);
         perf_column("##c3", c3, 4);
@@ -683,7 +702,10 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
         perf_cell(UI_MENU_OV_GAME_GB, perf_gb(s.ram_game_mb));
         ImGui::TableNextColumn();   // the frame row: no label, the rate in its place
         char b[64];
-        snprintf(b, sizeof b, menu_text(UI_MENU_OV_FPS), s.fps);
+        if ((vk_dlssg_running() || strcmp(cfg_value("MKW_FRAMEGEN"), "off")) && g_perf_fg_shown > 0)   // "60/180 fps" with frame generation
+            snprintf(b, sizeof b, menu_text(UI_PERF_LINE_FPS_FG), g_perf_fg_game, g_perf_fg_shown);
+        else
+            snprintf(b, sizeof b, menu_text(UI_MENU_OV_FPS), s.fps);
         ImGui::TextColored(fps_c, "%s", b);
         perf_cell(UI_MENU_OV_FRAME_MS, s.frame_ms_avg);
         perf_cell(UI_MENU_OV_MAX_MS, s.frame_ms_max);

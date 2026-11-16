@@ -215,6 +215,7 @@ void vk_exec_pass_begin(VkExec *ex) {
         want[nwant] = t->image, wasp[nwant++] = i < 8 ? VK_IMAGE_ASPECT_COLOR_BIT : t->img->aspect;
     }
     barrier_to(ex, want, wasp, nwant, 1);   // passes, clears, copies and dispatches see each other's results
+    if (vk_mv_armed > 0) vk_mv_pass_begin(ex);   // THWOMP: the picture without the HUD (device/vk_mv.c)
     ex->fbl_mask = fbl;
     ex->fb_dirty = 0;
     ex->pass_serial++;
@@ -267,6 +268,7 @@ void vk_exec_pass_end(VkExec *ex) {
     ex->in_pass = 0;
     vk_ind_read_pass_end(ex);
     if (vk_dump_armed) vk_dump_pass_end(ex);
+    if (vk_mv_armed > 0 && !split_ending) vk_mv_pass_end(ex);
     if (vk_rtstats_on && !split_ending) vk_rtstats_pass_end(ex);
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     for (int i = 0; i < 8; i++)

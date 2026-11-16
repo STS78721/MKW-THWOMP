@@ -36,6 +36,163 @@ msgctxt "UI_MENU_TAB_ADVANCED"
 msgid "Advanced"
 msgstr "Дополнительно"
 
+msgctxt "UI_MENU_TAB_ADV_GRAPHICS"
+msgid "Advanced graphics"
+msgstr ""
+
+msgctxt "UI_MENU_GROUP_UPSCALING"
+msgid "Upscaling"
+msgstr ""
+
+msgctxt "UI_MENU_GROUP_LATENCY"
+msgid "Latency"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_NOW"
+msgid "Running now: %s"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_DLSS"
+msgid "NVIDIA DLSS %s (%ux%u to %ux%u)"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_DLSS_RESTART"
+msgid "NVIDIA DLSS after a restart"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_FSR"
+msgid "FSR 1"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_BILINEAR"
+msgid "bilinear scaling"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_FG"
+msgid "THWOMP frame generation %s"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_FG_OFF"
+msgid "no frame generation"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_REFLEX"
+msgid "Reflex %s"
+msgstr ""
+
+msgctxt "UI_MENU_FG_TYPE"
+msgid "Frame generation type"
+msgstr ""
+
+msgctxt "UI_MENU_FG_THWOMP"
+msgid ""
+"This is THWOMP frame generation: made by the port from the game's pictures (optical flow), on any "
+"graphics card. With DLSS on, it makes its frames from DLSS's upscaled picture."
+msgstr ""
+
+msgctxt "UI_MENU_FG_TYPE_DESC"
+msgid ""
+"Which frame generation the game uses. THWOMP: the port's own, on any graphics card. NVIDIA DLSS "
+"FG: NVIDIA's AI frame generation, on an RTX 40 or newer card, with DLSS as the upscaler; it turns "
+"NVIDIA Reflex on while it runs. Only one runs at a time. Takes effect after a restart."
+msgstr ""
+
+msgctxt "UI_MENU_FG_TYPE_THWOMP"
+msgid "THWOMP"
+msgstr ""
+
+msgctxt "UI_MENU_FG_TYPE_DLSS"
+msgid "NVIDIA DLSS FG"
+msgstr ""
+
+msgctxt "UI_MENU_FG_DLSS_ABOUT"
+msgid ""
+"This is NVIDIA DLSS Frame Generation: an AI model on the graphics card makes the frames between "
+"the game's from DLSS's depth and motion vectors. It pauses while this menu is open and on screens "
+"without a 3D scene."
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG"
+msgid "DLSS FG multiplier"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_DESC"
+msgid ""
+"How many frames are shown for each frame the game makes: 2x on an RTX 40, up to 4x or more on an "
+"RTX 50. The game itself still runs at its own frame rate, so the controls feel as they do without "
+"it."
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_PRESET"
+msgid "DLSS FG preset"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_PRESET_DESC"
+msgid ""
+"The frame generation model. Preset A: the original model. Preset B: the newer model that "
+"separates the HUD and menus from the 3D scene for cleaner UI edges and overlays. Preset C: the "
+"performance mode, up to about a third faster with slightly lower image quality (needs a recent "
+"NVIDIA driver). The choice goes into mkw.exe's profile in the NVIDIA driver, as the NVIDIA App's "
+"DLSS Override does, and takes effect when DLSS FG next starts. Driver default leaves it to the "
+"driver."
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_PRESET_DEFAULT"
+msgid "Driver default"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_PRESET_A"
+msgid "Preset A"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_PRESET_B"
+msgid "Preset B"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_PRESET_C"
+msgid "Preset C"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_UNSUPPORTED"
+msgid "Needs an NVIDIA RTX 40 or newer graphics card"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_NEEDS_DLSS"
+msgid "Needs NVIDIA DLSS as the upscaler"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_RESTART"
+msgid "Restart the game to start DLSS FG"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_MAX"
+msgid "Up to %ux on this graphics card"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_REFLEX_ON"
+msgid "On while DLSS FG runs"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_PRESET_DRIVER"
+msgid "Driver now: %s"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_DLSSG"
+msgid "NVIDIA DLSS FG %s, %s"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_DLSSG_RESTART"
+msgid "NVIDIA DLSS FG after a restart"
+msgstr ""
+
+msgctxt "UI_MENU_ADVG_DLSSG_PAUSED"
+msgid "NVIDIA DLSS FG %s (paused in the menu), %s"
+msgstr ""
+
+msgctxt "UI_MENU_DLSSG_BY_DRIVER"
+msgid "%ux, set by the NVIDIA App"
+msgstr ""
+
 msgctxt "UI_MENU_TAB_GRAPHICS"
 msgid "Graphics"
 msgstr "Графика"
@@ -438,6 +595,26 @@ msgstr ""
 "столько, сколько позволяет частота монитора. Добавляет до одного кадра задержки, быстрое движение "
 "может смазываться. На консоли этого нет."
 
+#. THWOMP: NVIDIA Reflex (Screen category), shown on NVIDIA graphics cards only.
+msgctxt "UI_MENU_REFLEX"
+msgid "NVIDIA Reflex"
+msgstr ""
+
+msgctxt "UI_MENU_REFLEX_DESC"
+msgid ""
+"Starts each frame as late as it can still be shown on time, so a button press reaches the screen "
+"sooner. Most useful with frame generation. On + Boost also keeps the graphics card's clocks up, "
+"for a little more power use. Not on the console."
+msgstr ""
+
+msgctxt "UI_MENU_REFLEX_ON"
+msgid "On"
+msgstr ""
+
+msgctxt "UI_MENU_REFLEX_BOOST"
+msgid "On + Boost"
+msgstr ""
+
 msgctxt "UI_MENU_GRAPHICS"
 msgid "Picture"
 msgstr "Изображение"
@@ -446,10 +623,16 @@ msgctxt "UI_MENU_UPSCALER"
 msgid "Scaling to the window"
 msgstr "Масштабирование под окно"
 
+#, fuzzy
+#| msgid ""
+#| "How the picture is scaled when the window is larger than the game resolution. FSR keeps edges and "
+#| "detail sharper than bilinear."
 msgctxt "UI_MENU_UPSCALER_DESC"
 msgid ""
 "How the picture is scaled when the window is larger than the game resolution. FSR keeps edges and "
-"detail sharper than bilinear."
+"detail sharper than bilinear. NVIDIA DLSS (RTX graphics cards) rebuilds the picture from several "
+"frames with the game's depth and motion: the sharpest, and it smooths edges too. Switching to or "
+"from DLSS takes a restart."
 msgstr ""
 "Как картинка растягивается, когда окно больше разрешения игры. FSR сохраняет края и детали чётче "
 "билинейного."
@@ -461,6 +644,67 @@ msgstr "AMD FSR 1"
 msgctxt "UI_MENU_UPSCALER_BILINEAR"
 msgid "Bilinear"
 msgstr "Билинейное"
+
+msgctxt "UI_MENU_UPSCALER_DLSS"
+msgid "NVIDIA DLSS"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_RESTART"
+msgid "Restart the game to switch DLSS on"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_MODEL"
+msgid "DLSS model"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_MODEL_DESC"
+msgid ""
+"NVIDIA's AI model for DLSS. Transformer: sharp and stable. Transformer 2nd gen: sharper still, "
+"with less ghosting, at a little more cost on the graphics card."
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_TRANSFORMER"
+msgid "Transformer"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_TRANSFORMER2"
+msgid "Transformer 2nd gen"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_QUALITY"
+msgid "DLSS quality"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_QUALITY_DESC"
+msgid ""
+"How much of your display the game renders before DLSS fills in the rest: DLAA all of it, Quality "
+"two thirds, Balanced a little over half, Performance half, Ultra Performance a third. The game "
+"resolution follows it; the size the game renders at is shown under the choice."
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_DLAA"
+msgid "DLAA"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_Q"
+msgid "Quality"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_BALANCED"
+msgid "Balanced"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_PERF"
+msgid "Performance"
+msgstr ""
+
+msgctxt "UI_MENU_DLSS_ULTRA"
+msgid "Ultra Performance"
+msgstr ""
+
+msgctxt "UI_MENU_RESOLUTION_BY_DLSS"
+msgid "With NVIDIA DLSS the game resolution follows DLSS quality."
+msgstr ""
 
 msgctxt "UI_MENU_PICTURE_FIT"
 msgid "Picture shape"

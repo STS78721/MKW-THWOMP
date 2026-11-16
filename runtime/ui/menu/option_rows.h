@@ -51,6 +51,7 @@ void opt_disable_next(UiTextId note);
 // Page text that is not a row: a group heading in the accent colour, a wrapped paragraph (warn: the warning colour).
 void opt_group(UiTextId title);
 void opt_text(UiTextId text, bool warn = false);
+void opt_text_str(const char *text);   // THWOMP: a line made at run time
 
 // The return value of every row: true when it changed the setting this frame.
 // inverted: the row shows "on" while the key is 0 (a setting whose key names the opposite).

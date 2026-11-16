@@ -529,6 +529,13 @@ PFN_vkCmdPushDescriptorSetWithTemplateKHR vk_pipeline_push_tpl_fn(void) { return
 PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void) { return ensure_init() && P.tpl ? P.tpl_update : NULL; }
 int vk_pipeline_draw_cache(void) { return ensure_init() && P.draw_cache; }
 
+// THWOMP motion vectors (device/vk_mv.c): the dynamic states every graphics pipeline declares, and whether they use
+// the last provoking vertex, so a pipeline made outside this file can be bound in the same pass with that state kept.
+void vk_pipeline_dyn_list(const VkDynamicState **d, uint32_t *n, int *pv_last) {
+    ensure_init();
+    *d = P.dyn, *n = P.n_dyn, *pv_last = P.pv_last;
+}
+
 // ---- SPIR-V rewrites: vk_spirv_patch.c
 
 // Chain {size 32} into a stage create info when the stage uses subgroup ops and the driver allows the pin.

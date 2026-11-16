@@ -9,5 +9,8 @@ texel instead of 4), a BC1 encoder (`bc1_encode.comp`: half a byte per texel, fo
 `fg_median.comp` the vectors' median, `fg_synth.comp` a made frame) and the F1 menu on an HDR10 display
 (`hdr_fullscreen.vert` + `hdr_ui.frag`: the menu's sRGB image to PQ at paper white, `gfx/vk/device/vk_hdr_ui.c`; from
 totk-pc-recomp, MIT) and THWOMP's colour profiles (`color_grade.comp`: brightness, contrast, saturation and gamma
-on the present, `gfx/vk/device/vk_color.c`, from STS78721's DKB build). Compiled into `gfx/vk/*_spv.h`; a
+on the present, `gfx/vk/device/vk_color.c`, from STS78721's DKB build) and THWOMP's DLSS inputs (`gfx/vk/device/vk_mv.c`,
+`vk_dlss.c`: `mv_vel_vs.vert` + `mv_vel_fs.frag` draw each object's motion from its two captured positions,
+`mv_out.comp` the motion vectors and the bias-current-colour hint, `dlss_compose.comp` DLSS's picture encoded for the present,
+`mv_debug.comp` the `MKW_MV_DEBUG` views). Compiled into `gfx/vk/*_spv.h`; a
 new or changed one is regenerated with `uv run tools/shaders/embed_spv.py runtime/shaders/<name>.comp`.

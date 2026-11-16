@@ -3,7 +3,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
 
-enum { TAB_SCREEN, TAB_GRAPHICS, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_MENU, TAB_ADVANCED, TAB_HACKS, TAB_COUNT };
+enum { TAB_SCREEN, TAB_GRAPHICS, TAB_ADV_GRAPHICS, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_MENU, TAB_ADVANCED, TAB_HACKS, TAB_COUNT };
 
 void settings_list_gpus(VkInstance inst);   // once: the Vulkan devices the Screen tab offers (MKW_GPU_INDEX)
 void settings_select(int tab);              // that tab at the next layout

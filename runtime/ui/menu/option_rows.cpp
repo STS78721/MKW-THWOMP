@@ -296,6 +296,12 @@ void opt_text(UiTextId text, bool warn) {
     ImGui::PopTextWrapPos();
 }
 
+void opt_text_str(const char *text) {
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+}
+
 bool opt_choice_list(const char *key, UiTextId label, const char *const *values, const char *const *names, int n,
                      UiTextId desc, int cur, const char *note) {
     const CfgMeta *m = cfg_meta(key);

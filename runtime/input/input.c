@@ -354,6 +354,7 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
         if (kb && !pad_moved) plat_xchg32(&last_device, INPUT_DEVICE_KEYBOARD);
         else if (pad_moved && !kb) plat_xchg32(&last_device, INPUT_DEVICE_PAD);
     }
+    vk_reflex_input();   // THWOMP Reflex: the frame's first controller read
     script_apply(&b, sl, sr, 0);
     skip_input(&b);
     rec_apply(b, sl, sr);

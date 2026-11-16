@@ -125,6 +125,7 @@ static int g_cap_w, g_cap_h, g_cap_valid;
 // The swapchain images whose blit was submitted and whose present waits, oldest first: vk_present_flip presents the
 // oldest. More than one only with frame generation (vk_present_blit_ahead).
 static uint32_t g_flip_q[MAX_IMAGES];
+static uint64_t g_flip_id;   // THWOMP: the present id of the next flip (vk_present_flip_id), 0 none
 static int g_flip_n;
 static float g_aspect;           // gfx_aspect_set: the ultrawide output's aspect (MKW_ASPECT), 0 at 16:9
 void gfx_aspect_set(float a) { g_aspect = a; }
@@ -224,15 +225,18 @@ unsigned gfx_window_focus_messages(void) { return (unsigned)g_focus_msgs; }
 // swapchain at this present.
 static void window_settings_live(void) {
     static unsigned seen;
-    static int started, fg;
+    static int started, fg, dlssg;
     static char present[16];   // the MKW_VK_PRESENT the swapchain was made with
     unsigned v = cfg_version();
     if (started && v == seen) return;
     seen = v;
     const char *e = cfg_value("MKW_VK_PRESENT");
-    if (!started || strncmp(e, present, sizeof present - 1) || fg != vk_fg_wanted()) {
+    // THWOMP: DLSS frame generation turned on or off: the swapchain through its proxy or not (vk_dlss.c)
+    int dg = vk_dlssg_frames() > 0;
+    if (!started || strncmp(e, present, sizeof present - 1) || fg != vk_fg_wanted() || dg != dlssg) {
         snprintf(present, sizeof present, "%s", e);
         fg = vk_fg_wanted();
+        dlssg = dg;
         if (started) plat_xchg32(&g_dirty, 1);
     }
     if (started) gfx_window_apply_settings();
@@ -244,8 +248,11 @@ static const char *g_present_got = "";   // the MKW_VK_PRESENT value of the mode
 
 static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     const char *e = cfg_value("MKW_VK_PRESENT");
-    VkPresentModeKHR want = !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
-                          : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    int dlssg = vk_dlssg_frames() > 0;
+    VkPresentModeKHR orig_want = !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+                               : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    // Streamline DLSS-G does not support VSync (mailbox/fifo) on Vulkan (ProgrammingGuideDLSS_G 22.5).
+    VkPresentModeKHR want = dlssg ? VK_PRESENT_MODE_IMMEDIATE_KHR : orig_want;
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd, g_surface, &n, NULL);
     VkPresentModeKHR m[16];
@@ -262,12 +269,40 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     static int logged = -1;   // the mode last logged: a change from the menu shows in the log
     if ((int)got != logged) {
         logged = (int)got;
-        rt_log("gfx: present mode %s%s (MKW_VK_PRESENT=%s)", name, got == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? " relaxed" : "", e);
+        rt_log("gfx: present mode %s%s (MKW_VK_PRESENT=%s%s)", name, got == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? " relaxed" : "",
+               e, dlssg && want != orig_want ? "; immediate for DLSS FG" : "");
     }
     return got;
 }
 
 const char *gfx_window_present_mode(void) { return __atomic_load_n(&g_present_got, __ATOMIC_ACQUIRE); }
+
+// THWOMP: the swapchain calls, through NVIDIA Streamline's proxies when DLSS is on (vk_dlss.c: its frame-end work
+// runs in the present), else Vulkan's own.
+typedef struct {
+    PFN_vkCreateSwapchainKHR create;
+    PFN_vkDestroySwapchainKHR destroy;
+    PFN_vkGetSwapchainImagesKHR images;
+    PFN_vkAcquireNextImageKHR acquire;
+    PFN_vkQueuePresentKHR present;
+} ScFns;
+static const ScFns *sc_fns(void) {
+    static ScFns f;
+    static int done;
+    if (!done) {
+        f = (ScFns){vkCreateSwapchainKHR, vkDestroySwapchainKHR, vkGetSwapchainImagesKHR, vkAcquireNextImageKHR,
+                    vkQueuePresentKHR};
+        PFN_vkVoidFunction p;
+        if ((p = vk_dlss_proc("vkCreateSwapchainKHR"))) f.create = (PFN_vkCreateSwapchainKHR)p;
+        if ((p = vk_dlss_proc("vkDestroySwapchainKHR"))) f.destroy = (PFN_vkDestroySwapchainKHR)p;
+        if ((p = vk_dlss_proc("vkGetSwapchainImagesKHR"))) f.images = (PFN_vkGetSwapchainImagesKHR)p;
+        if ((p = vk_dlss_proc("vkAcquireNextImageKHR"))) f.acquire = (PFN_vkAcquireNextImageKHR)p;
+        if ((p = vk_dlss_proc("vkQueuePresentKHR"))) f.present = (PFN_vkQueuePresentKHR)p;
+        if (f.present != vkQueuePresentKHR) rt_log("gfx: swapchain calls through NVIDIA Streamline (DLSS)");
+        done = 1;
+    }
+    return &f;
+}
 
 // Queues the oldest present a blit left waiting (g_pl held).
 static void flip_one_locked(void) {
@@ -275,13 +310,22 @@ static void flip_one_locked(void) {
     uint32_t idx = g_flip_q[0];
     g_flip_n--;
     memmove(g_flip_q, g_flip_q + 1, (size_t)g_flip_n * sizeof *g_flip_q);
+    uint64_t id = g_flip_id;
+    g_flip_id = 0;
     if (!g_sc) return;
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &g_render_done[idx], .swapchainCount = 1, .pSwapchains = &g_sc,
                            .pImageIndices = &idx};
+    // THWOMP Reflex (vk_reflex.c): the game frame's present carries its id, between the present markers; through
+    // Streamline (DLSS frame generation) the markers always, and Streamline gives the present its id
+    VkPresentIdKHR pid = {.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .swapchainCount = 1, .pPresentIds = &id};
+    int reflex = id && (vk_reflex_on() || vk_dlssg_reflex());
+    if (reflex && !vk_dlssg_reflex()) pi.pNext = &pid;
+    if (reflex) vk_reflex_present(id, 0);
     vk_queue_lock();
-    VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
+    VkResult r = sc_fns()->present(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
+    if (reflex) vk_reflex_present(id, 1);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
 }
 
@@ -338,7 +382,24 @@ static int create_swapchain(void) {
                caps.maxImageCount);
 
     vk_queue_lock();
-    vkDeviceWaitIdle(c->device);
+    vk_wait_device_idle(c->device);
+    // THWOMP DLSS frame generation (vk_dlss.c): loaded for the new swapchain while it makes frames, unloaded otherwise
+    // (its proxy renders off-screen); switching between the two the old swapchain goes first, not handed over
+    static int g_sc_dlssg;
+    int dlssg = vk_dlssg_frames() > 0;
+    if (g_sc && dlssg != g_sc_dlssg) {
+        vk_reflex_swapchain(VK_NULL_HANDLE);
+        for (uint32_t i = 0; i < g_sc_n; i++) {
+            vkDestroySemaphore(c->device, g_render_done[i], NULL);
+            if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
+            g_sc_view[i] = VK_NULL_HANDLE;
+        }
+        g_sc_n = 0;
+        sc_fns()->destroy(c->device, g_sc, NULL);
+        g_sc = VK_NULL_HANDLE;
+    }
+    if (vk_dlssg_loaded()) vk_dlssg_swapchain(dlssg);
+    g_sc_dlssg = dlssg;
     VkSwapchainKHR old = g_sc;
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_surface, .minImageCount = count,
@@ -348,7 +409,12 @@ static int create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = pick_present_mode(c->phys), .clipped = VK_TRUE,
         .oldSwapchain = old};
-    VkResult r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
+    // THWOMP Reflex (vk_reflex.c): made in latency mode where the driver has it; MKW_REFLEX then says what it does
+    VkSwapchainLatencyCreateInfoNV lci = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV,
+                                          .latencyModeEnable = VK_TRUE};
+    if (c->has_low_latency) ci.pNext = &lci;
+    vk_reflex_swapchain(VK_NULL_HANDLE);
+    VkResult r = sc_fns()->create(c->device, &ci, NULL, &g_sc);
     if (r != VK_SUCCESS) {
         rt_log("gfx: vkCreateSwapchainKHR failed (%d)", (int)r);
         g_sc = old;
@@ -360,7 +426,8 @@ static int create_swapchain(void) {
         if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
         g_sc_view[i] = VK_NULL_HANDLE;
     }
-    if (old) vkDestroySwapchainKHR(c->device, old, NULL);
+    if (old) sc_fns()->destroy(c->device, old, NULL);
+    vk_reflex_swapchain(g_sc);
     gfx_hdr_metadata(g_sc);
     g_sc_fmt = sf.format;
     g_sc_hdr = sf.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
@@ -373,8 +440,12 @@ static int create_swapchain(void) {
             rt_log("gfx: the driver's surface is %ux%u for a %dx%d window: the picture goes in the window's part", ext.width,
                    ext.height, cw, ch);
     }
-    g_sc_n = MAX_IMAGES;
-    vkGetSwapchainImagesKHR(c->device, g_sc, &g_sc_n, g_sc_img);
+    // the count first, then the images: DLSS frame generation's proxy (Streamline) makes its own images on the first
+    // call and fills as many as the count says on the second
+    g_sc_n = 0;
+    sc_fns()->images(c->device, g_sc, &g_sc_n, NULL);
+    if (g_sc_n > MAX_IMAGES) g_sc_n = MAX_IMAGES;
+    sc_fns()->images(c->device, g_sc, &g_sc_n, g_sc_img);
     VkSemaphoreCreateInfo semi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (uint32_t i = 0; i < g_sc_n; i++) {
         vkCreateSemaphore(c->device, &semi, NULL, &g_render_done[i]);
@@ -560,6 +631,15 @@ void vk_present_screen_shot(const char *path) {
     __atomic_store_n(&g_screen_on, 1, __ATOMIC_RELEASE);
 }
 
+static char g_series_dir[400], g_series_path[512];
+static volatile int32_t g_series_left;
+void vk_present_screen_series(const char *dir, int n) {
+    plat_rmutex_lock(&g_pl);
+    snprintf(g_series_dir, sizeof g_series_dir, "%s", dir);
+    plat_rmutex_unlock(&g_pl);
+    __atomic_store_n(&g_series_left, n, __ATOMIC_RELEASE);
+}
+
 // The captured swapchain image as a PNG (the menu's test hook), RGBA with opaque alpha.
 static void save_capture(const char *path) {
     size_t n = (size_t)g_cap_w * (size_t)g_cap_h * 4;
@@ -592,6 +672,76 @@ void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]) {
     out[0] = (dw - out[2]) / 2, out[1] = (dh - out[3]) / 2;
 }
 
+// THWOMP DLSS with frame generation (vk_backend.c): DLSS once per game frame, before frame generation, which makes its
+// frames from the upscaled picture; the presents of the frames shown then skip DLSS (g_dlss_done). DLSS run on each
+// shown frame would take the made frames for game frames, with the game frame's motion vectors and jitter.
+#define DLSS_SLOTS 8
+static VkCommandPool g_dpool;
+static VkCommandBuffer g_dcb[DLSS_SLOTS];
+static VkFence g_dfence[DLSS_SLOTS];
+static unsigned g_dn;
+static int g_dlss_done;   // this game frame's DLSS ran (or was tried) in vk_present_dlss_first: the presents skip it
+
+VkImage vk_present_dlss_first(VkImage src, VkFormat fmt, int w, int h, const int crop[4], int *ow, int *oh) {
+    g_dlss_done = 0;
+    static int mv_debug = -1;   // MKW_MV_DEBUG's picture replaces the game's in the present: DLSS stays there
+    if (mv_debug < 0) mv_debug = getenv("MKW_MV_DEBUG") && atoi(getenv("MKW_MV_DEBUG")) > 0;
+    if (!src || mv_debug || !vk_fg_wanted() || !vk_dlss_active()) return VK_NULL_HANDLE;
+    gfx_window_start();
+    VkCtx *c = vk_ctx();
+    VkImage out = VK_NULL_HANDLE;
+    plat_rmutex_lock(&g_pl);
+    if (!g_sc || g_sc_hdr || wsys_minimized()) goto done;
+    if (!g_dpool) {
+        VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = c->gfx_family};
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = DLSS_SLOTS};
+        VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT};
+        if (vkCreateCommandPool(c->device, &pci, NULL, &g_dpool) != VK_SUCCESS) { g_dpool = VK_NULL_HANDLE; goto done; }
+        ai.commandPool = g_dpool;
+        if (vkAllocateCommandBuffers(c->device, &ai, g_dcb) != VK_SUCCESS) goto done;
+        for (int i = 0; i < DLSS_SLOTS; i++) vkCreateFence(c->device, &fi, NULL, &g_dfence[i]);
+    }
+    int cx = 0, cy = 0, cw = w, ch = h;   // the crop, as present_image takes it
+    if (crop && crop[2] > 0 && crop[3] > 0) { cx = crop[0]; cy = crop[1]; cw = crop[2]; ch = crop[3]; }
+    if (cx < 0) cx = 0;
+    if (cy < 0) cy = 0;
+    if (cx + cw > w) cw = w - cx;
+    if (cy + ch > h) ch = h - cy;
+    const int rect[4] = {cx, cy, cw, ch};
+    int to[4];
+    gfx_fit_rect(cw, ch, (int)g_sc_vis.width, (int)g_sc_vis.height, to);
+    unsigned s = g_dn++ % DLSS_SLOTS;
+    if (vkWaitForFences(c->device, 1, &g_dfence[s], VK_TRUE, 5000000000ull) != VK_SUCCESS) {
+        rt_log("dlss: fence wait timed out");
+        goto done;
+    }
+    g_dlss_done = 1;   // from here the presents leave DLSS alone this frame, whether it worked or not
+    VkCommandBuffer cb = g_dcb[s];
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(cb, &bi);
+    out = vk_dlss_record(cb, s, src, fmt, rect, w, h, (uint32_t)to[2], (uint32_t)to[3], to);
+    vkEndCommandBuffer(cb);
+    vkResetFences(c->device, 1, &g_dfence[s]);
+    VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi};
+    vk_queue_lock();
+    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_dfence[s]);
+    vk_queue_unlock();
+    if (r != VK_SUCCESS) {
+        rt_log("dlss: submit failed (%d)", (int)r);
+        out = VK_NULL_HANDLE;
+        vkQueueSubmit2(c->gfx_queue, 0, NULL, g_dfence[s]);   // the fence signals still
+    }
+    if (out) *ow = to[2], *oh = to[3];
+done:
+    plat_rmutex_unlock(&g_pl);
+    return out;
+}
+
 // defer: 0 present now, 1 leave the present waiting for vk_present_flip, 2 the same without queueing the presents
 // already waiting first (vk_present_blit_ahead)
 static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], int defer) {
@@ -613,11 +763,11 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         goto out;
     }
     uint32_t idx = 0;
-    VkResult r = vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+    VkResult r = sc_fns()->acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         plat_xchg32(&g_dirty, 1);
         if (!create_swapchain()) goto out;
-        r = vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+        r = sc_fns()->acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
     }
     static int acquire_fails;   // in a row: a timeout or a failure that keeps coming means the swapchain went bad
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {             // lost, not ready: skip the frame
@@ -653,6 +803,11 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     int overlay = src && g_sc_view[idx] &&
                   menu_overlay_frame(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), &mt, &menu_shot);
     if (!menu_shot && __atomic_exchange_n(&g_screen_on, 0, __ATOMIC_ACQ_REL)) menu_shot = g_screen_path;
+    if (!menu_shot && __atomic_load_n(&g_series_left, __ATOMIC_ACQUIRE) > 0) {
+        __atomic_sub_fetch(&g_series_left, 1, __ATOMIC_ACQ_REL);
+        snprintf(g_series_path, sizeof g_series_path, "%s/s%06llu.png", g_series_dir, (unsigned long long)g_frame);
+        menu_shot = g_series_path;
+    }
     int cap = src && (g_capture || menu_shot) && ensure_capture_buffer();
     int thumb = src && g_th_n && ensure_thumbs();
 
@@ -681,9 +836,19 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     vk_crumb_end(cb, VK_CRUMB_OP, prep);
     // THWOMP colour profiles (MKW_COLOR_*, vk_color.c): a graded copy of the crop takes the game image's place below;
     // not on an HDR10 swapchain (its picture is PQ, the grading is for SDR)
-    VkImage graded = src && general && !g_sc_hdr ? vk_color_record(cb, slot, src, fmt, rect) : VK_NULL_HANDLE;
     const int grect[4] = {0, 0, cw, ch};
     const int *prect = rect;
+    // THWOMP motion vectors, prototype (vk_mv.c): MKW_MV_DEBUG's picture takes the game's place
+    VkImage mvd = src && general && !g_sc_hdr ? vk_mv_record(cb, slot, src, fmt, rect) : VK_NULL_HANDLE;
+    if (mvd) src = mvd, fmt = VK_FORMAT_R8G8B8A8_UNORM, w = cw, h = ch, prect = grect, cx = cy = 0;
+    // THWOMP DLSS (vk_dlss.c, MKW_UPSCALER=dlss): the picture upscaled to the window's rectangle, HUD included, in
+    // place of the game's; FSR and the blit's scale then have nothing left to do
+    const int drect[4] = {0, 0, to[2], to[3]};
+    VkImage dl = src && general && !g_sc_hdr && !mvd && !g_dlss_done
+                     ? vk_dlss_record(cb, slot, src, fmt, prect, w, h, (uint32_t)to[2], (uint32_t)to[3], to)
+                     : VK_NULL_HANDLE;
+    if (dl) src = dl, fmt = VK_FORMAT_R8G8B8A8_UNORM, w = to[2], h = to[3], prect = drect, cx = cy = 0, cw = to[2], ch = to[3];
+    VkImage graded = src && general && !g_sc_hdr ? vk_color_record(cb, slot, src, fmt, prect) : VK_NULL_HANDLE;
     if (graded) src = graded, fmt = VK_FORMAT_R16G16B16A16_SFLOAT, w = cw, h = ch, prect = grect, cx = cy = 0;
     // FSR (MKW_UPSCALER) when the picture's rectangle is larger than the crop; else the bilinear blit
     uint32_t crumb = src ? vk_crumb_op(cb, "present scaling", (uint32_t)to[2], (uint32_t)to[3]) : 0;
@@ -753,9 +918,10 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     vk_crumb_end(cb, VK_CRUMB_OP, tail);
     sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vkEndCommandBuffer(cb);
+    vk_dlssg_present(vk_dlssg_frames(), g_sc_hdr);   // THWOMP DLSS frame generation: on or off for this present
 
     VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_acquire[slot],
-                                  .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT};
+                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_render_done[idx],
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
@@ -822,6 +988,14 @@ void vk_present_flip(void) {
     plat_rmutex_unlock(&g_pl);
 }
 
+void vk_present_flip_id(uint64_t id) {
+    plat_rmutex_lock(&g_pl);
+    if (g_flip_n == 1) g_flip_id = id;   // the game's frame: the last one waiting
+    flip_one_locked();
+    plat_rmutex_unlock(&g_pl);
+    vk_reflex_shown(id);
+}
+
 void gfx_window_resize(int cw, int chh) {
     gfx_window_start();
     wsys_resize(cw, chh);
@@ -836,7 +1010,7 @@ void gfx_window_release_vk(void) {
     plat_rmutex_lock(&g_pl);
     if (c && g_started) {
         vk_queue_lock();
-        vkDeviceWaitIdle(c->device);
+        vk_wait_device_idle(c->device);
         vk_queue_unlock();
         g_flip_n = 0;   // their blits are done (device idle); the swapchain goes away unpresented
         menu_vk_release();
@@ -856,8 +1030,12 @@ void gfx_window_release_vk(void) {
             g_sc_view[i] = VK_NULL_HANDLE;
         }
         if (g_pool) vkDestroyCommandPool(c->device, g_pool, NULL);
-        if (g_sc) vkDestroySwapchainKHR(c->device, g_sc, NULL);
-        if (g_surface) vkDestroySurfaceKHR(c->instance, g_surface, NULL);
+        vk_reflex_release();
+        if (g_sc) sc_fns()->destroy(c->device, g_sc, NULL);
+        if (g_surface) {   // THWOMP: made through Streamline's proxy with DLSS frame generation: it goes the same way
+            PFN_vkDestroySurfaceKHR d = (PFN_vkDestroySurfaceKHR)vk_dlss_instance_proc(c->instance, "vkDestroySurfaceKHR");
+            (d ? d : vkDestroySurfaceKHR)(c->instance, g_surface, NULL);
+        }
         g_sc = VK_NULL_HANDLE; g_surface = VK_NULL_HANDLE; g_pool = VK_NULL_HANDLE; g_sc_n = 0;
         g_started = 0;     // the window and its thread stay; the next gfx_window_start makes a new surface
     }

@@ -15,6 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#define VK_USE_PLATFORM_WIN32_KHR
+#include <vulkan/vulkan.h>   // VkWin32SurfaceCreateInfoKHR (THWOMP: the surface through Streamline)
+#endif
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
@@ -279,8 +285,10 @@ static void open_window(void *arg) {
     // focus or coming to the front, so a run started by an agent does not interrupt whoever is at the desktop (Adrià,
     // 07/11/2026). The game would pause without focus: the run scripts pin it with MKW_ASSUME_FOCUS.
     // =hidden (mkw --replay): no window on screen at all; the presents are read back from their textures.
+    // =offscreen: a real window that presents (DLSS and the other present-time passes run), placed far outside every
+    // display, for unattended agent runs that must not show anything.
     const char *bg = cfg_get("MKW_BACKGROUND_WINDOW");
-    int background = bg && strcmp(bg, "0"), hidden = bg && !strcmp(bg, "hidden");
+    int background = bg && strcmp(bg, "0"), hidden = bg && !strcmp(bg, "hidden"), offscreen = bg && !strcmp(bg, "offscreen");
     if (background) SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
     g_win = SDL_CreateWindow("Mario Kart World", w, h,
                              SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
@@ -289,8 +297,10 @@ static void open_window(void *arg) {
         rt_log("gfx: SDL_CreateWindow failed (%s)", SDL_GetError());
         return;
     }
+    if (offscreen) SDL_SetWindowPosition(g_win, -30000, -30000);
     app_icon_set(g_win);
-    set_pixel_size(w, h);   // w x h were window units; the setting is in pixels
+    if (offscreen) SDL_SetWindowSize(g_win, w, h);   // no display there: units are pixels
+    else set_pixel_size(w, h);   // w x h were window units; the setting is in pixels
     density_update();
     note_applied();
     refresh_rate_update();
@@ -311,6 +321,20 @@ typedef struct { VkInstance inst; VkSurfaceKHR surface; } SurfaceReq;
 
 static void make_surface(void *arg) {
     SurfaceReq *r = arg;
+#ifdef _WIN32
+    // THWOMP DLSS frame generation (vk_dlss.c): the surface through Streamline's proxy, which is how its plugin learns
+    // the window it presents to ("Could not find a window corresponding to this application" otherwise)
+    PFN_vkCreateWin32SurfaceKHR sl_create = (PFN_vkCreateWin32SurfaceKHR)vk_dlss_instance_proc(r->inst, "vkCreateWin32SurfaceKHR");
+    void *hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(g_win), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    if (sl_create && hwnd) {
+        VkWin32SurfaceCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                                          .hinstance = GetModuleHandleW(NULL), .hwnd = hwnd};
+        VkResult vr = sl_create(r->inst, &ci, NULL, &r->surface);
+        rt_log("gfx: window surface through NVIDIA Streamline (%d)", (int)vr);
+        if (vr == VK_SUCCESS) return;
+        r->surface = VK_NULL_HANDLE;
+    }
+#endif
     if (!SDL_Vulkan_CreateSurface(g_win, r->inst, NULL, &r->surface)) {
         rt_log("gfx: SDL_Vulkan_CreateSurface failed (%s)", SDL_GetError());
         r->surface = VK_NULL_HANDLE;

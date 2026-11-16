@@ -45,7 +45,8 @@ typedef struct VkCtx {
         has_emh,                            // VK_EXT_external_memory_host: pools imported when a shadow does not fit
         has_placed,                         // VK_EXT_map_memory_placed with unmap-reserve: pools as driver memory
         has_colorspace,                     // VK_EXT_swapchain_colorspace (instance): HDR10 swapchains (gfx_hdr.c)
-        has_hdr_metadata;                   // VK_EXT_hdr_metadata: the HDR10 swapchain's mastering metadata
+        has_hdr_metadata,                   // VK_EXT_hdr_metadata: the HDR10 swapchain's mastering metadata
+        has_low_latency;                    // THWOMP: VK_NV_low_latency2 + VK_KHR_present_id (presentId): Reflex
                                             // mapped at their guest address (vk_memory.c placed_pool)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. MKW_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
@@ -110,6 +111,70 @@ void vk_hdr_ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, u
 void vk_hdr_ui_release(void);   // before the device goes away
 // Queues the oldest present vk_present_blit or vk_present_blit_ahead left waiting.
 void vk_present_flip(void);
+// The same for the game's own frame: its present carries id as its VkPresentIdKHR and the Reflex present markers.
+void vk_present_flip_id(uint64_t id);
+// THWOMP: NVIDIA Reflex (vk_reflex.c, MKW_REFLEX=off|on|boost) through VK_NV_low_latency2. id: the game frame's
+// present count, the same on the game thread, the replay thread and the present thread.
+int vk_reflex_supported(void);                 // the driver has it (an NVIDIA GPU): the menu shows the row
+int vk_reflex_on(void);                        // on or boost now
+void vk_reflex_swapchain(VkSwapchainKHR sc);   // made (latency mode), or VK_NULL_HANDLE before it goes
+void vk_reflex_frame_start(uint64_t id);       // game thread: the sleep, then SIMULATION_START
+void vk_reflex_input(void);                    // the first controller read of the frame
+void vk_reflex_game_present(uint64_t id);      // game thread: SIMULATION_END, RENDERSUBMIT_START
+void vk_reflex_submitted(uint64_t id);         // replay thread: RENDERSUBMIT_END
+void vk_reflex_present(uint64_t id, int end);  // present thread: PRESENT_START / PRESENT_END
+void vk_reflex_release(void);                  // before the device goes away
+// THWOMP motion vectors, prototype (vk_mv.c, MKW_MV_DEBUG=1..3): camera motion from the scene depth and the camera block
+extern int vk_mv_armed;                        // > 0: the replay captures the camera block (vk_mv_draw, vk_exec.h)
+void vk_mv_frame(uint64_t frame);              // replay thread, at the frame's present
+VkImage vk_mv_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]);   // RGBA8 debug picture
+// The frame being presented, for DLSS (vk_dlss.cpp): depth, motion vectors (RG16F, pixels, previous minus current,
+// unjittered), the picture without the HUD (linear, before the game's SMAA), all of the render size and in GENERAL;
+// this frame's jitter (pixels, x right, y down) and the game's camera block rows (unjittered). reset: no history.
+typedef struct {
+    uint64_t frame;
+    int reset;
+    uint32_t w, h;
+    VkImage depth, mv, color, bias;
+    VkImageView depth_view, mv_view, color_view, bias_view;   // bias: DLSS's bias-current-colour hint (R16F: Streamline maps no R8_UNORM, R8_UINT only)
+    VkFormat depth_fmt, color_fmt;
+    float jitter[2];
+    float cam[32][4];
+} VkMvFrame;
+int vk_mv_frame_inputs(VkCommandBuffer cb, unsigned slot, const int crop[4], VkMvFrame *f);
+void vk_mv_set_pictures(VkImageView cur, VkImageView prev);   // the bias hint's pictures (DLSS's inputs), NULL: the HUD-less
+void vk_mv_set_jitter(int on);
+void vk_mv_jitter_px(uint64_t frame, float *x, float *y);
+// THWOMP DLSS super resolution (vk_dlss.c, MKW_UPSCALER=dlss): Streamline before and after the device, its swapchain
+// proxies (NULL: call Vulkan), and the upscaled picture with the HUD at out_w x out_h (RGBA8, GENERAL) or VK_NULL_HANDLE.
+int vk_dlss_wanted(void);
+int vk_dlss_active(void);
+// queues: Streamline's own, to make in the graphics family after the host's queue
+void vk_dlss_pre_device(uint32_t vendor, const char **ext, uint32_t *n_ext, uint32_t cap, uint32_t *queues);
+void vk_dlss_post_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t gfx_family);
+PFN_vkVoidFunction vk_dlss_proc(const char *name);
+PFN_vkVoidFunction vk_dlss_instance_proc(VkInstance inst, const char *name);   // with DLSS-G: the surface calls
+void vk_wait_device_idle(VkDevice dev);   // routes vkDeviceWaitIdle through Streamline's proxy when active
+// bb_rect: where the picture goes in the swapchain image {x, y, ...} (DLSS frame generation's subrect), NULL at 0, 0
+VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4], int src_w,
+                       int src_h, uint32_t out_w, uint32_t out_h, const int *bb_rect);
+// THWOMP NVIDIA DLSS frame generation (vk_dlss.c, MKW_FRAMEGEN_TYPE=dlss, MKW_DLSSG): through Streamline, with DLSS
+int vk_dlssg_loaded(void);         // its plugin runs on this device (loaded at start, RTX 40 or newer)
+int vk_dlssg_reflex(void);         // Streamline's Reflex and PCL run (vk_reflex.c goes through them)
+uint32_t vk_dlssg_max(void);       // the highest multiplier this GPU makes, 0 unknown
+uint32_t vk_dlssg_frames(void);    // frames per game frame the settings ask for and the GPU makes, 0 off
+uint32_t vk_dlssg_running(void);   // the multiplier in effect now, 0 none
+uint32_t vk_dlssg_take_presented(void);   // frames actually presented by DLSS-G since the last call
+void vk_dlssg_swapchain(int on);   // before a swapchain is made: through DLSS-G or not
+void vk_dlssg_present(uint32_t frames, int hdr);   // a game frame's options, before its present
+int vk_dlssg_preset_driver(int *own);   // the driver profile's preset: 0 default, 1 A, 2 B, 3 C, -1 unknown
+int vk_dlssg_preset_write(int preset);  // into this executable's driver profile, in the background
+uint32_t vk_dlssg_driver_mult(void);    // the NVIDIA App's fixed multiplier over ours, 0 none
+// With frame generation: DLSS of the game frame's picture once, before vk_fg_frame, at the window's rectangle (*ow x
+// *oh, RGBA8, GENERAL, no crop); VK_NULL_HANDLE when not upscaled. The presents of that frame then skip DLSS.
+VkImageView vk_dlss_last_bias(void);   // the bias hint of the last frame DLSS upscaled (render size, GENERAL)
+VkImage vk_present_dlss_first(VkImage src, VkFormat fmt, int w, int h, const int crop[4], int *ow, int *oh);
+void vk_reflex_shown(uint64_t id);             // the frame went out: its start-to-present time, logged
 // vk_present_blit for frame generation: presents already waiting stay waiting, so the frames of one game frame are
 // all blitted at once and each vk_present_flip then queues the next at its time.
 void vk_present_blit_ahead(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
@@ -117,7 +182,8 @@ int vk_present_ahead_max(void);       // presents that may wait at once (the swa
 double vk_present_refresh_hz(void);   // the window's monitor, 0 unknown
 // ---- frame generation (vk_framegen.c), the present thread
 #define VK_FG_MAX 4   // frames shown per game frame at most
-int vk_fg_wanted(void);   // MKW_FRAMEGEN is not off: the swapchain keeps spare images for it
+int vk_fg_wanted(void);
+void vk_fg_set_mask(VkImageView v);   // the HUD mask for the next vk_fg_frame (DLSS's bias hint), NULL none   // MKW_FRAMEGEN is not off: the swapchain keeps spare images for it
 // One game frame: copies the crop rectangle {x, y, w, h} of src (GENERAL, all its writes submitted) into a picture of
 // its own and submits the frames made between the last game frame and it. out: what to show, in order (the made
 // frames, then the game's), each a GENERAL R8G8B8A8_UNORM image of *w x *h; *step: the time between two of them.
@@ -146,6 +212,7 @@ void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]);
 void vk_present_capture(int on);
 int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt);
 void vk_present_screen_shot(const char *path);   // the next swapchain image to path as PNG (ctl "screen")
+void vk_present_screen_series(const char *dir, int n);   // the next n, as dir/s<present>.png (ctl "screens")
 
 // The window system's part of device creation (gfx_window_sdl.c): the instance
 // extensions a surface needs (their count, at most max), and whether a queue family of pd can present to it.
@@ -236,6 +303,8 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
 uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
 const uint8_t *vk_usnap_peek(uint64_t addr, uint64_t n, uint64_t align);   // vk_usnap_find's host copy, uncounted
+uint8_t *vk_usnap_gpu_bytes(uint64_t addr, uint64_t n);   // THWOMP: the arena bytes the GPU reads (camera jitter)
+void vk_usnap_patched(const uint8_t *p, uint64_t n);      // flushes what was written there
 extern int ubo_ptr_snap;   // MKW_UBO_PTR_SNAP (vk_exec_ubuf.c): read by vk_usnap_begin, which keeps the host copy for it
 struct VkExec;
 void vk_ubo_watch(const struct VkExec *ex, int st);   // MKW_UBO_WATCH (diag/vk_ubo_watch.c)

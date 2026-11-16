@@ -64,9 +64,17 @@ static void present_main(void *arg) {
         VkImage fo[VK_FG_MAX];
         int fw = 0, fh = 0;
         uint64_t step = 0;
-        int nf = vk_fg_frame(j.image, j.w, j.h, j.has_crop ? j.crop : NULL, j.at, fo, &fw, &fh, &step);
+        // THWOMP DLSS first, with frame generation: the frames are made from the upscaled picture
+        int uw = 0, uh = 0;
+        VkImage up = vk_present_dlss_first(j.image, j.format, j.w, j.h, j.has_crop ? j.crop : NULL, &uw, &uh);
+        VkImage pic = up ? up : j.image;
+        VkFormat pfmt = up ? VK_FORMAT_R8G8B8A8_UNORM : j.format;
+        int pw = up ? uw : j.w, ph = up ? uh : j.h;
+        const int *pcrop = up ? NULL : j.has_crop ? j.crop : NULL;
+        vk_fg_set_mask(up ? vk_dlss_last_bias() : VK_NULL_HANDLE);   // the HUD and the menus: not moved (fg_synth.comp)
+        int nf = vk_fg_frame(pic, pw, ph, pcrop, j.at, fo, &fw, &fh, &step);
         for (int k = 0; k < nf; k++) vk_present_blit_ahead(fo[k], VK_IMAGE_LAYOUT_GENERAL, VK_FORMAT_R8G8B8A8_UNORM, fw, fh, NULL);
-        if (!nf) vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
+        if (!nf) vk_present_blit(pic, VK_IMAGE_LAYOUT_GENERAL, pfmt, pw, ph, pcrop);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
@@ -84,9 +92,12 @@ static void present_main(void *arg) {
             vk_present_flip();
         }
         uint64_t target = nf ? first + (uint64_t)(nf - 1) * step : j.at;
-        wait_until(target);
+        // DLSS-G: one present per game frame as soon as it is ready; Streamline/Reflex pace the generated frames.
+        // Holding the flip to the 60 Hz pacer fights that and looks like duplicated/artifacted frames.
+        int dlssg_pace = !nf && vk_dlssg_frames() > 0;
+        if (!dlssg_pace) wait_until(target);
         uint64_t t1 = kern_now_ns();
-        vk_present_flip();
+        vk_present_flip_id(j.frame);
         // MKW_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went;
         // with frame generation, the game's frame and how many were shown before it
@@ -116,6 +127,8 @@ void vk_present_drain(void) {
 static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
                           uint64_t value) {
     static volatile int32_t n_skipped;
+    vk_reflex_submitted(frame);   // THWOMP Reflex: the frame's work is on the queue
+    vk_mv_frame(frame);           // THWOMP motion vectors: the frame's camera capture is the current one
     if (vk_pt_on()) vk_pt_frame(frame);
     vk_spec_frame(frame);
     vk_exec_present_note(frame);   // before vk_exec_frame_log, which resets the frame's draw counts
@@ -452,7 +465,12 @@ void gfx_exit_log(void) {
     if (gfx_replay_async() && r_started && !plat_xchg32(&done, 1)) replay_log(game_frames, 1);
 }
 
+// THWOMP Reflex (vk_reflex.c): presents the game has made, in the same order as the replay's frame numbers
+static volatile uint64_t be_presents;
+void gfx_frame_start(void) { vk_reflex_frame_start(__atomic_load_n(&be_presents, __ATOMIC_RELAXED) + 1); }
+
 static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
+    vk_reflex_game_present(__atomic_add_fetch(&be_presents, 1, __ATOMIC_RELAXED));
     vk_sync_start();
     if (vk_glyphs_due()) {   // the button icons changed: their sheet goes up again, as a WriteTexels would
         replay_drain(DR_WRITE_TEXELS);

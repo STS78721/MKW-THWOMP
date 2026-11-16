@@ -20,6 +20,7 @@ const OvNvState *ov_nv_state(void);                        // ov_gfx.c
 void gfx_window_start(void);                               // window thread, Vulkan device, swapchain; idempotent
 void gfx_window_early(void);                               // the window at boot, black until the first image
 void gfx_vsync_bind(uint64_t system_event);                // nn::vi vsync event; signalled at 60 Hz
+void gfx_frame_start(void);                                // THWOMP: a game frame begins (Reflex, vk_reflex.c)
 int gfx_hdr_output(uint16_t *peak, uint16_t *white);       // 1: the window shows HDR10 (peak, paper white nits)
 void gfx_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r);   // 10-bit PQ to sRGB bytes at paper white
 int gfx_window_focused(void);

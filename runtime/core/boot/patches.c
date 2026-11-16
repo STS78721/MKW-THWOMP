@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "fs.h"
 #include "gamelib.h"
 #include "gfx.h"
 #include "hacks.h"
@@ -168,7 +169,8 @@ static void shadow_set(const RtGame *g) {
     shadow_size = (uint32_t)atoi(cfg_value("MKW_SHADOW_SIZE"));   // "console": 0
     const char *extra = cfg_get("MKW_RB_EXTRA_MIB"), *res = cfg_value("MKW_RESOLUTION");
     rb_extra_mib = extra ? (uint32_t)atoi(extra) : 0;
-    scene_lines = strcmp(res, "original") ? (uint32_t)atoi(res) : 0;   // the targets' lines (romfs_res.c)
+    (void)res;
+    scene_lines = (uint32_t)romfs_render_lines();   // the targets' lines (romfs_res.c; DLSS quality's with DLSS)
     for (int i = 0; i < g->npatch_sets; i++)
         if (!strcmp(g->patch_sets[i].name, "shadow")) g->patch_on[i] = shadow_size != 0 || second_pool_bytes() != 0;
 }
@@ -325,7 +327,7 @@ static void aspect_set(const RtGame *g) {
 // MKW_ASPECT wider than 16:9, the width is the lines times that aspect (1440 lines when nothing else sets them).
 static void output_size(const RtGame *g) {
     const char *res = cfg_value("MKW_RESOLUTION"), *off = cfg_get("MKW_OUTPUT_PATCH");
-    int lines = strcmp(res, "original") ? atoi(res) : 0;
+    int lines = romfs_render_lines();   // MKW_RESOLUTION's, or DLSS quality's (romfs_res.c)
     if (!lines) {
         // the lines the picture gets in the window: fewer than the window's when it is narrower than the picture and
         // the present letterboxes it (gfx_fit_rect, MKW_PICTURE_FIT=keep). A 16:9 picture on the Steam Deck's

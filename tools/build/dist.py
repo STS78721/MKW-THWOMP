@@ -86,6 +86,8 @@ PINS = {
                    "eae7a3449d5a3b5351c5427137c076cc3fc826645c7bfc42dc10772b783826f1"),
     },
     "windows": {
+        "streamline": ("https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.16/streamline-sdk-v2.14.16.zip",
+                       "32041e51db0cab709a271b72a352281b690c2abbd669a827809401a5dd23956b"),
         "python": (PBS + "cpython-3.14.10%2B20261026-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
                    "c1876a9795d3a94ee49a1499a69cd91e26ca3e2829593f93fa6e4db90d05402b"),
         "zig": ("https://ziglang.org/download/0.17.1/zig-x86_64-windows-0.17.1.zip",
@@ -117,6 +119,13 @@ SOURCES = ["recomp", "sm86", "tools/build/build.py", "tools/prepare", "tools/mod
            "tools/github/signatures.toml"]  # fmt: skip  (the known errors tools/prepare/lastrun.py names)
 # Windows DLLs mkw.exe needs beside it (build/win/deps/bin, tools/build/windeps.py); vulkan-1.dll is the driver's.
 WIN_DLLS = ["SDL3.dll", "libopus-0.dll", "libusb-1.0.dll"]   # libusb: SDL3.dll loads it (windeps.py)
+# THWOMP: NVIDIA DLSS (runtime/gfx/vk/device/vk_dlss.c) through Streamline: its release build's DLLs beside mkw.exe, from
+# NVIDIA's SDK release (pinned below as "streamline"), and its licence. The settings offer DLSS only when
+# sl.interposer.dll is there and the GPU is an RTX one; the other GPUs never load them. DLSS frame generation
+# (MKW_FRAMEGEN_TYPE=dlss) adds its plugin and model and Streamline's Reflex and PCL, which it requires (NvLowLatencyVk:
+# Reflex on Vulkan).
+DLSS_DLLS = ["sl.interposer.dll", "sl.common.dll", "sl.dlss.dll", "nvngx_dlss.dll", "sl.dlss_g.dll", "nvngx_dlssg.dll",
+             "sl.reflex.dll", "sl.pcl.dll", "NvLowLatencyVk.dll"]
 
 
 def sha256(path: Path) -> str:
@@ -270,6 +279,11 @@ def main() -> None:
         windows_crt(setup / "lib/crt")
         for dll in WIN_DLLS:
             shutil.copy2(ROOT / "build/win/deps/bin" / dll, out / dll)
+        with zipfile.ZipFile(got["streamline"]) as z:
+            for dll in DLSS_DLLS:
+                (out / dll).write_bytes(z.read(f"bin/x64/{dll}"))
+            (out / "licenses").mkdir(exist_ok=True)
+            (out / "licenses/NVIDIA-Streamline-license.txt").write_bytes(z.read("license.txt"))
     copy_sources(setup / "src")
     size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file() and not p.is_symlink())
     print(f"{out}: {size / 2**20:.0f} MiB")

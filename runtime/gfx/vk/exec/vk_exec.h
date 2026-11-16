@@ -138,6 +138,13 @@ void vk_exec_draw_forget(void);   // forgets what is bound (pipeline, state, ver
 // vk_exec_draw.c: the calling thread's recording state (made once per thread; vk_exec_op_draw makes it too).
 void vk_exec_draw_thread(void);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
+void vk_mv_draw(VkExec *ex);
+// THWOMP object motion (device/vk_mv.c): a scene pre-pass draw again into transform feedback; 1 when it bound another
+// pipeline (the caller binds the game's again)
+void vk_mv_pass_begin(VkExec *ex);   // THWOMP: before a pass begins: the copy of the picture without the HUD
+void vk_mv_pass_end(VkExec *ex);     // THWOMP: after a pass completes: capture post-SMAA HUD-less scene before UI
+int vk_mv_capture(VkExec *ex, const void *vs, VkPipelineLayout lay, int minus_w, uint64_t ibuf, int32_t count,
+                  int32_t base_vertex, int32_t instances, int32_t base_instance, int triangles);   // THWOMP motion vectors (device/vk_mv.c): the camera block of a scene draw
 // Scissor 0 clipped to the render area of the open pass; extent 0: nothing to draw.
 VkRect2D vk_exec_scissor(const VkExec *ex);
 void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h);   // pass size when no attachment is set

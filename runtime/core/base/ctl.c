@@ -4,6 +4,7 @@
 //   shot PATH            the next presented frame, full size, as PNG (save_shot)
 //   screen PATH          the next swapchain image as PNG: what the player sees, with the menu, notices and overlays
 //                        (sRGB at paper white on an HDR display; gfx_present.c save_capture)
+//   screens N DIR        the next N swapchain images as DIR/s<present>.png (each waits for its frame: slow, every one kept)
 //   dump DIR [ubo|lut|log N]   the next frame as MKW_DUMP writes it (vk_dump_rearm; ubo: MKW_DUMP_UBO; lut: only 3D
 //                        volumes; log N: the N frames before it logged to passes.txt too, as MKW_DUMP_LOG)
 //   flight               a flight dump around now (MKW_FLIGHT=1), as F8
@@ -47,6 +48,10 @@ void ctl_run(char *line) {
     } else if (!strcmp(cmd, "screen") && *arg) {
         vk_present_screen_shot(arg);
         rt_log("ctl: screen %s queued at frame %llu", arg, (unsigned long long)frame);
+    } else if (!strcmp(cmd, "screens") && *arg) {   // "screens N DIR": the next N swapchain images, DIR/s<frame>.png
+        int n = 0, at = 0;
+        if (sscanf(arg, "%d %n", &n, &at) == 1 && n > 0 && arg[at]) vk_present_screen_series(arg + at, n);
+        rt_log("ctl: screens %s queued at frame %llu", arg, (unsigned long long)frame);
     } else if (!strcmp(cmd, "dump") && *arg) {
         char d[400];
         int ubo = 0, luts = 0, logn = 0;

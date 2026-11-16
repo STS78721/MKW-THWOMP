@@ -378,6 +378,22 @@ const uint8_t *vk_usnap_peek(uint64_t addr, uint64_t n, uint64_t align) {
     return off % align || !U.host_on ? NULL : U.host + off;
 }
 
+// THWOMP camera jitter (device/vk_mv.c): the bytes the GPU will read for [addr, addr+n) in this submission's arena, to
+// be rewritten before the part that binds them is submitted (vk_usnap_patched flushes them); NULL when the range was
+// not copied (the binding reads guest memory) or a GPU write dropped the copy.
+uint8_t *vk_usnap_gpu_bytes(uint64_t addr, uint64_t n) {
+    if (!U.on || !n || !U.arena) return NULL;
+    int i = first_above(addr);
+    if (i >= U.nreg) return NULL;
+    const Reg *r = &U.reg[i];
+    if (__atomic_load_n(&r->drop_at, __ATOMIC_ACQUIRE) <= vk_exec_op_pos() || addr < r->lo || addr + n > r->hi) return NULL;
+    return U.arena->map + r->off + (addr - r->lo);
+}
+
+void vk_usnap_patched(const uint8_t *p, uint64_t n) {
+    if (U.arena && p >= U.arena->map) vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, (VkDeviceSize)(p - U.arena->map), n);
+}
+
 // Chunks of one submission record on several threads (MKW_REPLAY_PAR): drops go under drop_lock; vk_usnap_find reads
 // a region's drop position without it.
 static PlatMutex drop_lock = PLAT_MUTEX_INIT;

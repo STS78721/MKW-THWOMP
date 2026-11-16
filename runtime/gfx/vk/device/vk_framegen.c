@@ -107,15 +107,15 @@ static int init(VkCtx *c) {
             return 0;
         }
     }
-    VkDescriptorSetLayoutBinding b[4];
-    for (int i = 0; i < 4; i++)
+    VkDescriptorSetLayoutBinding b[5];   // three pictures in, one out, the HUD mask (fg_synth.comp)
+    for (int i = 0; i < 5; i++)
         b[i] = (VkDescriptorSetLayoutBinding){.binding = (uint32_t)i, .descriptorCount = 1,
-                                              .descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                                                      : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                              .descriptorType = i != 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                                       : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                               .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
     VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-                                           .bindingCount = 4, .pBindings = b};
+                                           .bindingCount = 5, .pBindings = b};
     VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
     VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                      .pSetLayouts = &F.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
@@ -245,21 +245,28 @@ static void img_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkP
 }
 
 // One pass: inputs a, b, c (b and c may repeat a) into out, over w x h invocations, then a barrier
+// THWOMP: the HUD mask of the game frame being shown (DLSS's bias hint, vk_mv.c: 1 where the finished picture changed
+// and the scene did not: the HUD, the menus), when DLSS ran first; NULL: none. fg_synth.comp shows the nearer frame's
+// own pixels there instead of a blend moved along the scene's motion (menu text sliding in came out scrambled).
+static VkImageView g_mask;
+void vk_fg_set_mask(VkImageView v) { g_mask = v; }
+
 static void pass(VkCommandBuffer cb, VkPipeline p, const Img *a, const Img *b, const Img *c, const Img *out,
                  const void *pc, uint32_t w, uint32_t h) {
-    VkDescriptorImageInfo ii[4] = {{F.sampler, a->view, VK_IMAGE_LAYOUT_GENERAL},
+    VkDescriptorImageInfo ii[5] = {{F.sampler, a->view, VK_IMAGE_LAYOUT_GENERAL},
                                    {F.sampler, (b ? b : a)->view, VK_IMAGE_LAYOUT_GENERAL},
                                    {F.sampler, (c ? c : a)->view, VK_IMAGE_LAYOUT_GENERAL},
-                                   {VK_NULL_HANDLE, out->view, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet wr[4];
-    for (int i = 0; i < 4; i++)
+                                   {VK_NULL_HANDLE, out->view, VK_IMAGE_LAYOUT_GENERAL},
+                                   {F.sampler, g_mask ? g_mask : a->view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[5];
+    for (int i = 0; i < 5; i++)
         wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,
                                        .descriptorCount = 1,
-                                       .descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                                               : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                       .descriptorType = i != 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                                : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        .pImageInfo = &ii[i]};
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
-    rec_push(F.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, F.layout, 0, 4, wr);
+    rec_push(F.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, F.layout, 0, 5, wr);
     vkCmdPushConstants(cb, F.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, pc);
     vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
     mem_barrier(cb);
@@ -314,7 +321,8 @@ int vk_fg_record(VkCommandBuffer cb, VkImage src, int sw, int sh, const int crop
         pass(cb, F.full, &F.lf[prev], &F.lf[cur], &F.fl[3], &F.fl[4], pc1, gw, gh);
         pass(cb, F.median, &F.fl[4], NULL, NULL, &F.fl[5], level, gw, gh);
         for (int k = 0; k < made; k++) {
-            const float pc[4] = {(float)(k + 1) / (float)(made + 1), 1.0f / (16.0f * (float)gw), 1.0f / (16.0f * (float)gh), 0};
+            const float pc[4] = {(float)(k + 1) / (float)(made + 1), 1.0f / (16.0f * (float)gw), 1.0f / (16.0f * (float)gh),
+                                 g_mask ? 1.0f : 0.0f};
             pass(cb, F.synth, &F.pic[prev], &F.pic[cur], &F.fl[5], &F.made[k], pc, (uint32_t)cw, (uint32_t)ch);
         }
     }
@@ -351,7 +359,10 @@ static int mult_now(void) {
     return m < 1 ? 1 : m;
 }
 
-int vk_fg_wanted(void) { return strcmp(cfg_value("MKW_FRAMEGEN"), "off") != 0; }
+// THWOMP: off while NVIDIA DLSS frame generation is the type (vk_dlss.c): never both
+int vk_fg_wanted(void) {
+    return strcmp(cfg_value("MKW_FRAMEGEN"), "off") != 0 && strcmp(cfg_value("MKW_FRAMEGEN_TYPE"), "dlss") != 0;
+}
 
 // MKW_FG_DUMP=<game frame> (checking, with MKW_FG_DUMP_DIR, default "."): from that game frame of frame generation on,
 // four in a row as g<n>.png and the first frame made before each as m<n>.png, read back on the present thread (it

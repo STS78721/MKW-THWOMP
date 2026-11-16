@@ -128,6 +128,12 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
     ex->recorded++;
+    if (vk_mv_armed > 0 && vk_mv_capture(ex, B.st.vs, B.ds_layout, B.st.depth_minus_w, d->ibuf, d->count, d->base_vertex,
+                                          d->instances, d->base_instance, d->prim == NVN_DRAW_PRIMITIVE_TRIANGLES)) {
+        vkCmdBindPipeline(ex->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, B.pipe[0]);   // the game's again, and its discard
+        vkCmdSetRasterizerDiscardEnable(ex->cb, B.st.raster_discard != 0);
+        ex->recorded += 2;
+    }
     if (vk_dump_armed) vk_dump_draw_after(ex);
 }
 

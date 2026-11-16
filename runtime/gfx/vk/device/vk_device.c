@@ -246,6 +246,7 @@ typedef struct {
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed;
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pexe;
+    VkPhysicalDevicePresentIdFeaturesKHR pid;
 } FeatureChain;
 
 static int create_device(void) {
@@ -337,6 +338,15 @@ static int create_device(void) {
         ext[n_ext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
         CHAIN(pexe, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
     }
+    // THWOMP: NVIDIA Reflex (vk_reflex.c): VK_NV_low_latency2 with present ids; enabled where the driver has both, used
+    // only when MKW_REFLEX asks
+    int has_ll2 = 0;
+    if (has_ext(ep, ne, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+        ext[n_ext++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+        ext[n_ext++] = VK_NV_LOW_LATENCY_2_EXTENSION_NAME;
+        has_ll2 = 1;
+        CHAIN(pid, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+    }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -383,6 +393,8 @@ static int create_device(void) {
     g_vk.has_placed = has_placed && c->placed.memoryMapPlaced && c->placed.memoryUnmapReserve;
     c->placed.memoryMapRangePlaced = VK_FALSE;   // whole allocations only
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
+    g_vk.has_low_latency = has_ll2 && c->pid.presentId;
+    if (has_ll2) rt_log("vk: NVIDIA Reflex (VK_NV_low_latency2): %s", g_vk.has_low_latency ? "available" : "no presentId");
     {
         const char *e = cfg_get("MKW_FEEDBACK");
         int layout_ok = has_fbl && has_lr && c->fbl.attachmentFeedbackLoopLayout && c->lr.dynamicRenderingLocalRead;
@@ -394,10 +406,10 @@ static int create_device(void) {
                has_fbl && c->fbl.attachmentFeedbackLoopLayout, has_lr && c->lr.dynamicRenderingLocalRead);
     }
 
-    float prio = 1.0f;
+    static const float prio = 1.0f, prios[16] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
     VkDeviceQueueCreateInfo qi[2] = {
         {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.gfx_family, .queueCount = 1,
-         .pQueuePriorities = &prio}};
+         .pQueuePriorities = prios}};
     uint32_t nqi = 1;
     if (g_vk.xfer_family != g_vk.gfx_family) {
         qi[1] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -406,13 +418,28 @@ static int create_device(void) {
     }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &c->f2, .queueCreateInfoCount = nqi,
                              .pQueueCreateInfos = qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    uint32_t sl_queues = 0;   // THWOMP: Streamline's extensions and queues (DLSS, DLSS frame generation)
+    vk_dlss_pre_device(g_vk.props.vendorID, ext, &n_ext, (uint32_t)(sizeof ext / sizeof *ext), &sl_queues);
+    di.enabledExtensionCount = n_ext;
+    if (sl_queues) {   // in the graphics family after ours, where it has them
+        uint32_t nfam = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nfam, NULL);
+        VkQueueFamilyProperties fp[16];
+        if (nfam > 16) nfam = 16;
+        vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nfam, fp);
+        uint32_t have = g_vk.gfx_family < nfam ? fp[g_vk.gfx_family].queueCount : 1;
+        if (1 + sl_queues > have) rt_log("vk: Streamline asks for %u queues, the graphics family has %u", sl_queues, have);
+        else qi[0].queueCount = 1 + sl_queues;
+    }
     vk_guard_gpu_ok();
     VkResult r = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.device);
+    if (vk_dlss_wanted()) rt_log("vk: vkCreateDevice with %u extensions: %d", n_ext, (int)r);
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
     vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 0, &g_vk.gfx_queue);
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }
+    vk_dlss_post_device(g_vk.instance, g_vk.phys, g_vk.device, g_vk.gfx_family);   // THWOMP: Streamline learns the device
 
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};
@@ -513,7 +540,7 @@ static long g_errors_total;     // outlives the device so the probe can print it
 
 static void destroy_all(void) {
     gfx_window_release_vk();
-    if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
+    if (g_vk.device) vk_wait_device_idle(g_vk.device);
     if (g_vk.device) vk_astc_release(), vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
     vk_headroom_stop();

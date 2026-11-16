@@ -174,12 +174,43 @@ static const char *write_overlay(int lines, float lod) {
     return dir;
 }
 
+int gfx_window_shape(int *w, int *h);   // gfx_window_sdl.c
+
+// THWOMP DLSS quality (MKW_DLSS_QUALITY): the lines the game renders at for DLSS mode `mode`, its share of the lines
+// the picture gets in the window (16:9 in it, as patches.c output_size), a multiple of 18 so that the 16:9 width is a
+// multiple of 32 (4K: Quality 1440, Balanced 1260, Performance 1080, Ultra Performance 720); 0 unknown.
+int romfs_dlss_lines(const char *mode) {
+    static const char *const q[] = {"dlaa", "quality", "balanced", "performance", "ultra"};
+    static const float s[] = {1.0f, 2.0f / 3.0f, 0.58f, 0.5f, 1.0f / 3.0f};
+    int w = 0, h = 0;
+    if (!gfx_window_shape(&w, &h) || h <= 0) return 0;
+    if (w > 0 && strcmp(cfg_value("MKW_PICTURE_FIT"), "stretch") && w * 9 < h * 16) h = w * 9 / 16;
+    for (int i = 0; i < 5; i++) {
+        if (strcmp(mode, q[i])) continue;
+        int lines = (int)(h * s[i] / 18.0f + 0.5f) * 18;
+        return lines < 360 ? 360 : lines;
+    }
+    return 0;
+}
+
+// The lines the game renders at, settled once at start: MKW_RESOLUTION's (0: the game's own), or with DLSS
+// (MKW_UPSCALER=dlss) MKW_DLSS_QUALITY's share of the window's, which DLSS then scales up by its mode's own factor
+int romfs_render_lines(void) {
+    static int lines = -1;
+    if (lines >= 0) return lines;
+    const char *v = cfg_value("MKW_RESOLUTION");
+    int n = strcmp(v, "original") ? atoi(v) : 0;
+    if (!strcmp(cfg_value("MKW_UPSCALER"), "dlss")) {
+        int d = romfs_dlss_lines(cfg_value("MKW_DLSS_QUALITY"));
+        if (d > 0) n = d;
+    }
+    return lines = n < 0 ? 0 : n;
+}
+
 static int g_lines;   // romfs_resolution_lines
 
 const char *romfs_resolution_overlay(void) {
-    const char *v = cfg_value("MKW_RESOLUTION");
-    int lines = strcmp(v, "original") ? atoi(v) : 0;
-    if (lines < 0) lines = 0;
+    int lines = romfs_render_lines();
     // MKW_DETAIL_DISTANCE (Graphics tab): the game's LODDistanceRatio, 2 in 1.0.0; the
     // console's value writes nothing
     float lod = (float)cfg_double("MKW_DETAIL_DISTANCE");

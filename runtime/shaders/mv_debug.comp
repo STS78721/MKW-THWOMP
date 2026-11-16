@@ -1,0 +1,104 @@
+#version 450
+// THWOMP motion vectors, prototype (runtime/gfx/vk/device/vk_mv.c): from the scene's depth and the camera block's
+// current and previous view-projection (M: this frame's NDC to last frame's clip space), each pixel's camera motion in
+// pixels. MKW_MV_DEBUG picks what the present shows instead of the game's picture:
+//   1  the vectors as colours (grey = still; red/green = moving in x/y; 32 pixels to full colour)
+//   2  left half: |picture - last picture warped by the vectors| x4; right half: |picture - last picture| x4 (no
+//      warp). Where the vectors are right the left half is dark; the karts, which the camera alone does not move, stay
+//      bright on both
+//   3  last picture warped by the vectors (should look like the picture)
+//   4  the picture without the HUD (vk_mv_pass_begin's copy)
+//   5  the HUD alone at full brightness, the rest dimmed (where the picture differs from the one without the HUD)
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth;
+layout(binding = 1) uniform sampler2D src;
+layout(binding = 2) uniform sampler2D hist;
+layout(binding = 3, rgba8) uniform writeonly image2D dst;
+layout(binding = 4, rgba16f) uniform writeonly image2D hist_out;
+// error sums over the scene's pixels (not the sky): warped, unwarped (x1000, rounded), pixel count
+layout(binding = 5, std430) buffer Stats { uint warped_sum, still_sum, pixels, conv[4]; } st;
+// object motion (mv_vel_*): rg pixels, a 1 where an object's own vertex shader gave the motion
+layout(binding = 6) uniform sampler2D vel;
+// the picture without the HUD (vk_mv_pass_begin), this frame
+layout(binding = 7) uniform sampler2D hudless;   // conv: warped error of each convention (bit 0 flip y, bit 1 depth [0,1])
+layout(push_constant) uniform P {
+    mat4 m;         // NDC (this frame) -> clip (last frame), column-major
+    ivec2 offset;   // the crop rectangle's corner in src
+    ivec2 size;     // its size: dst, hist and hist_out
+    vec4 opt;       // mode, flip y (1: NDC y up while image rows go down), depth: 0 [-1,1] stored as d*0.5+0.5, 1 [0,1]
+    vec4 opt2;      // x: 1 when src is an sRGB view (its texels read back linear; the copy without the HUD holds the
+                    // stored values), so the HUD comparison encodes src again; y: mode 6's frame parity;
+                    // zw: this frame's jitter minus last frame's, pixels (vk_mv_jitter_px)
+} pc;
+shared uint g_w, g_s, g_n, g_c[4];   // the workgroup's sums: one global atomic per group
+
+void shade(ivec2 p) {
+    vec2 uv = (vec2(p) + 0.5) / vec2(pc.size);
+    float d = texture(depth, uv).r;
+    bool flip = pc.opt.y > 0.5;
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, flip ? 1.0 - uv.y * 2.0 : uv.y * 2.0 - 1.0);
+    float z = pc.opt.z > 0.5 ? d : d * 2.0 - 1.0;
+    vec4 q = pc.m * vec4(ndc, z, 1.0);
+    vec2 pn = q.xy / q.w;
+    vec2 puv = vec2(pn.x * 0.5 + 0.5, flip ? 0.5 - pn.y * 0.5 : pn.y * 0.5 + 0.5);
+    vec2 puv0 = puv;   // the camera's prediction before the jitter correction
+    vec2 mv = (uv - puv) * vec2(pc.size) + pc.opt2.zw;   // + the jitter's change (pixels): the pictures carry it
+    puv = uv - mv / vec2(pc.size);
+    vec4 ov = texelFetch(vel, p, 0);   // object motion from captured positions: the jitter is already in them
+    if (ov.a > 0.5) mv = ov.xy, puv = uv - mv / vec2(pc.size);
+    vec3 cur = texelFetch(src, p + pc.offset, 0).rgb;
+    vec3 warped = texture(hist, puv).rgb;
+    vec3 still = texelFetch(hist, p, 0).rgb;
+    if (pc.opt.w > 0.5 && d < 0.99999) {   // scored only on the frames MKW_MV_SHOT saves
+        atomicAdd(g_w, uint(dot(abs(cur - warped), vec3(333.0))));
+        atomicAdd(g_s, uint(dot(abs(cur - still), vec3(333.0))));
+        atomicAdd(g_n, 1u);
+        // colour space check: mean of the presented picture, and of the copy without the HUD as stored, sRGB-encoded
+        // and sRGB-decoded (x1000 per pixel, luma)
+        vec3 h = texelFetch(hudless, p, 0).rgb;
+        vec3 he = mix(h * 12.92, 1.055 * pow(max(h, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055, step(0.0031308, h));
+        vec3 hd = mix(h / 12.92, pow((max(h, vec3(0.0)) + 0.055) / 1.055, vec3(2.4)), step(0.04045, h));
+        const vec3 Y = vec3(0.2126, 0.7152, 0.0722) * 1000.0;
+        atomicAdd(g_c[0], uint(dot(clamp(cur, 0.0, 4.0), Y)));
+        atomicAdd(g_c[1], uint(dot(clamp(h, 0.0, 4.0), Y)));
+        atomicAdd(g_c[2], uint(dot(clamp(he, 0.0, 4.0), Y)));
+        atomicAdd(g_c[3], uint(dot(clamp(hd, 0.0, 4.0), Y)));
+    }
+    int mode = int(pc.opt.x + 0.5);
+    vec3 o;
+    if (mode == 1)
+        o = vec3(0.5 + mv.x / 64.0, 0.5 + mv.y / 64.0, ov.a > 0.5 ? 1.0 : 0.5);
+    else if (mode == 2)
+        o = p.x < pc.size.x / 2 ? abs(cur - warped) * 4.0 : abs(cur - still) * 4.0;
+    else if (mode == 4)
+        o = texelFetch(hudless, p, 0).rgb;
+    else if (mode == 6)   // even frames the copy without the HUD, odd frames the presented picture (both as stored)
+        o = pc.opt2.y > 0.5 ? texelFetch(hudless, p, 0).rgb : cur;
+    else if (mode == 5)   // the HUD: where the presented picture differs from the one without it
+    {
+        vec3 c = pc.opt2.x > 0.5 ? mix(cur * 12.92, 1.055 * pow(cur, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, cur)) : cur;
+        vec3 h = texelFetch(hudless, p, 0).rgb;
+        o = (p.x < pc.size.x / 2 ? abs(cur - h) : abs(c - h)) * 8.0;   // diagnosis: linear | encoded, x8
+    }
+    else
+        o = warped;
+    if (mode == 2 && abs(p.x - pc.size.x / 2) < 2) o = vec3(1.0, 0.0, 0.0);
+    imageStore(dst, p, vec4(clamp(o, 0.0, 1.0), 1.0));
+    imageStore(hist_out, p, vec4(cur, 1.0));
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0) g_w = 0u, g_s = 0u, g_n = 0u, g_c[0] = g_c[1] = g_c[2] = g_c[3] = 0u;
+    barrier();
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = all(lessThan(p, pc.size));
+    if (inside) shade(p);
+    barrier();
+    if (gl_LocalInvocationIndex == 0 && g_n > 0u) {
+        atomicAdd(st.warped_sum, g_w);
+        atomicAdd(st.still_sum, g_s);
+        atomicAdd(st.pixels, g_n);
+        for (int i = 0; i < 4; i++) atomicAdd(st.conv[i], g_c[i]);
+    }
+}
+

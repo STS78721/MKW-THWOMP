@@ -751,6 +751,7 @@ NVN_API(nvnWindowAcquireTexture) {
         perf_end(PERF_PACE, p0);
     }
     acquire_wait(o, idx);
+    gfx_frame_start();   // THWOMP: NVIDIA Reflex's sleep and frame start (vk_reflex.c), off by default
     // The sync means "the display no longer reads this image". Presents are copies queued in submit order, so it is
     // already satisfied: fenced = 3 with fence 0.
     if (s) {

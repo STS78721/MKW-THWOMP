@@ -627,6 +627,7 @@ int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int mesh) 
     feedback_written(ex, &s);
     bind_vertex_buffers(ex, msh ? 0xffff : vk_exec_streams(ex, info));
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info);
+    if (vk_mv_armed > 0) vk_mv_draw(ex);
     vk_exec_oq_draw(ex);
     if (vk_pt_enabled() && vk_pt_draw_mode()) vk_pt_draw(ex->cb, s.vs, s.fs);
     if (vk_spec_census_on()) spec_census(ex, vs, NVN_STAGE_VS), spec_census(ex, fs, NVN_STAGE_FS);

@@ -28,6 +28,19 @@ void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 enum { MAX_GPUS = 8 };
 static char g_gpu_names[MAX_GPUS][VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
 static int g_gpu_n = -1;   // -1: not listed yet
+static bool g_gpu_nvidia[MAX_GPUS];   // THWOMP: vendor 0x10de (the start screen gates Reflex on it)
+extern "C" struct VkCtx *vk_ctx(void);
+extern "C" int vk_reflex_supported(void);
+extern "C" int vk_dlss_active(void);
+extern "C" const char *vk_ctx_device_name(struct VkCtx *c);
+extern "C" int vk_dlssg_loaded(void);   // THWOMP: DLSS frame generation (gfx/vk/device/vk_dlss.c)
+extern "C" uint32_t vk_dlssg_max(void);
+extern "C" uint32_t vk_dlssg_frames(void);
+extern "C" uint32_t vk_dlssg_running(void);
+extern "C" int vk_dlssg_preset_driver(int *own);
+extern "C" int vk_dlssg_preset_write(int preset);
+extern "C" uint32_t vk_dlssg_driver_mult(void);
+extern "C" int gfx_window_lines(void);
 
 // The Vulkan devices in vkEnumeratePhysicalDevices order, which MKW_GPU_INDEX counts in (vk_device.c pick_device).
 void settings_list_gpus(VkInstance inst) {
@@ -39,6 +52,7 @@ void settings_list_gpus(VkInstance inst) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pd[i], &p);
         snprintf(g_gpu_names[i], sizeof g_gpu_names[i], "%s", p.deviceName);
+        g_gpu_nvidia[i] = p.vendorID == 0x10de;
     }
     g_gpu_n = (int)n;
 }
@@ -147,6 +161,15 @@ static const char *present_note(void) {
 }
 
 // ---- the tabs
+// THWOMP: Reflex shows only where it can work: in the game the driver has VK_NV_low_latency2; on the start screen
+// (no device yet) the GPU the game will use is an NVIDIA one.
+static bool reflex_available(void) {
+    if (vk_ctx()) return vk_reflex_supported() != 0;
+    int i = atoi(cfg_value("MKW_GPU_INDEX"));
+    if (i < 0 || i >= g_gpu_n) i = 0;
+    return g_gpu_n > 0 && g_gpu_nvidia[i];
+}
+
 static void tab_screen(float scale) {
     opt_begin("##screen", scale);
     opt_toggle("MKW_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
@@ -160,11 +183,6 @@ static void tab_screen(float scale) {
         static const char *const vals[] = {"auto", "30", "60"};
         const char *names[3] = {menu_text(UI_MENU_FPS_AUTO), "30", "60"};
         opt_choice_list("MKW_FPS", UI_MENU_FPS, vals, names, 3, UI_MENU_FPS_DESC);
-    }
-    {   // frames made between the game's (gfx/vk/device/vk_framegen.c), live
-        static const char *const vals[] = {"off", "auto", "2", "3", "4"};
-        const char *names[5] = {menu_text(UI_MENU_PERF_OFF), menu_text(UI_MENU_FPS_AUTO), "2x", "3x", "4x"};
-        opt_choice_list("MKW_FRAMEGEN", UI_MENU_FRAMEGEN, vals, names, 5, UI_MENU_FRAMEGEN_DESC);
     }
     opt_group(UI_MENU_GRAPHICS);
     static const UiTextId fit[] = {UI_MENU_PICTURE_FIT_KEEP, UI_MENU_PICTURE_FIT_STRETCH};
@@ -243,11 +261,141 @@ static void rows_color(void) {
     }
 }
 
+// THWOMP: the scaling to the window. NVIDIA DLSS (gfx/vk/device/vk_dlss.c) is offered on an RTX GPU with NVIDIA's
+// DLSS files beside mkw.exe; chosen, its model and quality rows follow and FSR's sharpness goes. The quality sets the
+// game's render resolution from the display's lines (DLAA all of them, Quality two thirds, Balanced 0.58, Performance
+// half, Ultra Performance a third), the nearest one the resolution row offers; the same scale picks DLSS's mode.
+static bool dlss_offered(void) {
+    static int have = -1;
+    if (have < 0) {
+        char exe[1024];
+        have = 0;
+        if (plat_exe_path(exe, sizeof exe)) {
+            char *s = strrchr(exe, '\\'), *t = strrchr(exe, '/');
+            if (t > s) s = t;
+            if (s && (size_t)(s - exe) + 20 < sizeof exe) strcpy(s + 1, "sl.interposer.dll"), have = plat_file_exists(exe);
+        }
+    }
+    if (!have) return false;
+    const char *name = nullptr;
+    if (struct VkCtx *c = vk_ctx()) name = vk_ctx_device_name(c);
+    else {
+        int i = atoi(cfg_value("MKW_GPU_INDEX"));
+        if (i < 0 || i >= g_gpu_n) i = 0;
+        if (g_gpu_n > 0 && g_gpu_nvidia[i]) name = g_gpu_names[i];
+    }
+    return name && strstr(name, "RTX");
+}
+
+static void rows_upscaler(void) {
+    bool dlss = dlss_offered();
+    const char *up = cfg_value("MKW_UPSCALER");
+    // chosen in the game but not running: Streamline and the captures start with the game
+    const char *note = dlss && !strcmp(up, "dlss") && vk_ctx() && !vk_dlss_active() ? menu_text(UI_MENU_DLSS_RESTART)
+                                                                                       : nullptr;
+    static const UiTextId names[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR, UI_MENU_UPSCALER_DLSS};
+    opt_choice("MKW_UPSCALER", UI_MENU_UPSCALER, names, dlss ? 3 : 2, UI_MENU_UPSCALER_DESC, note);
+    if (!strcmp(up, "fsr")) opt_slider("MKW_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
+    if (!dlss || strcmp(up, "dlss")) return;
+    static const UiTextId models[] = {UI_MENU_DLSS_TRANSFORMER, UI_MENU_DLSS_TRANSFORMER2};
+    opt_choice("MKW_DLSS_MODEL", UI_MENU_DLSS_MODEL, models, 2, UI_MENU_DLSS_MODEL_DESC);
+    // the game resolution follows at the next start (romfs_res.c romfs_dlss_lines): the size it renders at, below
+    static const UiTextId qn[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_Q, UI_MENU_DLSS_BALANCED, UI_MENU_DLSS_PERF,
+                                  UI_MENU_DLSS_ULTRA};
+    static char size[32];
+    int lines = romfs_dlss_lines(cfg_value("MKW_DLSS_QUALITY"));
+    if (lines > 0) snprintf(size, sizeof size, menu_text(UI_MENU_OV_FMT_SIZE), (unsigned)(lines * 16 / 9), (unsigned)lines);
+    opt_choice("MKW_DLSS_QUALITY", UI_MENU_DLSS_QUALITY, qn, 5, UI_MENU_DLSS_QUALITY_DESC, lines > 0 ? size : nullptr);
+}
+
+static bool dlss_sets_resolution(void) { return dlss_offered() && !strcmp(cfg_value("MKW_UPSCALER"), "dlss"); }
+
+// THWOMP: NVIDIA DLSS frame generation (gfx/vk/device/vk_dlss.c). Its plugin loads at start: once the game runs, what it
+// reports (loaded, the most frames); before that, or with the other type chosen, the GPU's name: an RTX 40 makes 2x, an
+// RTX 50 more (4x shown until the plugin says).
+static int gpu_rtx_series(void) {
+    const char *name = nullptr;
+    if (struct VkCtx *c = vk_ctx()) name = vk_ctx_device_name(c);
+    else {
+        int i = atoi(cfg_value("MKW_GPU_INDEX"));
+        if (i < 0 || i >= g_gpu_n) i = 0;
+        if (g_gpu_n > 0 && g_gpu_nvidia[i]) name = g_gpu_names[i];
+    }
+    const char *r = name ? strstr(name, "RTX ") : nullptr;
+    if (!r) return 0;
+    int n = atoi(r + 4);   // "RTX 4070" -> 4070, "RTX 5070 Ti" -> 5070, "RTX PRO 6000 Blackwell": 0
+    if (n >= 1000) return n / 100 / 10 * 10;   // 40, 50, 60
+    return name && strstr(name, "Blackwell") ? 50 : name && strstr(name, " Ada") ? 40 : 0;
+}
+static bool dlssg_offered(void) {
+    if (!dlss_offered()) return false;
+    if (vk_ctx() && vk_dlssg_loaded()) return true;
+    return gpu_rtx_series() >= 40;
+}
+static unsigned dlssg_max(void) {
+    if (vk_ctx() && vk_dlssg_loaded() && vk_dlssg_max()) return vk_dlssg_max();
+    return gpu_rtx_series() >= 50 ? 4 : 2;
+}
+static const char *const dlssg_preset_vals[] = {"default", "a", "b", "c"};
+static const UiTextId dlssg_preset_names[] = {UI_MENU_DLSSG_PRESET_DEFAULT, UI_MENU_DLSSG_PRESET_A, UI_MENU_DLSSG_PRESET_B,
+                                              UI_MENU_DLSSG_PRESET_C};
+static int dlssg_preset_index(const char *v) {
+    for (int i = 0; i < 4; i++)
+        if (!strcmp(v, dlssg_preset_vals[i])) return i;
+    return 0;
+}
+
+// The Frame generation group: the type, then the chosen type's rows
+static void rows_framegen(void) {
+    bool offered = dlssg_offered();
+    bool dlss_type = !strcmp(cfg_value("MKW_FRAMEGEN_TYPE"), "dlss");
+    {
+        static const char *const vals[] = {"thwomp", "dlss"};
+        const char *names[2] = {menu_text(UI_MENU_FG_TYPE_THWOMP), menu_text(UI_MENU_FG_TYPE_DLSS)};
+        // chosen but not loaded at this start: it starts with the game
+        const char *note = dlss_type && offered && vk_ctx() && !vk_dlssg_loaded() ? menu_text(UI_MENU_DLSSG_RESTART) : nullptr;
+        if (!offered && !dlss_type) opt_disable_next(UI_MENU_DLSSG_UNSUPPORTED);
+        opt_choice_list("MKW_FRAMEGEN_TYPE", UI_MENU_FG_TYPE, vals, names, 2, UI_MENU_FG_TYPE_DESC, -1, note);
+    }
+    if (!dlss_type || !offered) {   // frames made between the game's (gfx/vk/device/vk_framegen.c), live
+        static const char *const vals[] = {"off", "auto", "2", "3", "4"};
+        const char *names[5] = {menu_text(UI_MENU_PERF_OFF), menu_text(UI_MENU_FPS_AUTO), "2x", "3x", "4x"};
+        opt_choice_list("MKW_FRAMEGEN", UI_MENU_FRAMEGEN, vals, names, 5, UI_MENU_FRAMEGEN_DESC);
+        opt_text(UI_MENU_FG_THWOMP);
+        return;
+    }
+    {   // the multiplier, live; NVIDIA only offers 2x, 3x, 4x and (on RTX 50) 6x — never 5x
+        static const char *const vals[] = {"off", "2", "3", "4", "6"};
+        const char *names[5] = {menu_text(UI_MENU_PERF_OFF), "2x", "3x", "4x", "6x"};
+        unsigned mx = dlssg_max();
+        int n = mx >= 6 ? 5 : mx >= 4 ? 4 : mx >= 3 ? 3 : 2;
+        unsigned shown_max = mx >= 2 ? mx : 2;
+        static char note[96];
+        uint32_t drv = vk_dlssg_driver_mult();
+        if (drv) snprintf(note, sizeof note, menu_text(UI_MENU_DLSSG_BY_DRIVER), (unsigned)drv);
+        else snprintf(note, sizeof note, menu_text(UI_MENU_DLSSG_MAX), shown_max);
+        if (strcmp(cfg_value("MKW_UPSCALER"), "dlss")) opt_disable_next(UI_MENU_DLSSG_NEEDS_DLSS);
+        opt_choice_list("MKW_DLSSG", UI_MENU_DLSSG, vals, names, n, UI_MENU_DLSSG_DESC, -1, note);
+    }
+    {   // the preset, written into the driver profile (in the background) when changed; read back for the note
+        const char *names[4];
+        for (int i = 0; i < 4; i++) names[i] = menu_text(dlssg_preset_names[i]);
+        static char note[96];
+        int own = 0, drv = vk_dlssg_preset_driver(&own);
+        if (drv >= 0 && drv < 4) snprintf(note, sizeof note, menu_text(UI_MENU_DLSSG_PRESET_DRIVER), names[drv]);
+        if (opt_choice_list("MKW_DLSSG_PRESET", UI_MENU_DLSSG_PRESET, dlssg_preset_vals, names, 4, UI_MENU_DLSSG_PRESET_DESC,
+                            -1, drv >= 0 && drv < 4 ? note : nullptr))
+            vk_dlssg_preset_write(dlssg_preset_index(cfg_value("MKW_DLSSG_PRESET")));
+    }
+    opt_text(UI_MENU_FG_DLSS_ABOUT);
+}
+
 static void tab_graphics(float scale) {
     opt_begin("##graphics", scale);
     {   // the game's internal render resolution (sdk/fs/romfs_res.c), read at start
         static const char *const vals[] = {"original", "540", "720", "900", "1080", "1440", "2160"};   // 2160: issue #55
         const char *names[7] = {menu_text(UI_MENU_RESOLUTION_ORIGINAL), "540p", "720p", "900p", "1080p", "1440p", "2160p"};
+        if (dlss_sets_resolution()) opt_disable_next(UI_MENU_RESOLUTION_BY_DLSS);   // THWOMP: DLSS quality sets it
         opt_choice_list("MKW_RESOLUTION", UI_MENU_RESOLUTION, vals, names, 7, UI_MENU_RESOLUTION_DESC);
     }
     {   // the cameras' aspect and the output's width (core/boot/patches.c, set aspect), read at start
@@ -255,9 +403,6 @@ static void tab_graphics(float scale) {
         const char *names[5] = {"16:9", menu_text(UI_MENU_ASPECT_WINDOW), "21:9", "32:9", "48:9"};
         opt_choice_list("MKW_ASPECT", UI_MENU_ASPECT, vals, names, 5, UI_MENU_ASPECT_DESC);
     }
-    static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR};
-    opt_choice("MKW_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
-    opt_slider("MKW_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
     row_quality();
     {   // a floor on anisotropic filtering (gfx/vk/tex/vk_tex_slots.c make_sampler)
         static const char *const vals[] = {"game", "2", "4", "8", "16"};
@@ -280,6 +425,78 @@ static void tab_graphics(float scale) {
     }
     static const UiTextId mode[] = {UI_MENU_MODE_DOCKED, UI_MENU_MODE_HANDHELD};
     opt_choice("MKW_OPERATION_MODE", UI_MENU_OPERATION_MODE, mode, 2, UI_MENU_OPERATION_MODE_DESC);
+    opt_end();
+}
+
+// THWOMP: the Advanced graphics tab: what the port adds to the game's picture (upscalers, frame generation, Reflex,
+// colour profiles), with a line on top saying what runs now (a choice that waits for a restart says so)
+static void advg_status(void) {
+    static const UiTextId qn[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_Q, UI_MENU_DLSS_BALANCED, UI_MENU_DLSS_PERF,
+                                  UI_MENU_DLSS_ULTRA};
+    static const char *const qv[] = {"dlaa", "quality", "balanced", "performance", "ultra"};
+    char up[160], fg[160], all[400];
+    const char *u = cfg_value("MKW_UPSCALER");
+    if (!strcmp(u, "dlss") && vk_ctx() && vk_dlss_active()) {
+        int q = 1;
+        for (int i = 0; i < 5; i++)
+            if (!strcmp(cfg_value("MKW_DLSS_QUALITY"), qv[i])) q = i;
+        int lines = romfs_render_lines(), wl = gfx_window_lines();
+        snprintf(up, sizeof up, menu_text(UI_MENU_ADVG_DLSS), menu_text(qn[q]), (unsigned)(lines * 16 / 9),
+                 (unsigned)lines, (unsigned)(wl * 16 / 9), (unsigned)wl);
+    } else if (!strcmp(u, "dlss")) {
+        snprintf(up, sizeof up, "%s", menu_text(UI_MENU_ADVG_DLSS_RESTART));
+    } else {
+        snprintf(up, sizeof up, "%s", menu_text(!strcmp(u, "bilinear") ? UI_MENU_ADVG_BILINEAR : UI_MENU_ADVG_FSR));
+    }
+    const char *f = cfg_value("MKW_FRAMEGEN");
+    if (!strcmp(cfg_value("MKW_FRAMEGEN_TYPE"), "dlss") && dlssg_offered()) {
+        // NVIDIA DLSS FG: the multiplier set (paused while this menu is open) and the driver's preset
+        uint32_t frames = vk_ctx() && vk_dlssg_loaded() ? vk_dlssg_frames() : 0;
+        int drv = vk_dlssg_preset_driver(nullptr);
+        int p = drv >= 0 && drv < 4 ? drv : dlssg_preset_index(cfg_value("MKW_DLSSG_PRESET"));
+        char m[64];
+        uint32_t dm = vk_dlssg_driver_mult();   // the NVIDIA App's fixed multiplier wins over the row's
+        if (dm && dm != frames + 1) snprintf(m, sizeof m, menu_text(UI_MENU_DLSSG_BY_DRIVER), (unsigned)dm);
+        else snprintf(m, sizeof m, "%ux", (unsigned)frames + 1);
+        if (!vk_ctx() || !vk_dlssg_loaded()) snprintf(fg, sizeof fg, "%s", menu_text(UI_MENU_ADVG_DLSSG_RESTART));
+        else if (!frames) snprintf(fg, sizeof fg, "%s", menu_text(UI_MENU_ADVG_FG_OFF));
+        else if (vk_dlssg_running()) snprintf(fg, sizeof fg, menu_text(UI_MENU_ADVG_DLSSG), m, menu_text(dlssg_preset_names[p]));
+        else snprintf(fg, sizeof fg, menu_text(UI_MENU_ADVG_DLSSG_PAUSED), m, menu_text(dlssg_preset_names[p]));
+    } else if (!strcmp(f, "off")) snprintf(fg, sizeof fg, "%s", menu_text(UI_MENU_ADVG_FG_OFF));
+    else {
+        char m[32];
+        if (!strcmp(f, "auto")) snprintf(m, sizeof m, "%s", menu_text(UI_MENU_FPS_AUTO));
+        else snprintf(m, sizeof m, "%sx", f);
+        snprintf(fg, sizeof fg, menu_text(UI_MENU_ADVG_FG), m);
+    }
+    int n = snprintf(all, sizeof all, "%s  |  %s", up, fg);
+    if (reflex_available() && n > 0 && n < (int)sizeof all) {
+        const char *r = cfg_value("MKW_REFLEX");
+        const char *rn = !strcmp(r, "off") ? menu_text(UI_MENU_PERF_OFF)
+                       : !strcmp(r, "boost") ? menu_text(UI_MENU_REFLEX_BOOST) : menu_text(UI_MENU_REFLEX_ON);
+        char rs[64];
+        snprintf(rs, sizeof rs, menu_text(UI_MENU_ADVG_REFLEX), rn);
+        snprintf(all + n, sizeof all - n, "  |  %s", rs);
+    }
+    char line[480];
+    snprintf(line, sizeof line, menu_text(UI_MENU_ADVG_NOW), all);
+    opt_text_str(line);
+}
+
+static void tab_adv_graphics(float scale) {
+    opt_begin("##advgraphics", scale);
+    advg_status();
+    opt_group(UI_MENU_GROUP_UPSCALING);
+    rows_upscaler();
+    opt_group(UI_MENU_FRAMEGEN);
+    rows_framegen();
+    if (reflex_available()) {   // NVIDIA Reflex (gfx/vk/device/vk_reflex.c), NVIDIA only, live
+        opt_group(UI_MENU_GROUP_LATENCY);
+        static const UiTextId reflex[] = {UI_MENU_PERF_OFF, UI_MENU_REFLEX_ON, UI_MENU_REFLEX_BOOST};
+        // DLSS frame generation keeps it at least on while it runs (vk_reflex.c wanted_mode)
+        const char *note = vk_ctx() && vk_dlssg_frames() ? menu_text(UI_MENU_DLSSG_REFLEX_ON) : nullptr;
+        opt_choice("MKW_REFLEX", UI_MENU_REFLEX, reflex, 3, UI_MENU_REFLEX_DESC, note);
+    }
     rows_color();
     opt_end();
 }
@@ -527,7 +744,8 @@ static void tab_hacks(float scale) {
     opt_end();
 }
 
-static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GRAPHICS, UI_MENU_TAB_GAME,
+static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GRAPHICS, UI_MENU_TAB_ADV_GRAPHICS,
+                                              UI_MENU_TAB_GAME,
                                               UI_MENU_TAB_SOUND, UI_MENU_TAB_CONTROLS, UI_MENU_TAB_MENU,
                                               UI_MENU_TAB_ADVANCED, UI_MENU_TAB_HACKS};
 static int g_tab;               // the tab shown
@@ -605,6 +823,7 @@ void settings_page(float scale, float bottom) {
     switch (g_tab) {
     case TAB_SCREEN: tab_screen(scale); break;
     case TAB_GRAPHICS: tab_graphics(scale); break;
+    case TAB_ADV_GRAPHICS: tab_adv_graphics(scale); break;
     case TAB_GAME: tab_game(scale); break;
     case TAB_SOUND: tab_sound(scale); break;
     case TAB_CONTROLS: tab_controls(scale); break;

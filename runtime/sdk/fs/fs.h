@@ -40,6 +40,8 @@ uint32_t romfs_list(const char *path, int (*add)(const char *name, int is_dir, u
 uint64_t romfs_file_count(void);                           // files in the index (fs_init first)
 int romfs_has_language(const char *lang);                  // the index has Mals/<region><lang>/ ("pl", "th"): 1.5.0 and 1.7.0
 // ---- romfs_res.c
+int romfs_render_lines(void);             // the lines the game renders at (MKW_RESOLUTION or DLSS quality), 0 its own
+int romfs_dlss_lines(const char *mode);   // the lines for MKW_DLSS_QUALITY `mode` at this window, 0 unknown
 const char *romfs_resolution_overlay(void);   // MKW_RESOLUTION's overlay, NULL for the game's own
 void romfs_resolution_external(void);         // the overlay came from MKW_ROMFS_PATCHES instead
 int romfs_resolution_lines(void);             // lines applied at start: 0 the game's own, -1 MKW_ROMFS_PATCHES's

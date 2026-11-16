@@ -1,0 +1,114 @@
+#version 450
+// THWOMP DLSS (runtime/gfx/vk/device/vk_dlss.c): DLSS's output (linear: the game's finished picture, HUD included,
+// upscaled to the window's size) encoded to sRGB as the game's own picture is, into the RGBA8 picture the present
+// takes; with DLSS-G, also outputs HUD-less background and premultiplied UI + alpha for UI recomposition.
+// MKW_DLSS_MASK=1 (diagnosis): DLSS's picture on the left half, the game's own bilinearly scaled on the right;
+// 2: DLSS's picture with the bias hint in red (where DLSS takes this frame's pixels: the HUD, the menus, shadows).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D dlss;
+layout(binding = 1) uniform sampler2D final_pic;
+layout(binding = 2, rgba8) uniform writeonly image2D dst;
+layout(binding = 3) uniform sampler2D bias;         // DLSS's bias hint, the render size (MKW_DLSS_MASK=2)
+layout(binding = 4) uniform sampler2D hudless_in;   // post-tonemap SMAA-blended linear scene without UI, render size
+layout(binding = 5) uniform sampler2D in_cur;       // linear Scene+UI (R8G8B8A8_SRGB), render size
+layout(binding = 6, rgba8) uniform writeonly image2D dst_hudless;
+layout(binding = 7, rgba8) uniform writeonly image2D dst_ui;
+layout(push_constant) uniform P {
+    vec4 crop;       // the final picture's crop rectangle in its texture (x, y, w, h), texels
+    vec2 tex;        // that texture's size
+    vec2 size;       // dst's size
+    float view;      // MKW_DLSS_MASK
+    float write_fg;  // > 0.5: also split out dst_hudless + dst_ui
+} pc;
+
+vec3 enc(vec3 c) {
+    c = max(c, vec3(0.0));
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+
+// Approximate tone map for the pre-tonemap HUD-less float (B10G11R11): comparison-only, not the game's curve.
+vec3 approx_tm(vec3 c) {
+    c = max(c, vec3(0.0));
+    return c / (c + vec3(1.0));
+}
+
+vec4 cubic_weights(float f) {
+    float f2 = f * f, f3 = f2 * f;
+    return vec4(
+        -0.5 * f + f2 - 0.5 * f3,
+        1.0 - 2.5 * f2 + 1.5 * f3,
+        0.5 * f + 2.0 * f2 - 1.5 * f3,
+        -0.5 * f2 + 0.5 * f3
+    );
+}
+
+vec3 sample_hudless_srgb(ivec2 rsize, vec2 uv) {
+    vec2 t = uv * vec2(rsize) - 0.5;
+    ivec2 i0 = ivec2(floor(t));
+    vec2 f = clamp(t - vec2(i0), 0.0, 1.0);
+    vec4 wx = cubic_weights(f.x);
+    vec4 wy = cubic_weights(f.y);
+    vec3 col = vec3(0.0);
+    ivec2 max_p = rsize - 1;
+    for (int dy = -1; dy <= 2; dy++) {
+        vec3 row = vec3(0.0);
+        int py = clamp(i0.y + dy, 0, max_p.y);
+        for (int dx = -1; dx <= 2; dx++) {
+            int px = clamp(i0.x + dx, 0, max_p.x);
+            vec3 s = clamp(enc(approx_tm(texelFetch(hudless_in, ivec2(px, py), 0).rgb)), 0.0, 1.0);
+            row += s * wx[dx + 1];
+        }
+        col += row * wy[dy + 1];
+    }
+    return clamp(col, 0.0, 1.0);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, ivec2(pc.size)))) return;
+    vec2 uv = (vec2(p) + 0.5) / pc.size;
+    vec3 F = clamp(enc(texture(dlss, uv).rgb), 0.0, 1.0);
+    vec3 o = F;
+    if (pc.view > 1.5) o = mix(o, vec3(1.0, 0.0, 0.0), 0.75 * texture(bias, uv).r);   // MKW_DLSS_MASK=2: the hint in red
+    else if (pc.view > 0.5 && uv.x >= 0.5) o = texture(final_pic, (pc.crop.xy + uv * pc.crop.zw) / pc.tex).rgb;
+    imageStore(dst, p, vec4(clamp(o, 0.0, 1.0), 1.0));
+
+    if (pc.write_fg > 0.5) {
+        ivec2 rsize = textureSize(in_cur, 0);
+        ivec2 i0 = ivec2(floor(uv * vec2(rsize) - 0.5));
+        ivec2 max_p = rsize - 1;
+        // Bias hint already marks HUD/menus at render size; upsample it as the primary UI detector.
+        float ui_present = texture(bias, uv).r;
+        for (int dy = 0; dy <= 1; dy++) {
+            for (int dx = 0; dx <= 1; dx++) {
+                ivec2 q = clamp(i0 + ivec2(dx, dy), ivec2(0), max_p);
+                vec3 a_ui = clamp(enc(texelFetch(in_cur, q, 0).rgb), 0.0, 1.0);
+                vec3 a_hl = clamp(enc(approx_tm(texelFetch(hudless_in, q, 0).rgb)), 0.0, 1.0);
+                vec3 df = abs(a_ui - a_hl);
+                ui_present = max(ui_present, max(df.r, max(df.g, df.b)));
+            }
+        }
+        vec3 H = F;
+        vec4 U = vec4(0.0);
+        if (ui_present > 0.08) {
+            vec3 H_bg = sample_hudless_srgb(rsize, uv);
+            vec3 diff = F - H_bg;
+            float d = max(abs(diff.r), max(abs(diff.g), abs(diff.b)));
+            if (d > 0.012) {
+                float ax = 0.0;
+                for (int k = 0; k < 3; k++) {
+                    float req = F[k] < H_bg[k] ? (H_bg[k] - F[k]) / max(H_bg[k], 1e-4)
+                                               : (F[k] - H_bg[k]) / max(1.0 - H_bg[k], 1e-4);
+                    ax = max(ax, req);
+                }
+                float alpha = clamp(ax, 0.0, 1.0) * smoothstep(0.012, 0.025, d) * smoothstep(0.08, 0.35, ui_present);
+                if (alpha > 0.002) {
+                    H = H_bg;
+                    U = vec4(clamp(F - (1.0 - alpha) * H_bg, vec3(0.0), vec3(alpha)), alpha);
+                }
+            }
+        }
+        imageStore(dst_hudless, p, vec4(H, 1.0));
+        imageStore(dst_ui, p, U);
+    }
+}

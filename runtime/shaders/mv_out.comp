@@ -1,0 +1,83 @@
+#version 450
+// THWOMP motion vectors for DLSS (runtime/gfx/vk/device/vk_mv.c vk_mv_frame_inputs): per pixel of the render size, in
+// pixels, from this frame to the previous one (previous minus current, x right, y down), without the camera jitter.
+// Where an object's own vertex shader gave its motion (the velocity pass, alpha 1) that is used, less the jitter's
+// change it carries; elsewhere the camera's motion from the depth and the two view-projections.
+//
+// Also DLSS's bias-current-colour hint (0 keep the history, 1 drop it). Last frame's picture moved by the motion is
+// compared with this frame's:
+// - on the pixels that took the camera's motion (the road, the scenery), where they disagree well past the texture's
+//   own flicker under the jitter, something the motion does not describe changed there (a kart's shadow sliding over
+//   the road, the ground a kart has just uncovered): up to 0.8, so the edges keep some smoothing;
+// - with DLSS's finished pictures (has_scene: the HUD and the menus are in them), where the finished picture changed
+//   and the scene without the HUD did not, on any pixel: that is the HUD or a menu (text sliding in, a counter, the
+//   HUD staying put while the road moves under it), which DLSS takes as it is now: 1. The two pictures are compared
+//   each with its own last frame, so the scene's tone mapping (after the copy without the HUD) does not matter.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth;
+layout(binding = 1) uniform sampler2D vel;
+layout(binding = 2, rg16f) uniform writeonly image2D mv_out;
+layout(binding = 3) uniform sampler2D cur_pic;      // this frame's picture (finished with DLSS, else without the HUD)
+layout(binding = 4) uniform sampler2D prev_pic;     // last frame's
+layout(binding = 5, r16f) uniform writeonly image2D bias_out;
+layout(binding = 6) uniform sampler2D cur_scene;    // this frame's scene without the HUD (has_scene)
+layout(binding = 7) uniform sampler2D prev_scene;   // last frame's
+layout(push_constant) uniform P {
+    mat4 m;       // NDC (this frame) -> clip (last frame), column-major
+    vec2 size;    // render size
+    vec2 jd;      // this frame's jitter minus last frame's, pixels
+    float has_prev;
+    float has_scene;
+} pc;
+
+float tone(vec3 c) { return sqrt(max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0)); }   // roughly perceptual
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, ivec2(pc.size)))) return;
+    vec2 uv = (vec2(p) + 0.5) / pc.size;
+    vec4 ov = texelFetch(vel, p, 0);
+    vec2 mv;
+    float bias = 0.0;
+    bool cam = ov.a <= 0.5;
+    if (!cam) {
+        mv = -(ov.xy - pc.jd);
+    } else {
+        float d = texture(depth, uv).r;
+        vec4 q = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d * 2.0 - 1.0, 1.0);
+        vec2 pn = q.xy / q.w;
+        vec2 puv = vec2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
+        mv = (puv - uv) * pc.size;
+    }
+    // last frame's sample sits where this one was, shifted by the jitter's change too
+    vec2 prev_uv = uv + (mv - pc.jd) / pc.size;
+    if (pc.has_prev > 0.5 && all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
+        float ct = tone(texelFetch(cur_pic, p, 0).rgb);
+        float pt = tone(texture(prev_pic, prev_uv).rgb);
+        float diff = abs(ct - pt);
+        if (cam) {
+            // 3x3 neighborhood bounds keep sub-pixel Halton jitter on static edges inside [pmin, pmax],
+            // while catching soft moving shadows (e.g. a kart's shadow over bright sand) at full 1.0 bias.
+            float pmin = pt, pmax = pt;
+            vec2 texel = 1.0 / pc.size;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    float nt = tone(texture(prev_pic, clamp(prev_uv + vec2(dx, dy) * texel, vec2(0.0), vec2(1.0))).rgb);
+                    pmin = min(pmin, nt);
+                    pmax = max(pmax, nt);
+                }
+            }
+            float box_diff = max(0.0, max(ct - pmax, pmin - ct));
+            float rdiff = box_diff / (max(ct, pmax) + 0.08);
+            bias = smoothstep(0.025, 0.08, rdiff);
+        }
+        if (pc.has_scene > 0.5) {
+            float sc = tone(texelFetch(cur_scene, p, 0).rgb), sp = tone(texture(prev_scene, prev_uv).rgb);
+            float sdiff = abs(sc - sp) / (max(sc, sp) + 0.05);   // relative: the scene is before its tone mapping
+            bias = max(bias, smoothstep(0.04, 0.10, diff) * (1.0 - smoothstep(0.04, 0.10, sdiff)));
+        }
+    }
+    imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
+    imageStore(bias_out, p, vec4(bias));
+}
