@@ -337,8 +337,10 @@ int vk_fg_record(VkCommandBuffer cb, VkImage src, int sw, int sh, const int crop
 // The frames per game frame the setting asks for now: 0 off (also under the turbo, whose frames are dropped anyway),
 // else 1..VK_FG_MAX, at most what the swapchain has room for
 static int mult_now(void) {
+    // Must match vk_fg_wanted: with FRAMEGEN_TYPE=dlss, THWOMP must not interpolate — otherwise it presents
+    // made frames while DLSS-G is off for those, then the real frame with DLSS-G on (screen flicker).
+    if (!vk_fg_wanted() || turbo_speed() > 1) return 0;
     const char *v = cfg_value("MKW_FRAMEGEN");
-    if (!strcmp(v, "off") || turbo_speed() > 1) return 0;
     int m;
     if (!strcmp(v, "auto")) {
         // The refreshes of the monitor that fit in one game frame, rounded down: rounded up a quarter early, a game
