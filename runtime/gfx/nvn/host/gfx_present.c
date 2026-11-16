@@ -249,10 +249,10 @@ static const char *g_present_got = "";   // the MKW_VK_PRESENT value of the mode
 static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     const char *e = cfg_value("MKW_VK_PRESENT");
     int dlssg = vk_dlssg_frames() > 0;
-    VkPresentModeKHR orig_want = !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
-                               : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
-    // Streamline DLSS-G does not support VSync (mailbox/fifo) on Vulkan (ProgrammingGuideDLSS_G 22.5).
-    VkPresentModeKHR want = dlssg ? VK_PRESENT_MODE_IMMEDIATE_KHR : orig_want;
+    // Honour the player's Presentation setting even with DLSS-G. Forcing immediate tore on OLEDs and fought
+    // driver G-Sync/VRR; mailbox (default) or fifo stay user choices. Streamline may warn on fifo+FG — advisory only.
+    VkPresentModeKHR want = !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+                            : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd, g_surface, &n, NULL);
     VkPresentModeKHR m[16];
@@ -269,8 +269,9 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     static int logged = -1;   // the mode last logged: a change from the menu shows in the log
     if ((int)got != logged) {
         logged = (int)got;
-        rt_log("gfx: present mode %s%s (MKW_VK_PRESENT=%s%s)", name, got == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? " relaxed" : "",
-               e, dlssg && want != orig_want ? "; immediate for DLSS FG" : "");
+        rt_log("gfx: present mode %s%s (MKW_VK_PRESENT=%s)", name, got == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? " relaxed" : "", e);
+        if (dlssg && got == VK_PRESENT_MODE_FIFO_KHR)
+            rt_log("gfx: DLSS frame generation with VSync (fifo): Streamline may warn; mailbox or immediate if needed");
     }
     return got;
 }

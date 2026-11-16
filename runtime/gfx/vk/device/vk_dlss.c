@@ -135,29 +135,34 @@ int vk_dlssg_reflex(void) { return (D.have & SL_SHIM_REFLEX) != 0; }   // Stream
 uint32_t vk_dlssg_max(void) { return D.fg_max ? D.fg_max + 1 : 0; }    // the highest multiplier, 0 unknown
 
 // The frames per game frame the settings ask for and this GPU makes (multiplier - 1), 0 off. Needs DLSS super
-// resolution running (its depth and motion vectors). Caps to the monitor refresh so e.g. 3x at 60 game fps on
-// 120 Hz does not ask Streamline for ~180 presents a second (dropped/duplicated frames).
+// resolution running (its depth and motion vectors). Honours MKW_DLSSG (2/3/4/6); only clamps to the GPU's
+// reported max. A soft log warns when the ask exceeds ~monitor_Hz/60, but does not hard-lock to 2x.
 uint32_t vk_dlssg_frames(void) {
     if (!(D.have & SL_SHIM_FG) || !vk_dlss_active() || strcmp(cfg_value("MKW_FRAMEGEN_TYPE"), "dlss")) return 0;
     int m = atoi(cfg_value("MKW_DLSSG"));   // "off": 0
     if (m == 5) m = 4;                      // NVIDIA only offers 2x, 3x, 4x, 6x (map legacy 5 to 4x)
     if (m < 2) return 0;
     int asked = m;
-    double hz = vk_present_refresh_hz();
-    if (hz > 0.0) {
-        // ~60 game fps: max multiplier that still fits in one refresh budget (120 Hz -> 2x, 180 -> 3x, 240 -> 4x)
-        int fit = (int)(hz / 60.0 + 0.25);
-        if (fit < 2) fit = 2;
-        if (m > fit) m = fit;
-    }
     uint32_t n = (uint32_t)m - 1;
     if (D.fg_max && n > D.fg_max) n = D.fg_max;
+    double hz = vk_present_refresh_hz();
+    if (hz > 0.0) {
+        int fit = (int)(hz / 60.0 + 0.25);
+        if (fit < 2) fit = 2;
+        if ((int)(n + 1) > fit) {
+            static int warned_for = -1;
+            if (warned_for != asked)
+                rt_log("dlss: frame generation %ux may exceed monitor %.0f Hz at ~60 game fps (settings %ux; not capped)",
+                       n + 1, hz, asked),
+                    warned_for = asked;
+        }
+    }
     if (asked != (int)(n + 1)) {
         static int said_for = -1;
         if (said_for != asked) {
             said_for = asked;
-            rt_log("dlss: frame generation using %ux (settings %ux; monitor %.0f Hz, GPU max %ux)", n + 1, asked,
-                   hz > 0.0 ? hz : 0.0, D.fg_max ? D.fg_max + 1 : 0);
+            rt_log("dlss: frame generation using %ux (settings %ux; GPU max %ux)", n + 1, asked,
+                   D.fg_max ? D.fg_max + 1 : 0);
         }
     }
     return n;

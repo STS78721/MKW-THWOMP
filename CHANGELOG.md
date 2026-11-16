@@ -6,11 +6,12 @@ its issue, #N), `### Tested` (what was run from the packages before publishing) 
 
 ## Unreleased — DLSS ghosting (branch `cursor/dlssg-triage-b00c`)
 
-Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation ghosting (menu smear, kart/world shadow trails). Not a numbered release yet. **Test build tip:** `8c14f2a` → `build/dist/windows/mkw.exe`. Safe shipped defaults stay FSR / FG off; opt into DLSS+FG yourself to verify.
+Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not a numbered release yet. **Test build tip:** see the newest Bug Fixes block below for the hash and `build/dist/windows/mkw.exe`. Safe shipped defaults stay FSR / FG off / Presentation mailbox; opt into DLSS+FG yourself to verify. G-Sync/VRR is not forced on or off — use the NVIDIA Control Panel (and Presentation) as you like.
 
 ■ Major Updates
 
 - Fixed DLSS transformer ghosting that BiasCurrentColorHint could not clear: modern presets (K/M/L) ignore that hint, so reactive pixels now go to Particle and AnimatedTexture masks, with a host-side lerp back to the current frame where the mask is hard.
+- Restored player control of DLSS frame-generation multipliers and Presentation mode (no hard 2× refresh lock; no forced immediate present for FG).
 
 ■ Bug Fixes
 
@@ -27,15 +28,21 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation ghost
 - Lowered the finished-vs-scene UI gap so semi-transparent Free Roam and character-select panels are marked for reject.
 - Tightened compose history reject so hard mask hits replace DLSS output with the current game picture more readily.
 
-○ DLSS Super Resolution (`8c14f2a` — after `c49b545`, tip)
+○ DLSS Super Resolution (`8c14f2a` — after `c49b545`)
 
 - Reset DLSS history when the HUD-less scene capture is missing (character-select and some Free Roam panes).
 - Without HUD-less, rejected finished-picture temporal diffs so menu icons do not trail in SR history.
 - Added `MKW_DLSS_ALWAYS_RESET=1` for diagnosis (optional; not a player default).
 
+○ Present path & DLSS-G multipliers (after `956c058` / tip when this ships)
+
+- Stopped hard-capping DLSS frame generation to monitor_Hz/60 (that locked 120 Hz panels to 2×). Settings 3× / 4× / 6× are honoured again; only the GPU max still clamps. A soft log warns if the ask may exceed refresh.
+- Stopped forcing Presentation to immediate whenever DLSS-G is on (that caused tearing and fought driver G-Sync/VRR). Mailbox, VSync (fifo) and Immediate follow the player's setting; fifo+FG logs an advisory only.
+- G-Sync/VRR is left to the player and the driver — the game does not force it on or off.
+
 ■ Other
 
-- Commit chain for this tip: `fc1f07a` → `c49b545` → `8c14f2a`.
+- Prior tip for ghosting quality: `8c14f2a`. Present/FG-policy tip: this section's newest commit (see git log / test path after push).
 - Headless offscreen still reports FG 2× on with 600 presents / 600 game frames (overlay 60/60); interactive 120 Hz sessions previously showed 60/120 — FG verify needs a real display.
 - Personal settings, dumps and logs are not part of any release package.
 
