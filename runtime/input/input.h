@@ -72,6 +72,9 @@ int input_rumble_triggers_enabled(void);
 void input_motion_start(void);
 // MKW_MOTION is not "0" (a live setting: read again when cfg_version changes). Off: the sensor reads at rest.
 int input_motion_enabled(void);
+// Keyboard game controls (MKW_KEYBOARD=0 turns them off, live). Controllers and mouse buttons stay active; F1/Esc
+// still open the menu. Read again when cfg_version changes.
+int input_keyboard_enabled(void);
 // SDL sensor values (accelerometer m/s^2, gyro rad/s, SDL gamepad axes) to the Switch controller frame motion_feed
 // takes (acceleration in G as gravity reads, rotation rad/s).
 void input_motion_axes(const float sdl_acc[3], const float sdl_gyro[3], double acc_g[3], double gyro[3]);

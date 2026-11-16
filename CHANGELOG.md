@@ -6,12 +6,19 @@ its issue, #N), `### Tested` (what was run from the packages before publishing) 
 
 ## Unreleased — DLSS ghosting (branch `cursor/dlssg-triage-b00c`)
 
-Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not a numbered release yet. **Test build tip:** see the newest Bug Fixes block below for the hash and `build/dist/windows/mkw.exe`. Safe shipped defaults stay FSR / FG off / Presentation mailbox; opt into DLSS+FG yourself to verify. G-Sync/VRR is not forced on or off — use the NVIDIA Control Panel (and Presentation) as you like.
+Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not a numbered release yet. **Test build tip:** see the newest Bug Fixes / New & Improvements blocks below for the hash and `build/dist/windows/mkw.exe`. Safe shipped defaults stay FSR / FG off / Presentation mailbox; opt into DLSS+FG yourself to verify. G-Sync/VRR is not forced on or off — use the NVIDIA Control Panel (and Presentation) as you like.
 
 ■ Major Updates
 
 - Fixed DLSS transformer ghosting that BiasCurrentColorHint could not clear: modern presets (K/M/L) ignore that hint, so reactive pixels now go to Particle and AnimatedTexture masks, with a host-side lerp back to the current frame where the mask is hard.
 - Restored player control of DLSS frame-generation multipliers and Presentation mode (no hard 2× refresh lock; no forced immediate present for FG).
+
+■ New & Improvements
+
+○ Keyboard On / Off
+
+- Controls tab (F1): **Keyboard** toggle enables or disables keyboard game controls. Controllers and mouse stay as they are; F1 / Esc still open the menu. Persists as `MKW_KEYBOARD` (default On).
+- **Test build tip:** see tip hash after commit — `build/dist/windows/mkw.exe` SHA256 `D913938CE16AF237519FB7C09E8059AB9CD4378E37772CADFDA17D58056F7CA8` (34438144 bytes; +3584 vs `70fe896`).
 
 ■ Bug Fixes
 

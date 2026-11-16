@@ -330,9 +330,11 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             static int was_captured;
             static uint8_t mouse_ignore[KEY_COUNT];
             int cap = ikb_captured();
+            int keys_on = input_keyboard_enabled();
             for (int k = 1; k < KEY_COUNT; k++) {
-                down[k] = ikb_down(k);
-                if (k < KEY_MOUSE_L || k > KEY_MOUSE_X2) continue;
+                int mouse = k >= KEY_MOUSE_L && k <= KEY_MOUSE_X2;
+                down[k] = (keys_on || mouse) ? ikb_down(k) : 0;
+                if (!mouse) continue;
                 if (cap && !was_captured) mouse_ignore[k] = down[k];
                 if (!down[k]) mouse_ignore[k] = 0;
                 if (!cap || mouse_ignore[k]) down[k] = 0;
@@ -581,6 +583,17 @@ int input_motion_enabled(void) {
     if (on < 0 || v != seen) {
         seen = v;
         on = cfg_bool("MKW_MOTION");
+    }
+    return on;
+}
+
+int input_keyboard_enabled(void) {
+    static int on = -1;
+    static unsigned seen;
+    unsigned v = cfg_version();
+    if (on < 0 || v != seen) {
+        seen = v;
+        on = cfg_bool("MKW_KEYBOARD");
     }
     return on;
 }

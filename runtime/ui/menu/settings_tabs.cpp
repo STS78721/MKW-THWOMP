@@ -549,6 +549,7 @@ static void tab_controls(float scale) {
                                      UI_MENU_ICONS_KEYBOARD};
     opt_choice("MKW_BUTTON_ICONS", UI_MENU_BUTTON_ICONS, icons, 5, UI_MENU_BUTTON_ICONS_DESC, button_icons_note());
     opt_toggle("MKW_MOTION", UI_MENU_MOTION, UI_MENU_MOTION_DESC);
+    opt_toggle("MKW_KEYBOARD", UI_MENU_KEYBOARD, UI_MENU_KEYBOARD_DESC);
     opt_slider("MKW_RUMBLE_STRENGTH", UI_MENU_RUMBLE_STRENGTH, 0, 300, UI_MENU_RUMBLE_STRENGTH_DESC, 10, "%.0f %%");
     opt_slider("MKW_RUMBLE_CURVE", UI_MENU_RUMBLE_CURVE, 0.2f, 1.5f, UI_MENU_RUMBLE_CURVE_DESC, 0.05f, "%.2f");
     opt_toggle("MKW_RUMBLE_TRIGGERS", UI_MENU_RUMBLE_TRIGGERS, UI_MENU_RUMBLE_TRIGGERS_DESC);

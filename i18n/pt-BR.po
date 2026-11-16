@@ -847,6 +847,14 @@ msgctxt "UI_MENU_MOTION_DESC"
 msgid "Steering by tilting the controller."
 msgstr "Virar inclinando o controle."
 
+msgctxt "UI_MENU_KEYBOARD"
+msgid "Keyboard"
+msgstr ""
+
+msgctxt "UI_MENU_KEYBOARD_DESC"
+msgid "Use the keyboard for game controls. Controllers are not affected."
+msgstr ""
+
 msgctxt "UI_MENU_RUMBLE_STRENGTH"
 msgid "Vibration strength"
 msgstr "Intensidade da vibração"
