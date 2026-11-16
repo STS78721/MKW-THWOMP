@@ -4,92 +4,75 @@ Each version's section is that release's notes: `tools/build/notes.py` puts it i
 updating, known issues, reporting) for the GitHub release. A section has a summary paragraph, `### Changes` (each with
 its issue, #N), `### Tested` (what was run from the packages before publishing) and optionally `### Known issues`.
 
-## Unreleased — DLSS ghosting (branch `cursor/dlssg-triage-b00c`)
+## Unreleased
 
-Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not a numbered release yet. **Test build tip:** see the newest Bug Fixes / New & Improvements blocks below for the hash and `build/dist/windows/mkw.exe`. Safe shipped defaults stay FSR / FG off / Presentation mailbox; opt into DLSS+FG yourself to verify. G-Sync/VRR is not forced on or off — use the NVIDIA Control Panel (and Presentation) as you like.
+(empty — next work after 0.2.2)
+
+## MKW-THWOMP 0.2.2
+
+THWOMP's releases come first, in the Pearl Abyss style of its other projects (■ sections, ○ groups); the GitLab release carries the same text. Upstream mkw-recomp's own notes follow from 0.1.12 down.
+
+MKW-THWOMP 0.2.2
+
+NVIDIA DLSS Super Resolution and Frame Generation are much cleaner in menus and races, frame-generation multipliers go through to 6× (including 5×), and the start screen and Controls tab pick up two quality-of-life toggles. Safe shipped defaults stay FSR, frame generation Off, and Presentation mailbox — raise DLSS and FG yourself if you want them. G-Sync / VRR stay under your control in the NVIDIA app.
 
 ■ Major Updates
 
-- Fixed DLSS transformer ghosting that BiasCurrentColorHint could not clear: modern presets (K/M/L) ignore that hint, so reactive pixels now go to Particle and AnimatedTexture masks, with a host-side lerp back to the current frame where the mask is hard.
-- Restored player control of DLSS frame-generation multipliers and Presentation mode (no hard 2× refresh lock; no forced immediate present for FG).
+- Cut DLSS transformer ghosting in Free Roam and character select: reactive pixels use proper Particle / AnimatedTexture masks, with a host-side blend back to the current frame on hard hits, instead of a soft full-frame bias modern presets ignore.
+- Unlocked DLSS Frame Generation multipliers and Presentation again: no hard 2× refresh lock, no forced Immediate present for FG. Mailbox, VSync and Immediate follow your setting.
 
 ■ New & Improvements
 
-○ Presentation mailbox fallback (`5698550`)
+○ Frame Generation (DLSS)
 
-- When Mailbox is not offered by the driver, fall back to plain **VSync (FIFO)** instead of FIFO_RELAXED (which could tear on map pan). Default Presentation stays **Mailbox**. Mailbox / VSync / Immediate remain selectable. G-Sync/VRR stay under your control.
-- **Test build tip:** `5698550` — `build/dist/windows/mkw.exe` SHA256 `24020289AA15825BB029764CF600B04C03964B13B1FE89A975FC0105F9E3B5CC` (34439168 bytes; −2560 vs `07a8c55` tip binary).
+- Multipliers **2× / 3× / 4× / 5× / 6×** (Off by default). 5× matches NVIDIA Fixed Frame Generation Mode.
+- When Frame generation type is DLSS, the older THWOMP interpolator stays off so leftover settings cannot flicker the picture.
+- CNN (legacy) sits beside Transformer and Transformer 2nd gen; quality presets from DLAA through Ultra Performance honour the menu.
 
-○ DLSS-G FG split matches presented picture (`07a8c55`)
+○ Launcher
 
-- Restored `bd70085` DLSS compose / colour-grade path after `ac0e5d3`…`a8d54d3` regresssed world flicker/ghosting (split-from-`o` + grade-before-split). Kept the THWOMP `mult_now()` ↔ `vk_fg_wanted()` gate so `FRAMEGEN_TYPE=dlss` does not interpolate leftover `MKW_FRAMEGEN`.
-- **Test build tip:** `07a8c55` — `build/dist/windows/mkw.exe` SHA256 `B97AF892ECD1C8F067739D40AA54573A01F3C144C4889B1AF98E2CD65CC4776B` (34441728 bytes; compose back to `bd70085` size, +framegen gate only).
+- **Show launcher on startup** on the start-screen home page and in Settings / F1 → Menu. Off goes straight into the game next time; default On. `--launcher` still opens the start screen.
 
-○ DLSS-G 5x multiplier (`16b540e`)
+○ Controls
 
-- Frame generation (DLSS type): **5x** restored alongside 2x–6x. NVIDIA Fixed FG Mode lists 5x; the UI and Streamline path no longer remap or omit it. Default remains Off.
-- **Test build tip:** `16b540e` — `build/dist/windows/mkw.exe` SHA256 `C37156842C3B6F5BC0F6DF9769771946353206A6534D9B7FF720D5EEEEA9EC4E` (34441728 bytes; +512 vs `b2ee667`).
-
-○ Show launcher on startup (`b2ee667`)
-
-- Launcher main page quick toggle + Menu tab (launcher Settings / F1): **Show launcher on startup** On/Off. Off skips the start screen on the next plain start and goes straight into the game. Default On. Persists as `MKW_SHOW_LAUNCHER` under `[launcher]`. `--launcher` still opens the start screen when it is Off.
-- **Test build tip:** `b2ee667` — `build/dist/windows/mkw.exe` SHA256 `5277F9F18226C49504B72AAA4D7D35F590AA3CFBDDDFDEB116B173320EF684DC` (34441216 bytes; +1536 vs `7d798e2`).
-
-○ Keyboard On / Off (`7bd6ab1`)
-
-- Controls tab (F1): **Keyboard** toggle enables or disables keyboard game controls. Controllers and mouse stay as they are; F1 / Esc still open the menu. Persists as `MKW_KEYBOARD` (default On).
-- **Test build tip:** `7bd6ab1` — `build/dist/windows/mkw.exe` SHA256 `D913938CE16AF237519FB7C09E8059AB9CD4378E37772CADFDA17D58056F7CA8` (34438144 bytes; +3584 vs `70fe896`).
+- **Keyboard** On/Off in the Controls tab. Controllers and mouse stay as they are; F1 / Esc still open the menu. Default On.
 
 ■ Bug Fixes
 
-○ DLSS Super Resolution (`fc1f07a`)
+○ DLSS Super Resolution
 
-- Enabled auto-exposure when no exposure texture is provided (missing exposure was a known ghosting cause).
-- Dilated motion vectors toward closer depth (thin lamps/poles) and told Streamline `motionVectorsDilated`.
-- Replaced soft full-frame bias with a sparse reactive mask (contact-shadow darken, hard thin edges, finished-vs-scene UI gap).
-- Stopped promoting raw shadow bias into the FG UI layer (that flooded HUD-less and broke recomposition).
+- Auto-exposure when no exposure texture is provided; dilated motion vectors toward closer depth; sparse reactive masks for thin edges and UI gaps.
+- Zeroed motion on hard reactive hits; tighter compose reject so menus do not trail; history reset when a HUD-less scene capture is missing.
+- Balanced quality at 1080p engages again (render lines snapped off odd multiples of 18 that broke depth / motion vectors).
 
-○ DLSS Super Resolution (`c49b545` — after `fc1f07a`)
+○ DLSS Frame Generation
 
-- Zeroed motion vectors on hard reactive hits so history cannot warp those pixels.
-- Lowered the finished-vs-scene UI gap so semi-transparent Free Roam and character-select panels are marked for reject.
-- Tightened compose history reject so hard mask hits replace DLSS output with the current game picture more readily.
+- Parallel FG queue and spare swapchain images so base race FPS holds under 3×+.
+- FG inputs wait on the GPU instead of stalling the present thread under race load.
 
-○ DLSS Super Resolution (`8c14f2a` — after `c49b545`)
+○ Present & display
 
-- Reset DLSS history when the HUD-less scene capture is missing (character-select and some Free Roam panes).
-- Without HUD-less, rejected finished-picture temporal diffs so menu icons do not trail in SR history.
-- Added `MKW_DLSS_ALWAYS_RESET=1` for diagnosis (optional; not a player default).
-
-○ Present path & DLSS-G multipliers (`886ab25`)
-
-- Stopped hard-capping DLSS frame generation to monitor_Hz/60 (that locked 120 Hz panels to 2×). Settings 3× / 4× / 6× are honoured again; only the GPU max still clamps. A soft log warns if the ask may exceed refresh.
-- Stopped forcing Presentation to immediate whenever DLSS-G is on (that caused tearing and fought driver G-Sync/VRR). Mailbox, VSync (fifo) and Immediate follow the player's setting; fifo+FG logs an advisory only.
-- G-Sync/VRR is left to the player and the driver — the game does not force it on or off.
-
-○ Base FPS with DLSS-G (`718149e`)
-
-- Stopped Streamline's default present-queue block for FG work (`eBlockNoClientQueues`): FG no longer holds the graphics/present queue until it finishes.
-- Gave the DLSS-G swapchain the same spare images / present fence depth as THWOMP FG (mailbox was starving under 3×+ and showing up as fence/present wait).
-- Passes `numBackBuffers` into `slDLSSGSetOptions`. Presentation mode and G-Sync remain player-controlled; safe defaults unchanged.
-
-○ Race base FPS + DLSS models (`5437c09`)
-
-- Moved the FG inputs fence from a present-thread CPU wait to a GPU wait on the DLSS/present submit (race load was stalling behind FG).
-- Ping-pong HUD-less/UI buffers so FG can still read last frame while this frame writes.
-- Run `vk_present_dlss_first` for DLSS-G as well as THWOMP FG so upscale is not stuck in the blit CB.
-- Added CNN (legacy Preset F) beside Transformer / Transformer 2nd gen in settings; all qualities (DLAA → Ultra Performance) honour `MKW_DLSS_QUALITY` and log when they engage. Safe default remains FSR / Transformer when DLSS is chosen.
-
-○ DLSS Balanced at 1080p (`70fe896`)
-
-- Snap DLSS render lines that land on odd multiples of 18 (1080p Balanced was 630) up/down to a multiple of 36. At 630 the game’s scene depth came back 1120×628 vs a 1120×630 crop, so motion vectors refused the frame and DLSS never evaluated.
-- **Test build tip:** `70fe896` — `build/dist/windows/mkw.exe` SHA256 `11A3DA0D993473250C6E86FD5F4992509EFC4FF770D0DE8190E336DCBC33FFA6` (34434560 bytes).
+- Presentation mode is not forced when DLSS-G is on. G-Sync / VRR are not forced on or off.
+- When Mailbox is not offered by the driver, fall back to plain VSync (FIFO) instead of FIFO_RELAXED. Default Presentation stays Mailbox.
 
 ■ Other
 
-- Prior tips: ghosting `8c14f2a`, present/FG `886ab25`, FG queue parallel `718149e`, race+models `5437c09`. This section's newest commit is Balanced-1080p `70fe896`.
-- Headless offscreen still reports FG 2× on with 600 presents / 600 game frames (overlay 60/60); interactive 120 Hz sessions previously showed 60/120 — FG verify needs a real display.
-- Personal settings, dumps and logs are not part of any release package.
+- Update check and installer URLs point at the SteelTemple GitLab project (`steeltemplesaint-recomps/MKW-THWOMP` Releases; the start screen pulls `*-Update.zip`).
+- Personal settings, dumps, shader caches and logs are not part of any package.
+
+■ Known issues
+
+- A non-default colour profile with DLSS Frame Generation can show a mild grade mismatch after the FG split. Left alone for this ship (fixing it risked world ghosting).
+- The in-game map can tear while you pan under Mailbox (especially without G-Sync / VRR). Try Presentation VSync if it bothers you; Mailbox stays the default for lower input lag.
+- Frame generation multipliers above monitor_Hz÷60 (for example 3× on a 120 Hz panel at 60 game FPS) ask for more presents than the display refreshes. That is allowed and only soft-warned — not a hard lock — so expect the driver / Streamline to drop or pace extras.
+
+■ Update
+
+- From 0.2.1b (or 0.1.1 / 0.1.2): open the start screen. It offers 0.2.2 and installs it. You can also extract SteelTemple-MKW-THWOMP-0.2.2-Update.zip over the game folder.
+- New install: run SteelTemple-MKW-THWOMP-0.2.2-Full-Setup-Wizard.exe, then open the start screen. Choose Game files, choose your dump, press Set up (about 5 minutes on an 8-core CPU), then press Play.
+- Portable: extract SteelTemple-MKW-THWOMP-0.2.2-Portable-StandAlone.zip anywhere, run mkw.exe and set the game up the same way.
+
+Your dump, saves, and personal settings stay on your PC.
 
 ## MKW-THWOMP 0.2.1b
 
