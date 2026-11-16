@@ -296,7 +296,8 @@ extern "C" int sl_shim_evaluate(VkCommandBuffer cb, const SlShimFrame *f) {
     o.mode = modes[f->mode < 5 ? f->mode : 1];
     o.outputWidth = f->out_w, o.outputHeight = f->out_h;
     o.colorBuffersHDR = sl::Boolean::eFalse;   // the game's finished picture, read through sRGB: linear, within 0..1
-    o.useAutoExposure = sl::Boolean::eFalse;
+    // No exposure texture: auto-exposure. useAutoExposure=false without a 1x1 exposure map ghosts moving contrast.
+    o.useAutoExposure = sl::Boolean::eTrue;
     sl::DLSSPreset gen1 = sl::DLSSPreset::ePresetK, gen2 = sl::DLSSPreset::ePresetM;
     sl::DLSSPreset p = f->model == 2 ? gen2 : gen1;
     o.dlaaPreset = o.qualityPreset = o.balancedPreset = o.performancePreset = p;
@@ -329,7 +330,7 @@ extern "C" int sl_shim_evaluate(VkCommandBuffer cb, const SlShimFrame *f) {
     c.motionVectors3D = sl::Boolean::eFalse;
     c.reset = f->reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     c.orthographicProjection = f->ortho ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-    c.motionVectorsDilated = sl::Boolean::eFalse;
+    c.motionVectorsDilated = sl::Boolean::eTrue;   // mv_out.comp dilates toward closer depth (thin poles/lamps)
     c.motionVectorsJittered = sl::Boolean::eFalse;
     rr = p_consts(c, *tok, vp);
     if (rr != sl::Result::eOk) {
@@ -346,8 +347,9 @@ extern "C" int sl_shim_evaluate(VkCommandBuffer cb, const SlShimFrame *f) {
     sl::Extent ebb{};
     int have_ebb = to_sl_ebb(f->bb_rect, f->out_w, f->out_h, &ebb);
     sl::ResourceLifecycle fg_life = f->fg ? sl::ResourceLifecycle::eOnlyValidNow : sl::ResourceLifecycle::eValidUntilEvaluate;
-    // Bias also feeds ShadowHint + ReactiveMask + InvalidDepthMotion (UI overlays): same 0..1 mask, high = unstable.
-    sl::ResourceTag tags[10];
+    // Transformer presets ignore BiasCurrentColorHint (Preset F only). NGX still consumes Particle + AnimatedTexture
+    // masks — feed the reactive hint there. InvalidDepthMotion marks HUD/overlays whose depth/MVs do not match colour.
+    sl::ResourceTag tags[12];
     uint32_t nt = 0;
     tags[nt++] = sl::ResourceTag(&depth, sl::kBufferTypeDepth, fg_life, &ein);
     tags[nt++] = sl::ResourceTag(&mvec, sl::kBufferTypeMotionVectors, fg_life, &ein);
@@ -355,9 +357,9 @@ extern "C" int sl_shim_evaluate(VkCommandBuffer cb, const SlShimFrame *f) {
     tags[nt++] = sl::ResourceTag(&out, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &eout);
     if (f->bias.image) {
         sl::ResourceLifecycle bl = sl::ResourceLifecycle::eValidUntilEvaluate;
-        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeBiasCurrentColorHint, bl, &ein);
-        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeReactiveMaskHint, bl, &ein);
-        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeShadowHint, bl, &ein);
+        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeBiasCurrentColorHint, bl, &ein);   // legacy / FG compose
+        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeParticleHint, bl, &ein);
+        tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeAnimatedTextureHint, bl, &ein);
         tags[nt++] = sl::ResourceTag(&bias, sl::kBufferTypeInvalidDepthMotionHint, bl, &ein);
     }
     // Backbuffer extent: pass a real subrect, or nullptr for the full swapchain — never 0x0.

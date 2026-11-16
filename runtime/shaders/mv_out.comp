@@ -1,15 +1,15 @@
 #version 450
-// THWOMP motion vectors + DLSS bias/shadow/UI hints (vk_mv.c).
-// MVs: object velocity where drawn, else camera from depth. Pixels, prev-minus-cur, unjittered.
-// Bias (R): reject DLSS history. Also tagged as ReactiveMask / ShadowHint / InvalidDepthMotion for UI.
+// THWOMP MVs + reactive hint. Transformer presets ignore BiasCurrentColorHint; Particle/AnimatedTexture + a
+// compose-time lerp to the current frame kill soft-shadow / thin-edge / HUD trails. Keep the mask sparse —
+// flooding it replaces the whole DLSS picture with bilinear.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D depth;
 layout(binding = 1) uniform sampler2D vel;
 layout(binding = 2, rg16f) uniform writeonly image2D mv_out;
-layout(binding = 3) uniform sampler2D cur_pic;      // finished picture (sRGB view -> linear)
+layout(binding = 3) uniform sampler2D cur_pic;
 layout(binding = 4) uniform sampler2D prev_pic;
 layout(binding = 5, r16f) uniform writeonly image2D bias_out;
-layout(binding = 6) uniform sampler2D cur_scene;    // pre-tonemap scene without HUD (B10G11R11)
+layout(binding = 6) uniform sampler2D cur_scene;
 layout(binding = 7) uniform sampler2D prev_scene;
 layout(push_constant) uniform P {
     mat4 m;
@@ -20,80 +20,136 @@ layout(push_constant) uniform P {
 } pc;
 
 float tone(vec3 c) { return sqrt(max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0)); }
-// Match finished SDR-ish range before comparing to cur_pic (fixes HUD detection on HDR scene copy).
 vec3 approx_tm(vec3 c) {
     c = max(c, vec3(0.0));
     return c / (c + vec3(1.0));
 }
 float tone_scene(vec3 c) { return tone(approx_tm(c)); }
 
+vec2 cam_mv(vec2 uv, float d) {
+    vec4 q = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d * 2.0 - 1.0, 1.0);
+    vec2 pn = q.xy / q.w;
+    vec2 puv = vec2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
+    return (puv - uv) * pc.size;
+}
+
+vec2 pixel_mv(ivec2 p, vec2 uv) {
+    vec4 ov = texelFetch(vel, p, 0);
+    if (ov.a > 0.5) return -(ov.xy - pc.jd);
+    return cam_mv(uv, texture(depth, uv).r);
+}
+
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(p, ivec2(pc.size)))) return;
     vec2 uv = (vec2(p) + 0.5) / pc.size;
     vec4 ov = texelFetch(vel, p, 0);
-    vec2 mv;
-    float bias = 0.0;
     bool cam = ov.a <= 0.5;
-    if (!cam) {
-        mv = -(ov.xy - pc.jd);
-    } else {
-        float d = texture(depth, uv).r;
-        vec4 q = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d * 2.0 - 1.0, 1.0);
-        vec2 pn = q.xy / q.w;
-        vec2 puv = vec2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
-        mv = (puv - uv) * pc.size;
+    float d0 = texture(depth, uv).r;
+    vec2 mv = cam ? cam_mv(uv, d0) : -(ov.xy - pc.jd);
+
+    // Dilate MVs toward closer depth (lamp poles / thin silhouettes).
+    ivec2 max_p = ivec2(pc.size) - 1;
+    float best_d = d0;
+    vec2 best_mv = mv;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
+            vec2 quv = (vec2(q) + 0.5) / pc.size;
+            float dq = texture(depth, quv).r;
+            if (dq + 0.003 < best_d) {
+                best_d = dq;
+                best_mv = pixel_mv(q, quv);
+            }
+        }
     }
+    mv = best_mv;
+
     vec2 prev_uv = uv + (mv - pc.jd) / pc.size;
     bool prev_ok = pc.has_prev > 0.5 && all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
+    float bias = 0.0;
+
     if (pc.has_prev > 0.5 && !prev_ok) {
         bias = 1.0;
     } else if (prev_ok) {
         float ct = tone(texelFetch(cur_pic, p, 0).rgb);
         float pt = tone(texture(prev_pic, prev_uv).rgb);
         float diff = abs(ct - pt);
-        // Soft shadows: do NOT clamp with a 3x3 history box (that hid gradual shadow motion on bright sand).
-        // Dilate the raw darken/lighten signal so blocky trails get full history reject.
+
+        // Soft contact shadows: camera pixel, clearly darker than reprojected previous, and not already bright.
+        // Strict thresholds — temporal noise on sand/snow must not paint the whole ground.
+        float shadow = 0.0;
         if (cam) {
-            float shadow_raw = 0.0;
-            vec2 texel = 1.0 / pc.size;
-            ivec2 max_p = ivec2(pc.size) - 1;
-            for (int dy = -2; dy <= 2; dy++) {
-                for (int dx = -2; dx <= 2; dx++) {
-                    ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
-                    vec2 puv = clamp(prev_uv + vec2(dx, dy) * texel, vec2(0.0), vec2(1.0));
-                    float c = tone(texelFetch(cur_pic, q, 0).rgb);
-                    float pv = tone(texture(prev_pic, puv).rgb);
-                    float darken = max(0.0, pv - c);
-                    float lighten = max(0.0, c - pv);
-                    // Darkening (shadow arrives) weighted higher — the common kart-shadow trail case.
-                    shadow_raw = max(shadow_raw, max(darken * 1.6, lighten));
+            float c_luma, p_luma;
+            if (pc.has_scene > 0.5) {
+                c_luma = tone_scene(texelFetch(cur_scene, p, 0).rgb);
+                p_luma = tone_scene(texture(prev_scene, prev_uv).rgb);
+            } else {
+                c_luma = ct;
+                p_luma = pt;
+            }
+            float darken = max(0.0, p_luma - c_luma);
+            // Binary contact-shadow hit only — soft smoothsteps speckled the whole track.
+            if (darken > 0.10 && c_luma < 0.42) shadow = 1.0;
+
+            // Dilate hard hits only (Performance block ghosts), keep binary.
+            if (shadow > 0.5) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dx = -2; dx <= 2; dx++) {
+                        ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
+                        vec2 puv = clamp(prev_uv + vec2(dx, dy) / pc.size, vec2(0.0), vec2(1.0));
+                        float cq, pq;
+                        if (pc.has_scene > 0.5) {
+                            cq = tone_scene(texelFetch(cur_scene, q, 0).rgb);
+                            pq = tone_scene(texture(prev_scene, puv).rgb);
+                        } else {
+                            cq = tone(texelFetch(cur_pic, q, 0).rgb);
+                            pq = tone(texture(prev_pic, puv).rgb);
+                        }
+                        float dk = max(0.0, pq - cq);
+                        if (dk > 0.09 && cq < 0.42) shadow = 1.0;
+                    }
                 }
             }
-            bias = max(bias, smoothstep(0.006, 0.028, shadow_raw));
-            float mlen = length(mv);
-            if (mlen > 1.5)
-                bias = max(bias, smoothstep(0.004, 0.02, shadow_raw) * smoothstep(1.5, 8.0, mlen));
-        } else {
-            bias = max(bias, smoothstep(0.03, 0.10, diff));
         }
-        if (pc.has_scene > 0.5) {
-            float sc = tone_scene(texelFetch(cur_scene, p, 0).rgb);
-            float sp = tone_scene(texture(prev_scene, prev_uv).rgb);
-            float sdiff = abs(sc - sp) / (max(sc, sp) + 0.05);
-            // Finished moved, tonemapped-scene did not => menu / HUD / prompts.
-            float hud = smoothstep(0.008, 0.03, diff) * (1.0 - smoothstep(0.01, 0.06, sdiff));
-            if (hud > 0.35) bias = 1.0;
-            else bias = max(bias, hud);
-            // Same-frame finished vs scene (UI composited on 3D) — both in ~0..1 after approx_tm.
-            float ui_gap = abs(ct - sc) / (max(ct, sc) + 0.06);
-            if (ui_gap > 0.08 && sdiff < 0.10) {
-                float u = smoothstep(0.08, 0.22, ui_gap);
-                if (u > 0.5) bias = 1.0;
-                else bias = max(bias, u);
+
+        // Thin silhouettes against sky: hard depth edge + strong contrast only (lamps/poles).
+        float thin = 0.0;
+        float edge = 0.0;
+        float far_nb = 0.0;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
+                float dq = texture(depth, (vec2(q) + 0.5) / pc.size).r;
+                edge = max(edge, abs(dq - d0));
+                far_nb = max(far_nb, dq);
             }
         }
+        if (edge > 0.10 && (far_nb - d0) > 0.08) {
+            float contrast = 0.0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
+                    contrast = max(contrast, abs(tone(texelFetch(cur_pic, q, 0).rgb) - ct));
+                }
+            }
+            if (contrast > 0.16) thin = 1.0;
+        }
+
+        if (cam) bias = max(shadow, thin);
+        else if (diff > 0.10) bias = 1.0;
+
+        // HUD / title logo: finished must disagree with HUD-less scene (content gap). Temporal-only
+        // "finished changed, scene stable" fired on bloom/particles and speckled the whole track.
+        if (pc.has_scene > 0.5) {
+            float sc = tone_scene(texelFetch(cur_scene, p, 0).rgb);
+            float ui_gap = abs(ct - sc) / (max(ct, sc) + 0.08);
+            if (ui_gap > 0.20) bias = 1.0;
+        }
     }
+
     imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
     imageStore(bias_out, p, vec4(clamp(bias, 0.0, 1.0)));
 }

@@ -564,9 +564,11 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     int write_fg = s.fg && !skip && !s.ortho && D.hudless && D.ui && f.color_view;
     if (s.fg && !skip && !write_fg) {
         sl_shim_fg_clear_tags(cb, s.frame_index, out_w, out_h, s.bb_rect);
-        static int said_fg_skip;
-        if (said_fg_skip++ < 4)
-            rt_log("dlss: frame generation skipped this frame (ortho=%d hudless_src=%d)", s.ortho, f.color_view != VK_NULL_HANDLE);
+        static uint64_t skip_n, skip_log;
+        skip_n++;
+        if (skip_log < 8 || (skip_n % 600) == 0)
+            rt_log("dlss: frame generation skipped (ortho=%d hudless_src=%d, %llu skips so far)", s.ortho,
+                   f.color_view != VK_NULL_HANDLE, (unsigned long long)skip_n), skip_log++;
     }
     // DLSS's picture -> the window's (sRGB-encoded); the game's own and the bias hint for MKW_DLSS_MASK
     barrier(cb, D.out, VK_IMAGE_LAYOUT_GENERAL);

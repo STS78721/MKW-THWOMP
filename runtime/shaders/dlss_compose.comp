@@ -64,21 +64,31 @@ void main() {
     if (any(greaterThanEqual(p, ivec2(pc.size)))) return;
     vec2 uv = (vec2(p) + 0.5) / pc.size;
     vec3 F = clamp(enc(texture(dlss, uv).rgb), 0.0, 1.0);
-    vec3 o = F;
-    if (pc.view > 1.5) o = mix(o, vec3(1.0, 0.0, 0.0), 0.75 * texture(bias, uv).r);
-    else if (pc.view > 0.5 && uv.x >= 0.5) o = texture(final_pic, (pc.crop.xy + uv * pc.crop.zw) / pc.tex).rgb;
+    // Host-side history reject: Transformer presets ignore BiasCurrentColorHint. Where our reactive mask is high
+    // (soft shadows, thin edges, HUD), lerp to the current game picture so trails cannot survive compose.
+    float b = texture(bias, uv).r;
+    vec2 src_uv = (pc.crop.xy + uv * pc.crop.zw) / pc.tex;
+    vec3 cur = texture(final_pic, src_uv).rgb;
+    // Reject only hard mask hits so a speckled bias does not bilinear the whole frame.
+    float reject = smoothstep(0.55, 0.85, b);
+    vec3 o = mix(F, cur, reject);
+    // MKW_DLSS_MASK: 1 = split DLSS|source, 2 = tint reactive mask red, 3 = show source only (ghosts in cur?).
+    if (pc.view > 2.5) o = cur;
+    else if (pc.view > 1.5) o = mix(o, vec3(1.0, 0.0, 0.0), 0.75 * b);
+    else if (pc.view > 0.5 && uv.x >= 0.5) o = cur;
     imageStore(dst, p, vec4(clamp(o, 0.0, 1.0), 1.0));
 
     if (pc.write_fg > 0.5) {
         ivec2 rsize = textureSize(in_cur, 0);
-        float b = texture(bias, uv).r;
         vec3 H_bg = sample_hudless_srgb(rsize, uv);
         vec3 diff_bg = abs(F - H_bg);
         float d_bg = max(diff_bg.r, max(diff_bg.g, diff_bg.b));
-        // Hard UI: any strong finished-vs-scene gap (menu text, minimap) — do not require bias alone.
-        float ui_w = clamp(max(b, smoothstep(0.03, 0.12, d_bg)), 0.0, 1.0);
-        if (d_bg > 0.10) ui_w = 1.0;
-        if (b > 0.55) ui_w = 1.0;
+        // Hard UI from finished-vs-scene gap only. Do not promote raw bias→UI: bias also marks soft shadows /
+        // thin edges for ParticleHint, and flooding UI broke FG (and left shadow ghosts in the warped layer).
+        float ui_w = clamp(smoothstep(0.02, 0.09, d_bg), 0.0, 1.0);
+        if (d_bg > 0.07) ui_w = 1.0;
+        // Bias reinforces UI where the gap already looks like an overlay (title logo, Free Roam icons).
+        if (b > 0.4 && d_bg > 0.025) ui_w = max(ui_w, 0.95);
 
         vec3 H = mix(F, H_bg, ui_w);
         vec4 U = vec4(0.0);
