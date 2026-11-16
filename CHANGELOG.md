@@ -15,10 +15,10 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 
 ■ New & Improvements
 
-○ Keyboard On / Off
+○ Keyboard On / Off (`7bd6ab1`)
 
 - Controls tab (F1): **Keyboard** toggle enables or disables keyboard game controls. Controllers and mouse stay as they are; F1 / Esc still open the menu. Persists as `MKW_KEYBOARD` (default On).
-- **Test build tip:** see tip hash after commit — `build/dist/windows/mkw.exe` SHA256 `D913938CE16AF237519FB7C09E8059AB9CD4378E37772CADFDA17D58056F7CA8` (34438144 bytes; +3584 vs `70fe896`).
+- **Test build tip:** `7bd6ab1` — `build/dist/windows/mkw.exe` SHA256 `D913938CE16AF237519FB7C09E8059AB9CD4378E37772CADFDA17D58056F7CA8` (34438144 bytes; +3584 vs `70fe896`).
 
 ■ Bug Fixes
 
