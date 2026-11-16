@@ -15,9 +15,10 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 
 ■ New & Improvements
 
-○ DLSS-G 5x multiplier
+○ DLSS-G 5x multiplier (`16b540e`)
 
 - Frame generation (DLSS type): **5x** restored alongside 2x–6x. NVIDIA Fixed FG Mode lists 5x; the UI and Streamline path no longer remap or omit it. Default remains Off.
+- **Test build tip:** `16b540e` — `build/dist/windows/mkw.exe` SHA256 `C37156842C3B6F5BC0F6DF9769771946353206A6534D9B7FF720D5EEEEA9EC4E` (34441728 bytes; +512 vs `b2ee667`).
 
 ○ Show launcher on startup (`b2ee667`)
 
