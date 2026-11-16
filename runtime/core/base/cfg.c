@@ -97,7 +97,7 @@ static const struct { const char *key, *section; } sections[] = {
 static const CfgMeta metas[] = {
     // Screen
     {"FULLSCREEN", "0", "0|1", LIVE}, {"WINDOW_SIZE", "1920x1080", NULL, LIVE},
-    {"VK_PRESENT", "fifo", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},   // fifo: tear-free default; mailbox/immediate still selectable
+    {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
 
     {"PERF_OVERLAY", "off", "off|fps|full", LIVE}, {"FPS", "auto", "auto|30|60", LIVE},
     {"FRAMEGEN", "off", "off|auto|2|3|4", LIVE},

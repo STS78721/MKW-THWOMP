@@ -486,9 +486,7 @@ msgstr "화면 출력"
 #, fuzzy
 #| msgid "How finished frames reach the screen."
 msgctxt "UI_MENU_PRESENT_DESC"
-msgid ""
-"How finished frames reach the screen. VSync waits for the display (no tearing). Mailbox is lower "
-"latency and may tear if G-Sync/VRR is off. Immediate can always tear."
+msgid "How finished frames reach the screen."
 msgstr "완성된 프레임을 화면에 내보내는 방식입니다."
 
 msgctxt "UI_MENU_PRESENT_MAILBOX"

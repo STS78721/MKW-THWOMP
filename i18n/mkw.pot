@@ -454,9 +454,7 @@ msgid "Presentation"
 msgstr ""
 
 msgctxt "UI_MENU_PRESENT_DESC"
-msgid ""
-"How finished frames reach the screen. VSync waits for the display (no tearing). "
-"Mailbox is lower latency and may tear if G-Sync/VRR is off. Immediate can always tear."
+msgid "How finished frames reach the screen."
 msgstr ""
 
 msgctxt "UI_MENU_PRESENT_MAILBOX"
