@@ -15,10 +15,9 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 
 ■ New & Improvements
 
-○ Show launcher on startup (`7d798e2`)
+○ Show launcher on startup
 
-- Menu tab (launcher + F1): **Show launcher on startup** On/Off. Off skips the start screen on the next plain start and goes straight into the game. Default On. Persists as `MKW_SHOW_LAUNCHER` under `[launcher]`. `--launcher` still opens the start screen when it is Off.
-- **Test build tip:** `7d798e2` — `build/dist/windows/mkw.exe` SHA256 `AA710145680CD6CE52D4B01388813CE3C6664C63F7C957ECDF9FA6169A64FE63` (34439680 bytes; +1536 vs `7bd6ab1`).
+- Launcher main page quick toggle + Menu tab (launcher Settings / F1): **Show launcher on startup** On/Off. Off skips the start screen on the next plain start and goes straight into the game. Default On. Persists as `MKW_SHOW_LAUNCHER` under `[launcher]`. `--launcher` still opens the start screen when it is Off.
 
 ○ Keyboard On / Off (`7bd6ab1`)
 

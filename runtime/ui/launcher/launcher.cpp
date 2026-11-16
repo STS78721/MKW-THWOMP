@@ -219,7 +219,8 @@ static float item_height(void) { return fmaxf(44.0f, 60 * L.scale); }
 
 // A row of the main page's menu: the label alone at rest; under the mouse or the controller's cursor a band of the
 // accent that fades out to the right comes in under it (as Dusklight's start screen does), with a bar at its left edge.
-static bool menu_item(const char *label, float width, bool enabled) {
+// value: optional right-aligned On/Off (or similar); NULL draws the label alone.
+static bool menu_item(const char *label, float width, bool enabled, const char *value = nullptr) {
     float s = L.scale, hgt = item_height();
     ImVec2 a = ImGui::GetCursorScreenPos(), b(a.x + width, a.y + hgt);
     ImGui::BeginDisabled(!enabled);
@@ -239,8 +240,12 @@ static bool menu_item(const char *label, float width, bool enabled) {
         dl->AddRectFilled(a, ImVec2(a.x + 3 * s, b.y), ImGui::ColorConvertFloat4ToU32(ImVec4(1, 1, 1, hot)));
     }
     float fs = L.item->FontSize;
-    dl->AddText(L.item, fs, ImVec2(a.x + 24 * s + 4 * s * hot, (a.y + b.y - fs) * 0.5f),
-                enabled ? mix(LOOK_HEADING, LOOK_TEXT, hot) : LOOK_OFF, label);
+    ImU32 col = enabled ? mix(LOOK_HEADING, LOOK_TEXT, hot) : LOOK_OFF;
+    dl->AddText(L.item, fs, ImVec2(a.x + 24 * s + 4 * s * hot, (a.y + b.y - fs) * 0.5f), col, label);
+    if (value && *value) {
+        ImVec2 vw = L.item->CalcTextSizeA(fs, FLT_MAX, 0, value);
+        dl->AddText(L.item, fs, ImVec2(b.x - 24 * s - vw.x, (a.y + b.y - fs) * 0.5f), col, value);
+    }
     return hit;
 }
 
@@ -383,9 +388,9 @@ static void state_line(bool ok, const char *text) {
 static void page_main(float w, float h) {
     float s = L.scale, left = 96 * s, cw = 440 * s, lh = ImGui::GetTextLineHeight();
     bool ready = rt_game_present() && update_state().phase != UPDATE_FETCHING;
-    // the column's height, to centre it: logo and title, the gap, Play, the menu, the gap and Quit
+    // the column's height, to centre it: logo and title, the gap, Play, the menu (6 rows), the gap and Quit
     float mark = 84 * s, items = item_height(), gap = 12 * s;
-    float play_h = fmaxf(52.0f, 76 * s), col_h = mark + 48 * s + play_h + gap * 2 + items * 5 + 28 * s + items;
+    float play_h = fmaxf(52.0f, 76 * s), col_h = mark + 48 * s + play_h + gap * 2 + items * 6 + 28 * s + items;
     ImGui::SetNextWindowPos(ImVec2(left - 8 * s, fmaxf(32 * s, (h - col_h) * 0.45f) - 8 * s));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * s, 8 * s));   // room for the cursor's ring
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, gap));
@@ -443,18 +448,27 @@ static void page_main(float w, float h) {
     }
     intro_apply(dl, v0, intro(3));
     v0 = dl->VtxBuffer.Size;
-    if (menu_item(menu_text(UI_LAUNCH_FILES), cw, true)) L.page = PAGE_FILES;
+    {   // same MKW_SHOW_LAUNCHER as Settings/F1 Menu tab; Off skips this screen on the next plain start
+        bool show = cfg_bool("MKW_SHOW_LAUNCHER") != 0, locked = cfg_from_env("MKW_SHOW_LAUNCHER") != 0;
+        if (menu_item(menu_text(UI_MENU_SHOW_LAUNCHER), cw, !locked, menu_text(show ? UI_MENU_ON : UI_MENU_OFF))) {
+            cfg_set("MKW_SHOW_LAUNCHER", show ? "0" : "1");
+            opt_save_soon();
+        }
+    }
     intro_apply(dl, v0, intro(4));
     v0 = dl->VtxBuffer.Size;
-    if (menu_item(menu_text(UI_LAUNCH_MODS), cw, true)) L.page = PAGE_MODS;
+    if (menu_item(menu_text(UI_LAUNCH_FILES), cw, true)) L.page = PAGE_FILES;
     intro_apply(dl, v0, intro(5));
     v0 = dl->VtxBuffer.Size;
-    if (menu_item(menu_text(UI_LAUNCH_SHORTCUT), cw, true)) make_shortcut();
+    if (menu_item(menu_text(UI_LAUNCH_MODS), cw, true)) L.page = PAGE_MODS;
     intro_apply(dl, v0, intro(6));
+    v0 = dl->VtxBuffer.Size;
+    if (menu_item(menu_text(UI_LAUNCH_SHORTCUT), cw, true)) make_shortcut();
+    intro_apply(dl, v0, intro(7));
     ImGui::Dummy(ImVec2(0, 28 * s));
     v0 = dl->VtxBuffer.Size;
     if (menu_item(menu_text(UI_LAUNCH_QUIT), cw, true)) L.result = LAUNCHER_QUIT;
-    intro_apply(dl, v0, intro(7));
+    intro_apply(dl, v0, intro(8));
     ImGui::PopStyleVar();
     if (L.shortcut_note[0]) {
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + cw);
@@ -477,7 +491,7 @@ static void page_main(float w, float h) {
     float right = w - 56 * s;
     fg->AddText(ImVec2(right - ImGui::CalcTextSize(ver).x, y), LOOK_DIM, ver);
     fg->AddText(ImVec2(right - ImGui::CalcTextSize(note).x, y - lh - 6 * s), LOOK_DIM, note);
-    intro_apply(fg, f0, intro(7));
+    intro_apply(fg, f0, intro(8));
 }
 
 static bool back_pressed(void) {
