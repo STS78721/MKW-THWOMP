@@ -510,8 +510,9 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
         if (!fg_images(c, out_w, out_h)) s.fg = 0;
     }
     s.frame_index = (uint32_t)f.frame;
-    s.reset = f.reset || (D.sl_eval_frame + 1 != f.frame);
     s.ortho = fabsf(f.cam[10][3]) > 0.5f;
+    // Ortho / 2D menus: drop DLSS history every frame so Multiplayer rows etc. do not smear in SR.
+    s.reset = f.reset || (D.sl_eval_frame + 1 != f.frame) || s.ortho;
     float ratio = (float)out_w / (float)f.w;   // the mode whose scale is nearest
     s.mode = ratio < 1.2f ? 0 : ratio < 1.6f ? 1 : ratio < 1.85f ? 2 : ratio < 2.5f ? 3 : 4;
     s.model = D.model;
@@ -558,8 +559,15 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
         return VK_NULL_HANDLE;
     }
     if (!skip) D.sl_eval_frame = f.frame;
-    int write_fg = s.fg && !skip && D.hudless && D.ui && f.color_view;
-    if (s.fg && !skip) D.fg_tagged = 1, D.fg_in_w = f.w, D.fg_in_h = f.h, D.fg_out_w = out_w, D.fg_out_h = out_h;
+    // FG must not run without HUD-less + UI tags: otherwise Streamline warps menus/HUD with scene MVs (smear).
+    // Ortho / 2D menus: keep DLSS SR but pause FG for this present.
+    int write_fg = s.fg && !skip && !s.ortho && D.hudless && D.ui && f.color_view;
+    if (s.fg && !skip && !write_fg) {
+        sl_shim_fg_clear_tags(cb, s.frame_index, out_w, out_h, s.bb_rect);
+        static int said_fg_skip;
+        if (said_fg_skip++ < 4)
+            rt_log("dlss: frame generation skipped this frame (ortho=%d hudless_src=%d)", s.ortho, f.color_view != VK_NULL_HANDLE);
+    }
     // DLSS's picture -> the window's (sRGB-encoded); the game's own and the bias hint for MKW_DLSS_MASK
     barrier(cb, D.out, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cb, D.comp, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -604,7 +612,8 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
         barrier(cb, D.ui, VK_IMAGE_LAYOUT_GENERAL);
         s.hudless = (SlShimImage){D.hudless, D.hudless_v, VK_FORMAT_R8G8B8A8_UNORM, out_w, out_h, COMP_USAGE};
         s.ui = (SlShimImage){D.ui, D.ui_v, VK_FORMAT_R8G8B8A8_UNORM, out_w, out_h, COMP_USAGE};
-        sl_shim_tag_fg(cb, &s);
+        if (sl_shim_tag_fg(cb, &s))
+            D.fg_tagged = 1, D.fg_in_w = f.w, D.fg_in_h = f.h, D.fg_out_w = out_w, D.fg_out_h = out_h;
     }
     if (D.qp) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, D.qp, qs * 2 + 1);
     D.last_bias = f.bias_view;

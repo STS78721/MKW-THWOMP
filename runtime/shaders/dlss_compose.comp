@@ -9,7 +9,7 @@ layout(binding = 0) uniform sampler2D dlss;
 layout(binding = 1) uniform sampler2D final_pic;
 layout(binding = 2, rgba8) uniform writeonly image2D dst;
 layout(binding = 3) uniform sampler2D bias;         // DLSS's bias hint, the render size (MKW_DLSS_MASK=2)
-layout(binding = 4) uniform sampler2D hudless_in;   // post-tonemap SMAA-blended linear scene without UI, render size
+layout(binding = 4) uniform sampler2D hudless_in;   // pre-tonemap scene without UI (B10G11R11), render size
 layout(binding = 5) uniform sampler2D in_cur;       // linear Scene+UI (R8G8B8A8_SRGB), render size
 layout(binding = 6, rgba8) uniform writeonly image2D dst_hudless;
 layout(binding = 7, rgba8) uniform writeonly image2D dst_ui;
@@ -26,7 +26,7 @@ vec3 enc(vec3 c) {
     return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
 }
 
-// Approximate tone map for the pre-tonemap HUD-less float (B10G11R11): comparison-only, not the game's curve.
+// Approximate tone map for the pre-tonemap HUD-less float: comparison / FG background only.
 vec3 approx_tm(vec3 c) {
     c = max(c, vec3(0.0));
     return c / (c + vec3(1.0));
@@ -69,7 +69,7 @@ void main() {
     vec2 uv = (vec2(p) + 0.5) / pc.size;
     vec3 F = clamp(enc(texture(dlss, uv).rgb), 0.0, 1.0);
     vec3 o = F;
-    if (pc.view > 1.5) o = mix(o, vec3(1.0, 0.0, 0.0), 0.75 * texture(bias, uv).r);   // MKW_DLSS_MASK=2: the hint in red
+    if (pc.view > 1.5) o = mix(o, vec3(1.0, 0.0, 0.0), 0.75 * texture(bias, uv).r);
     else if (pc.view > 0.5 && uv.x >= 0.5) o = texture(final_pic, (pc.crop.xy + uv * pc.crop.zw) / pc.tex).rgb;
     imageStore(dst, p, vec4(clamp(o, 0.0, 1.0), 1.0));
 
@@ -77,8 +77,8 @@ void main() {
         ivec2 rsize = textureSize(in_cur, 0);
         ivec2 i0 = ivec2(floor(uv * vec2(rsize) - 0.5));
         ivec2 max_p = rsize - 1;
-        // Bias hint already marks HUD/menus at render size; upsample it as the primary UI detector.
-        float ui_present = texture(bias, uv).r;
+        float b = texture(bias, uv).r;
+        float ui_present = b;
         for (int dy = 0; dy <= 1; dy++) {
             for (int dx = 0; dx <= 1; dx++) {
                 ivec2 q = clamp(i0 + ivec2(dx, dy), ivec2(0), max_p);
@@ -88,27 +88,31 @@ void main() {
                 ui_present = max(ui_present, max(df.r, max(df.g, df.b)));
             }
         }
-        vec3 H = F;
+        // CRITICAL: never leave UI inside HUD-less. Defaulting H=F made Streamline warp menus/HUD with scene MVs.
+        vec3 H_bg = sample_hudless_srgb(rsize, uv);
+        float ui_w = clamp(max(b * 1.25, smoothstep(0.04, 0.18, ui_present)), 0.0, 1.0);
+        // Non-UI: keep F (matches what DLSS produced). UI: strip to scene background.
+        vec3 H = mix(F, H_bg, ui_w);
         vec4 U = vec4(0.0);
-        if (ui_present > 0.08) {
-            vec3 H_bg = sample_hudless_srgb(rsize, uv);
-            vec3 diff = F - H_bg;
+        if (ui_w > 0.02) {
+            vec3 diff = F - H;
             float d = max(abs(diff.r), max(abs(diff.g), abs(diff.b)));
-            if (d > 0.012) {
-                float ax = 0.0;
-                for (int k = 0; k < 3; k++) {
-                    float req = F[k] < H_bg[k] ? (H_bg[k] - F[k]) / max(H_bg[k], 1e-4)
-                                               : (F[k] - H_bg[k]) / max(1.0 - H_bg[k], 1e-4);
-                    ax = max(ax, req);
-                }
-                float alpha = clamp(ax, 0.0, 1.0) * smoothstep(0.012, 0.025, d) * smoothstep(0.08, 0.35, ui_present);
-                if (alpha > 0.002) {
-                    H = H_bg;
-                    U = vec4(clamp(F - (1.0 - alpha) * H_bg, vec3(0.0), vec3(alpha)), alpha);
-                }
+            float ax = 0.0;
+            for (int k = 0; k < 3; k++) {
+                float req = F[k] < H[k] ? (H[k] - F[k]) / max(H[k], 1e-4)
+                                         : (F[k] - H[k]) / max(1.0 - H[k], 1e-4);
+                ax = max(ax, req);
+            }
+            // Bias-driven floor so menu text / minimap always get a real UI layer even if tonemap mismatch is mild.
+            float alpha = clamp(max(ax, ui_w * 0.85), 0.0, 1.0) * smoothstep(0.02, 0.55, ui_w);
+            if (d < 0.008 && b < 0.35) alpha = 0.0;
+            if (alpha > 0.002) {
+                // Re-resolve H against alpha so FG composites cleanly: H + U*(premult) ~= F.
+                H = mix(F, H_bg, alpha);
+                U = vec4(clamp(F - (1.0 - alpha) * H, vec3(0.0), vec3(alpha)), alpha);
             }
         }
-        imageStore(dst_hudless, p, vec4(H, 1.0));
+        imageStore(dst_hudless, p, vec4(clamp(H, 0.0, 1.0), 1.0));
         imageStore(dst_ui, p, U);
     }
 }
