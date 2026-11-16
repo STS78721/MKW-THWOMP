@@ -512,7 +512,13 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     s.frame_index = (uint32_t)f.frame;
     s.ortho = fabsf(f.cam[10][3]) > 0.5f;
     // Ortho / 2D menus: drop DLSS history every frame so Multiplayer rows etc. do not smear in SR.
-    s.reset = f.reset || (D.sl_eval_frame + 1 != f.frame) || s.ortho;
+    // No HUD-less capture (common on character-select / some Free Roam panes): also reset — without it the
+    // finished picture (UI included) accumulates trails that ParticleHint alone cannot clear.
+    s.reset = f.reset || (D.sl_eval_frame + 1 != f.frame) || s.ortho || !f.color_view;
+    // MKW_DLSS_ALWAYS_RESET=1 (diagnosis / stubborn menu smear): clear history every evaluate.
+    static int always_reset = -1;
+    if (always_reset < 0) always_reset = getenv("MKW_DLSS_ALWAYS_RESET") && atoi(getenv("MKW_DLSS_ALWAYS_RESET")) > 0;
+    if (always_reset) s.reset = 1;
     float ratio = (float)out_w / (float)f.w;   // the mode whose scale is nearest
     s.mode = ratio < 1.2f ? 0 : ratio < 1.6f ? 1 : ratio < 1.85f ? 2 : ratio < 2.5f ? 3 : 4;
     s.model = D.model;

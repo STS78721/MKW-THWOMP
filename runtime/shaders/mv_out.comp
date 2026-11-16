@@ -139,15 +139,17 @@ void main() {
         }
 
         if (cam) bias = max(shadow, thin);
-        else if (diff > 0.10) bias = 1.0;
+        else if (diff > 0.08) bias = 1.0;
 
-        // HUD / title logo: finished must disagree with HUD-less scene (content gap). Temporal-only
-        // "finished changed, scene stable" fired on bloom/particles and speckled the whole track.
+        // HUD / title logo: finished must disagree with HUD-less scene (content gap).
         if (pc.has_scene > 0.5) {
             float sc = tone_scene(texelFetch(cur_scene, p, 0).rgb);
             float ui_gap = abs(ct - sc) / (max(ct, sc) + 0.08);
             // Semi-transparent Free Roam / character-select panels need a lower gate than opaque logos.
             if (ui_gap > 0.10) bias = 1.0;
+        } else if (diff > 0.025) {
+            // No HUD-less this frame (many game menus): fall back to finished temporal reject so icons do not trail.
+            bias = 1.0;
         }
     }
 
