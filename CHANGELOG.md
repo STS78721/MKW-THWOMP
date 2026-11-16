@@ -15,13 +15,10 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 
 ■ New & Improvements
 
-○ DLSS-G FG split matches presented picture (`12b9c66`)
+○ DLSS-G FG split matches presented picture (`07a8c55`)
 
-- Frame generation HUD-less/UI split is built from the post-reject compose colour (`o`), not raw DLSS `F`, so Streamline’s UI+(1−α)×HUD-less matches what is drawn.
-- While DLSS-G tags a frame, colour profiles are applied in compose before that split (same ops as the present grade pass); the post-compose grade is skipped so Default and non-Default profiles stay consistent with generated frames.
-- Fixed white-screen regression on `ac0e5d3`: push-constant `adj` was misaligned (host offset 40 vs GLSL std430 offset 48), so brightness read as ~1 and blew the picture to white under FG. Host/GLSL now share the same layout; identity adj skips the grade.
-- Fixed flicker when `MKW_FRAMEGEN_TYPE=dlss` but a leftover `MKW_FRAMEGEN=2|3|4` was still set: THWOMP `mult_now()` now respects `vk_fg_wanted()` so it does not interpolate under DLSS-G.
-- **Test build tip:** `12b9c66` — `build/dist/windows/mkw.exe` SHA256 `39B407659B47430ED37E93250B34208F1B94B6E93CABE98E4D6D60A97EB0F7D5` (34444288 bytes).
+- Restored `bd70085` DLSS compose / colour-grade path after `ac0e5d3`…`a8d54d3` regresssed world flicker/ghosting (split-from-`o` + grade-before-split). Kept the THWOMP `mult_now()` ↔ `vk_fg_wanted()` gate so `FRAMEGEN_TYPE=dlss` does not interpolate leftover `MKW_FRAMEGEN`.
+- **Test build tip:** `07a8c55` — `build/dist/windows/mkw.exe` SHA256 `B97AF892ECD1C8F067739D40AA54573A01F3C144C4889B1AF98E2CD65CC4776B` (34441728 bytes; compose back to `bd70085` size, +framegen gate only).
 
 ○ DLSS-G 5x multiplier (`16b540e`)
 
