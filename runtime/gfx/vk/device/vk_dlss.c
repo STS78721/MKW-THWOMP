@@ -135,12 +135,11 @@ int vk_dlssg_reflex(void) { return (D.have & SL_SHIM_REFLEX) != 0; }   // Stream
 uint32_t vk_dlssg_max(void) { return D.fg_max ? D.fg_max + 1 : 0; }    // the highest multiplier, 0 unknown
 
 // The frames per game frame the settings ask for and this GPU makes (multiplier - 1), 0 off. Needs DLSS super
-// resolution running (its depth and motion vectors). Honours MKW_DLSSG (2/3/4/6); only clamps to the GPU's
+// resolution running (its depth and motion vectors). Honours MKW_DLSSG (2/3/4/5/6); only clamps to the GPU's
 // reported max. A soft log warns when the ask exceeds ~monitor_Hz/60, but does not hard-lock to 2x.
 uint32_t vk_dlssg_frames(void) {
     if (!(D.have & SL_SHIM_FG) || !vk_dlss_active() || strcmp(cfg_value("MKW_FRAMEGEN_TYPE"), "dlss")) return 0;
     int m = atoi(cfg_value("MKW_DLSSG"));   // "off": 0
-    if (m == 5) m = 4;                      // NVIDIA only offers 2x, 3x, 4x, 6x (map legacy 5 to 4x)
     if (m < 2) return 0;
     int asked = m;
     uint32_t n = (uint32_t)m - 1;

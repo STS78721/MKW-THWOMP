@@ -102,7 +102,7 @@ static const CfgMeta metas[] = {
     {"FRAMEGEN", "off", "off|auto|2|3|4", LIVE},
     // THWOMP: whose frame generation: the port's (MKW_FRAMEGEN) or NVIDIA DLSS frame generation (MKW_DLSSG, its
     // multiplier, with DLSS; vk_dlss.c), whose plugins load at start; the preset goes into the driver profile
-    {"FRAMEGEN_TYPE", "thwomp", "thwomp|dlss", RESTART}, {"DLSSG", "off", "off|2|3|4|6", LIVE},
+    {"FRAMEGEN_TYPE", "thwomp", "thwomp|dlss", RESTART}, {"DLSSG", "off", "off|2|3|4|5|6", LIVE},
     {"DLSSG_PRESET", "default", "default|a|b|c", RESTART},
     {"UPSCALER", "fsr", "fsr|bilinear|dlss", LIVE},
     {"DLSS_MODEL", "transformer", "transformer|transformer2|cnn", LIVE},   // cnn: legacy Preset F for older GPUs

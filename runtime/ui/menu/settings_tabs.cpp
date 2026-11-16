@@ -364,11 +364,11 @@ static void rows_framegen(void) {
         opt_text(UI_MENU_FG_THWOMP);
         return;
     }
-    {   // the multiplier, live; NVIDIA only offers 2x, 3x, 4x and (on RTX 50) 6x — never 5x
-        static const char *const vals[] = {"off", "2", "3", "4", "6"};
-        const char *names[5] = {menu_text(UI_MENU_PERF_OFF), "2x", "3x", "4x", "6x"};
+    {   // the multiplier, live; NVIDIA Fixed FG Mode offers 2x–6x including 5x (driver override list)
+        static const char *const vals[] = {"off", "2", "3", "4", "5", "6"};
+        const char *names[6] = {menu_text(UI_MENU_PERF_OFF), "2x", "3x", "4x", "5x", "6x"};
         unsigned mx = dlssg_max();
-        int n = mx >= 6 ? 5 : mx >= 4 ? 4 : mx >= 3 ? 3 : 2;
+        int n = mx >= 6 ? 6 : mx >= 5 ? 5 : mx >= 4 ? 4 : mx >= 3 ? 3 : 2;
         unsigned shown_max = mx >= 2 ? mx : 2;
         static char note[96];
         uint32_t drv = vk_dlssg_driver_mult();

@@ -15,6 +15,10 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 
 ■ New & Improvements
 
+○ DLSS-G 5x multiplier
+
+- Frame generation (DLSS type): **5x** restored alongside 2x–6x. NVIDIA Fixed FG Mode lists 5x; the UI and Streamline path no longer remap or omit it. Default remains Off.
+
 ○ Show launcher on startup (`b2ee667`)
 
 - Launcher main page quick toggle + Menu tab (launcher Settings / F1): **Show launcher on startup** On/Off. Off skips the start screen on the next plain start and goes straight into the game. Default On. Persists as `MKW_SHOW_LAUNCHER` under `[launcher]`. `--launcher` still opens the start screen when it is Off.
