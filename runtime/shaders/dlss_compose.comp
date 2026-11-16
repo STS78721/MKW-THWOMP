@@ -14,12 +14,14 @@ layout(binding = 5) uniform sampler2D in_cur;       // linear Scene+UI
 layout(binding = 6, rgba8) uniform writeonly image2D dst_hudless;
 layout(binding = 7, rgba8) uniform writeonly image2D dst_ui;
 layout(push_constant) uniform P {
+    // adj after size: vec4 must be 16-byte aligned (std430). Do not put it after two floats —
+    // that padded to offset 48 while the host packed at 40 and blew brightness → white screen.
     vec4 crop;
     vec2 tex;
     vec2 size;
+    vec4 adj;   // brightness, contrast, saturation, gamma — identity (0,1,1,1) = no grade
     float view;
     float write_fg;
-    vec4 adj;   // brightness, contrast, saturation, gamma — identity (0,1,1,1) = no grade
 } pc;
 
 vec3 enc(vec3 c) {
@@ -104,8 +106,11 @@ void main() {
         if (b > 0.35 && d_bg > 0.02) ui_w = max(ui_w, 0.95);
 
         // Grade after UI detect (content gaps), before split, so H/U recompose to the graded screen.
-        o = grade(o);
-        H_bg = grade(H_bg);
+        // Skip the no-op when adj is identity (Default profile).
+        if (pc.adj != vec4(0.0, 1.0, 1.0, 1.0)) {
+            o = grade(o);
+            H_bg = grade(H_bg);
+        }
 
         vec3 H = mix(o, H_bg, ui_w);
         vec4 U = vec4(0.0);

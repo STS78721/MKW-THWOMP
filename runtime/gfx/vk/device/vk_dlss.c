@@ -633,13 +633,14 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     if (mask < 0) mask = getenv("MKW_DLSS_MASK") ? atoi(getenv("MKW_DLSS_MASK")) : 0;
     float adj[4] = {0.0f, 1.0f, 1.0f, 1.0f};
     if (write_fg) vk_color_adj(adj);   // grade inside compose before FG split; present skips vk_color_record
-    struct { float crop[4], tex[2], size[2], view, write_fg, adj[4]; } pc = {
+    // Layout matches GLSL std430: vec4 adj at offset 32 (after crop/tex/size), then view/write_fg.
+    struct { float crop[4], tex[2], size[2], adj[4], view, write_fg; } pc = {
         {(float)crop[0], (float)crop[1], (float)crop[2], (float)crop[3]},
         {(float)src_w, (float)src_h},
         {(float)out_w, (float)out_h},
+        {adj[0], adj[1], adj[2], adj[3]},
         (float)mask,
-        write_fg ? 1.0f : 0.0f,
-        {adj[0], adj[1], adj[2], adj[3]}};
+        write_fg ? 1.0f : 0.0f};
     // Manual Streamline hooking: route CmdBindPipeline through the interposer after slEvaluateFeature so
     // sl.common's missing auto-hooks do not leave the command buffer in a bad state for DLSS-G.
     PFN_vkCmdBindPipeline bind_pipe = (PFN_vkCmdBindPipeline)vk_dlss_proc("vkCmdBindPipeline");
