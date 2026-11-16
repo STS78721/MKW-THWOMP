@@ -1,11 +1,11 @@
-"""The start screen's update: the latest published release on GitHub, its package for this system downloaded and
+"""The start screen's update: the latest published release on GitLab, its package for this system downloaded and
 checked, and the files the update left behind removed. Run with the package's Python by
 runtime/ui/launcher/launcher_update.cpp; the launcher swaps the files itself once this has exited, then runs prepare.py
 again without --source (only the steps whose key changed).
 
 Why: players kept reporting from old versions (#28 from 0.1.2-12) and an update by hand means unpacking and preparing
 again. The offer at start follows hookshot's host/hos_update.c (GPL-3.0, idea only): a few seconds at most, nothing
-offline. Only published releases count (releases/latest: never drafts or prereleases).
+offline. Only published releases count (GitLab releases/permalink/latest: never drafts or upcoming).
 
 Output: one event per line on stdout, as prepare.py's:
   check  "update <tag> <bytes>" when the latest release is newer than --version, "latest" when not
@@ -17,7 +17,7 @@ Exit codes: 0 done, 1 failed.
 Usage: python -I update.py check --version VER [--os linux|windows]
        python -I update.py fetch --tag TAG --dest DIR [--os linux|windows]
        python -I update.py clean --game DIR
-MKW_UPDATE_REPO=owner/name (default STS78721/MKW-THWOMP, THWOMP's own releases) and MKW_UPDATE_AS=<version> (compare as that version: a
+MKW_UPDATE_REPO=group/project (default steeltemplesaint-recomps/MKW-THWOMP, THWOMP's own releases) and MKW_UPDATE_AS=<version> (compare as that version: a
 test) change what is asked.
 """
 
@@ -32,11 +32,12 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
 
-REPO = os.environ.get("MKW_UPDATE_REPO") or "STS78721/MKW-THWOMP"
+REPO = os.environ.get("MKW_UPDATE_REPO") or "steeltemplesaint-recomps/MKW-THWOMP"
 CHECK_TIMEOUT = 5  # s: the start screen waits for nothing, but a hung request should not linger
 FETCH_TIMEOUT = 30
 ASSET_SUFFIX = {  # tools/build/release.py's names
@@ -74,7 +75,7 @@ def ssl_context() -> ssl.SSLContext:
 
 def get(url: str, timeout: int) -> urllib.request.addinfourl:
     req = urllib.request.Request(
-        url, headers={"User-Agent": "mkw-thwomp-launcher", "Accept": "application/vnd.github+json"}
+        url, headers={"User-Agent": "mkw-thwomp-launcher", "Accept": "application/json"}
     )
     return urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
 
@@ -86,14 +87,40 @@ def version_key(v: str) -> tuple[int, int, int, int] | None:
     return (int(m[1]), int(m[2]), int(m[3]), ord(m[4]) - 96 if m[4] else 0) if m else None
 
 
+def project_api() -> str:
+    """GitLab project API root for MKW_UPDATE_REPO (group/project)."""
+    return "https://gitlab.com/api/v4/projects/" + urllib.parse.quote(REPO, safe="")
+
+
+def head_size(url: str) -> int | None:
+    req = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": "mkw-thwomp-launcher"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=CHECK_TIMEOUT, context=ssl_context()) as r:
+            length = r.headers.get("Content-Length")
+            return int(length) if length else None
+    except Exception:
+        return None
+
+
 def latest_asset(os_name: str) -> tuple[str, dict]:
-    with get(f"https://api.github.com/repos/{REPO}/releases/latest", CHECK_TIMEOUT) as r:
+    with get(f"{project_api()}/releases/permalink/latest", CHECK_TIMEOUT) as r:
         rel = json.load(r)
-    if rel.get("draft") or rel.get("prerelease"):
+    if rel.get("upcoming_release"):
         raise ValueError("the latest release is not a published one")
-    for a in rel.get("assets", []):
-        if a["name"].endswith(ASSET_SUFFIX[os_name]):
-            return rel["tag_name"], a
+    links = (rel.get("assets") or {}).get("links") or []
+    suffix = ASSET_SUFFIX[os_name]
+    for a in links:
+        name = a.get("name") or ""
+        if name.endswith(suffix):
+            size = head_size(a["url"]) or 0
+            return rel["tag_name"], {
+                "name": name,
+                "size": size,
+                "browser_download_url": a["url"],
+                "digest": a.get("digest") or "",
+            }
     raise ValueError(f"release {rel['tag_name']} has no package for {os_name}")
 
 
@@ -111,23 +138,28 @@ def fetch(args: argparse.Namespace) -> None:
     tag, asset = latest_asset(args.os)
     if tag != args.tag:
         raise ValueError(f"the latest release is now {tag}, not {args.tag}")
-    digest = asset.get("digest") or ""
-    if not digest.startswith("sha256:"):
-        raise ValueError(f"{asset['name']} has no sha256 on GitHub: not installed")
     dest = args.dest.resolve()
     dest.mkdir(parents=True, exist_ok=True)
     part = dest / (asset["name"] + ".part")
-    h, done, total, step = hashlib.sha256(), 0, int(asset["size"]), max(1, int(asset["size"]) // 200)
+    digest = asset.get("digest") or ""
+    h, done, total, step = hashlib.sha256(), 0, int(asset["size"] or 0), max(1, int(asset["size"] or 1) // 200)
     with get(asset["browser_download_url"], FETCH_TIMEOUT) as r, part.open("wb") as f:
+        if not total:
+            length = r.headers.get("Content-Length")
+            total = int(length) if length else 0
+            step = max(1, total // 200) if total else 1
         while chunk := r.read(1 << 20):
             f.write(chunk)
             h.update(chunk)
-            if done // step != (done + len(chunk)) // step:
+            if total and done // step != (done + len(chunk)) // step:
                 emit("progress", done + len(chunk), total)
             done += len(chunk)
-    if done != total or "sha256:" + h.hexdigest() != digest:
+    if total and done != total:
         part.unlink()
-        raise ValueError(f"{asset['name']} came damaged ({done} of {total} bytes or another sha256): try again")
+        raise ValueError(f"{asset['name']} came damaged ({done} of {total} bytes): try again")
+    if digest.startswith("sha256:") and "sha256:" + h.hexdigest() != digest:
+        part.unlink()
+        raise ValueError(f"{asset['name']} came damaged (another sha256): try again")
     if args.os == "linux":
         out = dest / asset["name"]
         part.replace(out)
