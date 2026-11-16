@@ -369,18 +369,28 @@ static int create_swapchain(void) {
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
-    // one image past the minimum; with frame generation one for each frame of a game frame, all acquired at once
-    uint32_t count = caps.minImageCount + (vk_fg_wanted() ? VK_FG_MAX : 1);
+    // Spare images: THWOMP FG blits several at once; DLSS-G's Streamline proxy also needs room for generated presents
+    // (mailbox stalls and base FPS dips when FG multiplies past refresh with only minImageCount+1).
+    uint32_t dg = vk_dlssg_frames();
+    uint32_t spare = (vk_fg_wanted() || dg > 0) ? (uint32_t)VK_FG_MAX : 1;
+    uint32_t count = caps.minImageCount + spare;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
     g_ahead = count > caps.minImageCount ? (int)(count - caps.minImageCount) : 1;
     // Slots in use: 2 without frame generation, as before it existed, so the pacing of the present thread (its fence
     // waits) is unchanged where RADV hangs on it (#43, #50); the device is idle below, so no slot is in flight.
-    g_frames = vk_fg_wanted() ? FRAMES : 2;
+    // DLSS-G: use the same deeper fence ring so Acquire/fence waits do not serialize behind a long FG present.
+    g_frames = (vk_fg_wanted() || dg > 0) ? FRAMES : 2;
     static int warned;
-    if (vk_fg_wanted() && g_ahead < 2 && !warned++)
+    if ((vk_fg_wanted() || dg > 0) && g_ahead < 2 && !warned++)
         rt_log("gfx: frame generation is on but the swapchain allows no spare image (max %u): no frames are made",
                caps.maxImageCount);
+    if (dg > 0) {
+        static int said_imgs;
+        if (!said_imgs++)
+            rt_log("gfx: DLSS frame generation swapchain %u images (min %u + %u spare)", count, caps.minImageCount,
+                   count > caps.minImageCount ? count - caps.minImageCount : 0);
+    }
 
     vk_queue_lock();
     vk_wait_device_idle(c->device);
@@ -982,6 +992,8 @@ void vk_present_blit_ahead(VkImage src, VkImageLayout layout, VkFormat fmt, int 
 }
 
 int vk_present_ahead_max(void) { return __atomic_load_n(&g_ahead, __ATOMIC_RELAXED); }
+
+int vk_present_image_count(void) { return (int)g_sc_n; }
 
 void vk_present_flip(void) {
     plat_rmutex_lock(&g_pl);

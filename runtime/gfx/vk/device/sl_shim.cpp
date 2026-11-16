@@ -30,9 +30,10 @@
 #include "sl_pcl.h"
 #include "sl_reflex.h"
 
+extern "C" {
+#include "host.h"
+}
 #include "sl_shim.h"
-
-extern "C" void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 namespace {
 HMODULE g_mod;
@@ -433,7 +434,14 @@ void fg_error(const sl::APIError &e) {   // the present thread: logged and back 
 }
 }  // namespace
 
-extern "C" int sl_shim_fg_set(uint32_t frames, uint32_t mvec_w, uint32_t mvec_h, uint32_t color_w, uint32_t color_h) {
+namespace {
+VkSemaphore g_fg_inputs_sem;
+uint64_t g_fg_inputs_val;
+int g_fg_parallel_said;
+}  // namespace
+
+extern "C" int sl_shim_fg_set(uint32_t frames, uint32_t mvec_w, uint32_t mvec_h, uint32_t color_w, uint32_t color_h,
+                              uint32_t num_back_buffers) {
     if (!(g_have & SL_SHIM_FG)) return 0;
     sl::ViewportHandle vp{0};
     sl::DLSSGOptions o{};
@@ -443,6 +451,10 @@ extern "C" int sl_shim_fg_set(uint32_t frames, uint32_t mvec_w, uint32_t mvec_h,
     o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
     o.mvecDepthWidth = mvec_w, o.mvecDepthHeight = mvec_h;
     o.colorWidth = color_w, o.colorHeight = color_h;
+    if (num_back_buffers) o.numBackBuffers = num_back_buffers;
+    // Default eBlockPresentingClientQueue holds our present/graphics queue until FG finishes — that costs base FPS
+    // (game speed < 1.0 with headroom). Parallel mode lets FG overlap; we wait on inputs before rewriting them.
+    o.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockNoClientQueues;
     o.onErrorCallback = fg_error;
     o.hudLessBufferFormat = (uint32_t)VK_FORMAT_R8G8B8A8_UNORM;
     o.uiBufferFormat = (uint32_t)VK_FORMAT_R8G8B8A8_UNORM;
@@ -452,6 +464,12 @@ extern "C" int sl_shim_fg_set(uint32_t frames, uint32_t mvec_w, uint32_t mvec_h,
         static int logged;
         if (logged++ < 4) rt_log("dlss: slDLSSGSetOptions failed (%d)", (int)r);
         return 0;
+    }
+    if (frames && !g_fg_parallel_said++)
+        rt_log("dlss: frame generation queue parallelism on (present queue not held for FG work)");
+    if (!frames) {
+        g_fg_inputs_sem = VK_NULL_HANDLE;
+        g_fg_inputs_val = 0;
     }
     return 1;
 }
@@ -465,7 +483,27 @@ extern "C" int sl_shim_fg_state(uint32_t *max_frames, uint32_t *status, uint32_t
     if (status) *status = (uint32_t)s.status;
     if (presented) *presented = s.numFramesActuallyPresented;
     if (min_side) *min_side = s.minWidthOrHeight;
+    // void* holds the VkSemaphore handle value (Streamline Programming Guide DLSS_G §16.1 / SOTC pattern)
+    g_fg_inputs_sem = (VkSemaphore)(uintptr_t)s.inputsProcessingCompletionFence;
+    g_fg_inputs_val = s.lastPresentInputsProcessingCompletionFenceValue;
     return 1;
+}
+
+extern "C" void sl_shim_fg_inputs_wait(VkDevice device) {
+    if (!device || !g_fg_inputs_sem || !g_fg_inputs_val) return;
+    VkSemaphore sem = g_fg_inputs_sem;
+    uint64_t val = g_fg_inputs_val;
+    g_fg_inputs_sem = VK_NULL_HANDLE;
+    g_fg_inputs_val = 0;
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &sem,
+                              .pValues = &val};
+    uint64_t p0 = perf_begin();
+    VkResult r = vkWaitSemaphores(device, &wi, 100000000ull);   // 100 ms: FG should have finished long before
+    perf_end(PERF_FENCE, p0);
+    if (r != VK_SUCCESS) {
+        static int said;
+        if (said++ < 4) rt_log("dlss: frame generation inputs still in use after 100 ms (%d)", (int)r);
+    }
 }
 
 extern "C" void sl_shim_fg_loaded(int on) {

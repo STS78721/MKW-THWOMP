@@ -34,15 +34,21 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 - Without HUD-less, rejected finished-picture temporal diffs so menu icons do not trail in SR history.
 - Added `MKW_DLSS_ALWAYS_RESET=1` for diagnosis (optional; not a player default).
 
-○ Present path & DLSS-G multipliers (after `956c058` / tip when this ships)
+○ Present path & DLSS-G multipliers (`886ab25`)
 
 - Stopped hard-capping DLSS frame generation to monitor_Hz/60 (that locked 120 Hz panels to 2×). Settings 3× / 4× / 6× are honoured again; only the GPU max still clamps. A soft log warns if the ask may exceed refresh.
 - Stopped forcing Presentation to immediate whenever DLSS-G is on (that caused tearing and fought driver G-Sync/VRR). Mailbox, VSync (fifo) and Immediate follow the player's setting; fifo+FG logs an advisory only.
 - G-Sync/VRR is left to the player and the driver — the game does not force it on or off.
 
+○ Base FPS with DLSS-G (after `886ab25` / tip when this ships)
+
+- Stopped Streamline's default present-queue block for FG work (`eBlockNoClientQueues`): FG no longer holds the graphics/present queue until it finishes. Wait on the inputs-processing timeline semaphore before rewriting FG-tagged buffers.
+- Gave the DLSS-G swapchain the same spare images / present fence depth as THWOMP FG (mailbox was starving under 3×+ and showing up as fence/present wait).
+- Passes `numBackBuffers` into `slDLSSGSetOptions`. Presentation mode and G-Sync remain player-controlled; safe defaults unchanged.
+
 ■ Other
 
-- Prior tip for ghosting quality: `8c14f2a`. Present/FG-policy tip: this section's newest commit (see git log / test path after push).
+- Prior tip for ghosting quality: `8c14f2a`. Present/FG-policy tip: `886ab25`. Base-FPS tip: this section's newest commit.
 - Headless offscreen still reports FG 2× on with 600 presents / 600 game frames (overlay 60/60); interactive 120 Hz sessions previously showed 60/120 — FG verify needs a real display.
 - Personal settings, dumps and logs are not part of any release package.
 

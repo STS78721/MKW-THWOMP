@@ -53,10 +53,16 @@ void sl_shim_fg_clear_tags(VkCommandBuffer cb, uint32_t frame_index, uint32_t ou
 void sl_shim_shutdown(void);
 
 // DLSS frame generation (sl.dlss_g). frames: generated per game frame (multiplier - 1), 0 off. Present thread.
-int sl_shim_fg_set(uint32_t frames, uint32_t mvec_w, uint32_t mvec_h, uint32_t color_w, uint32_t color_h);
+// num_back_buffers: swapchain image count (0 unknown); used so FG can size its proxy correctly.
+int sl_shim_fg_set(uint32_t frames, uint32_t mvec_w, uint32_t mvec_h, uint32_t color_w, uint32_t color_h,
+                   uint32_t num_back_buffers);
 // The plugin's state: the most frames it can make (numFramesToGenerateMax), its status bits (DLSSGStatus), the frames
 // presented since the last call and the smallest swapchain side it works at. 0: not loaded.
+// Also keeps the inputs-processing timeline semaphore from GetState for sl_shim_fg_inputs_wait.
 int sl_shim_fg_state(uint32_t *max_frames, uint32_t *status, uint32_t *presented, uint32_t *min_side);
+// Before rewriting FG-tagged inputs (HUD-less / UI / depth / MVs): wait until Streamline finished reading the last set.
+// Required with eBlockNoClientQueues so the present/graphics queue is not held for the whole FG workload.
+void sl_shim_fg_inputs_wait(VkDevice device);
 void sl_shim_fg_loaded(int on);   // before a swapchain is made: on, the next one goes through DLSS-G
 void sl_shim_fg_free(void);       // after turning it off for good: its memory back
 

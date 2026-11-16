@@ -179,6 +179,7 @@ void vk_reflex_shown(uint64_t id);             // the frame went out: its start-
 // all blitted at once and each vk_present_flip then queues the next at its time.
 void vk_present_blit_ahead(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
 int vk_present_ahead_max(void);       // presents that may wait at once (the swapchain's spare images), at least 1
+int vk_present_image_count(void);     // current swapchain image count (0 before one exists)
 double vk_present_refresh_hz(void);   // the window's monitor, 0 unknown
 // ---- frame generation (vk_framegen.c), the present thread
 #define VK_FG_MAX 4   // frames shown per game frame at most

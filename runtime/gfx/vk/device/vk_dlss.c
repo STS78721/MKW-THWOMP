@@ -184,7 +184,8 @@ void vk_dlssg_present(uint32_t frames, int hdr) {
     if (!(D.have & SL_SHIM_FG)) return;
     uint32_t want = D.fg_tagged && !hdr && !menu_is_open() ? frames : 0;
     D.fg_tagged = 0;
-    if (want != D.fg_set && sl_shim_fg_set(want, D.fg_in_w, D.fg_in_h, D.fg_out_w, D.fg_out_h)) {
+    if (want != D.fg_set &&
+        sl_shim_fg_set(want, D.fg_in_w, D.fg_in_h, D.fg_out_w, D.fg_out_h, (uint32_t)vk_present_image_count())) {
         if (want) {
             uint32_t drv = vk_dlssg_driver_mult();
             rt_log("dlss: frame generation %ux on", want + 1);
@@ -426,6 +427,8 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     static int inited = -1;
     if (inited < 0) inited = init(c);
     if (!inited) return VK_NULL_HANDLE;
+    // FG parallel mode: do not rewrite depth/MV/HUD-less/UI until Streamline finished reading the last tagged set
+    if (vk_dlssg_frames() > 0) sl_shim_fg_inputs_wait(c->device);
     unsigned v = cfg_version();
     if (v != D.seen) D.seen = v, D.model = !strcmp(cfg_value("MKW_DLSS_MODEL"), "transformer2") ? 2 : 1;
     // DLSS's colour: the game's finished picture (tone-mapped, HUD included), its crop copied out of the larger present
