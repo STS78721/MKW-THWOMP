@@ -15,9 +15,10 @@ Work in progress on NVIDIA DLSS Super Resolution and DLSS Frame Generation. Not 
 
 ■ New & Improvements
 
-○ Presentation mailbox fallback (`pending`)
+○ Presentation mailbox fallback (`5698550`)
 
 - When Mailbox is not offered by the driver, fall back to plain **VSync (FIFO)** instead of FIFO_RELAXED (which could tear on map pan). Default Presentation stays **Mailbox**. Mailbox / VSync / Immediate remain selectable. G-Sync/VRR stay under your control.
+- **Test build tip:** `5698550` — `build/dist/windows/mkw.exe` SHA256 `24020289AA15825BB029764CF600B04C03964B13B1FE89A975FC0105F9E3B5CC` (34439168 bytes; −2560 vs `07a8c55` tip binary).
 
 ○ DLSS-G FG split matches presented picture (`07a8c55`)
 
