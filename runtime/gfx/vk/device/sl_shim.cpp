@@ -15,6 +15,7 @@
 // (NVIDIA's NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_ID, the NVIDIA App's "DLSS Override - Model Presets > Frame
 // Generation") when frame generation starts. sl_shim_fg_preset_* read and write it in mkw.exe's own profile through
 // NVAPI's driver settings (nvapi64.dll, installed with the driver; the functions by their published ids).
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -767,3 +768,48 @@ extern "C" int sl_shim_fg_preset_write(int preset) {
     CloseHandle(h);
     return 1;
 }
+#else
+#include <vulkan/vulkan.h>
+#include "sl_shim.h"
+
+extern "C" {
+int sl_shim_init(const wchar_t *, int) { return 0; }
+int sl_shim_requirements(const char *const **dev_ext, uint32_t *n_dev, const char *const **inst_ext, uint32_t *n_inst,
+                         uint32_t *gfx_queues, uint32_t *compute_queues) {
+    if (dev_ext) *dev_ext = nullptr;
+    if (n_dev) *n_dev = 0;
+    if (inst_ext) *inst_ext = nullptr;
+    if (n_inst) *n_inst = 0;
+    if (gfx_queues) *gfx_queues = 0;
+    if (compute_queues) *compute_queues = 0;
+    return 0;
+}
+int sl_shim_set_vulkan(VkInstance, VkPhysicalDevice, VkDevice, uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }
+PFN_vkVoidFunction sl_shim_device_proc(VkDevice, const char *) { return nullptr; }
+PFN_vkVoidFunction sl_shim_instance_proc(VkInstance, const char *) { return nullptr; }
+int sl_shim_evaluate(VkCommandBuffer, const SlShimFrame *) { return 0; }
+int sl_shim_tag_fg(VkCommandBuffer, const SlShimFrame *) { return 0; }
+void sl_shim_fg_clear_tags(VkCommandBuffer, uint32_t, uint32_t, uint32_t, const int32_t *) {}
+void sl_shim_shutdown(void) {}
+int sl_shim_fg_set(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }
+int sl_shim_fg_state(uint32_t *max_frames, uint32_t *status, uint32_t *presented, uint32_t *min_side) {
+    if (max_frames) *max_frames = 0;
+    if (status) *status = 0;
+    if (presented) *presented = 0;
+    if (min_side) *min_side = 0;
+    return 0;
+}
+int sl_shim_fg_inputs_take(VkSemaphore *, uint64_t *) { return 0; }
+void sl_shim_fg_loaded(int) {}
+void sl_shim_fg_free(void) {}
+int sl_shim_reflex_mode(int) { return 0; }
+int sl_shim_reflex_sleep(uint32_t) { return 0; }
+int sl_shim_pcl_marker(int, uint32_t) { return 0; }
+int sl_shim_fg_preset_read(int *own) {
+    if (own) *own = 0;
+    return -1;
+}
+int sl_shim_fg_preset_write(int) { return 0; }
+int sl_shim_fg_frames_override(void) { return 0; }
+}
+#endif
