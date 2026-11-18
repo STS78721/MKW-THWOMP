@@ -20,8 +20,10 @@
 // plugin's numFramesToGenerateMax). While the menu is open, or a frame has no 3D scene (no motion vectors), it is off for
 // that frame; turned on or off for good the swapchain is made again (gfx_present.c) with the plugin loaded or not.
 // It and the port's own frame generation (vk_framegen.c) never run together: vk_fg_wanted is off with it.
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 #include "vk.h"
 
@@ -79,11 +81,15 @@ void vk_dlss_pre_device(uint32_t vendor, const char **ext, uint32_t *n_ext, uint
         rt_log("dlss: not an NVIDIA GPU: DLSS unavailable, the upscaler is FSR 1");
         return;
     }
+#ifdef _WIN32
     wchar_t dir[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
     while (n && dir[n - 1] != L'\\' && dir[n - 1] != L'/') n--;
     if (!n) return;
     dir[n - 1] = 0;
+#else
+    wchar_t dir[2] = L"";
+#endif
     int fg = !strcmp(cfg_value("MKW_FRAMEGEN_TYPE"), "dlss");   // read at start: its plugins load with Streamline
     if (!sl_shim_init(dir, fg)) return;
     const char *const *de = NULL, *const *ie = NULL;
