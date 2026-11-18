@@ -1,4 +1,4 @@
-﻿// MKW-THWOMP Setup: the Windows installer of Mario Kart World PC, and its uninstaller.
+// MKW-THWOMP Setup: the Windows installer of Mario Kart World PC, and its uninstaller.
 //
 // What: one .exe (tools/installer/build.py) holding the player's folder (build/dist/windows: mkw.exe, its DLLs and
 // setup/) compressed with zstd and appended after the program (THWOMPV1, read at the footer). Pages: Welcome, the
@@ -264,7 +264,7 @@ static void install_run(Payload pl, std::wstring exe, std::wstring dir, bool des
         reg_str(k, L"DisplayIcon", game);
         reg_str(k, L"InstallLocation", dir);
         reg_str(k, L"UninstallString", L"\"" + dir + L"\\uninstall.exe\"");
-        reg_str(k, L"URLInfoAbout", L"https://gitlab.com/steeltemplesaint-recomps/MKW-THWOMP");
+        reg_str(k, L"URLInfoAbout", L"https://github.com/STS78721/MKW-THWOMP");
         reg_dword(k, L"NoModify", 1);
         reg_dword(k, L"NoRepair", 1);
         reg_dword(k, L"EstimatedSize", (DWORD)(pl.total / 1024));

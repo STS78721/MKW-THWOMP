@@ -1,4 +1,4 @@
-﻿// The start screen, shown before the game: Play, Settings, Game files and Quit, the game files' state at the lower left
+// The start screen, shown before the game: Play, Settings, Game files and Quit, the game files' state at the lower left
 //. The player's build (build.py --dist) always starts here; Play starts the process again
 // with the launcher skipped (main.c), so the game claims its address space in a fresh process. build/mkw shows it only
 // with --launcher.
@@ -347,19 +347,19 @@ static void lastrun_row(float bw) {
     LastRun r = lastrun_state();
     if (r.kind == LASTRUN_NONE) return;
     const char *repo = getenv("MKW_UPDATE_REPO");
-    if (!repo || !*repo) repo = "steeltemplesaint-recomps/MKW-THWOMP";   // THWOMP: its releases and issues
+    if (!repo || !*repo) repo = "STS78721/MKW-THWOMP";   // THWOMP: its releases and issues
     char text[700], button[160], url[300];
     url[0] = 0;
     if (r.kind == LASTRUN_KNOWN) {
         snprintf(text, sizeof text, menu_text(UI_LAUNCH_LASTRUN_KNOWN), r.issue);
         snprintf(button, sizeof button, menu_text(UI_LAUNCH_LASTRUN_OPEN), r.issue);
-        snprintf(url, sizeof url, "https://gitlab.com/%s/-/issues/%d", repo, r.issue);
+        snprintf(url, sizeof url, "https://github.com/%s/issues/%d", repo, r.issue);
     } else if (r.kind == LASTRUN_FIXED) {
         snprintf(text, sizeof text, menu_text(UI_LAUNCH_LASTRUN_FIXED), r.tag);
     } else {
         snprintf(text, sizeof text, "%s", menu_text(UI_LAUNCH_LASTRUN_CRASH));
         snprintf(button, sizeof button, "%s", menu_text(UI_LAUNCH_LASTRUN_REPORT));
-        snprintf(url, sizeof url, "https://gitlab.com/%s/-/issues/new", repo);
+        snprintf(url, sizeof url, "https://github.com/%s/issues/new?template=bug_report.yml", repo);
     }
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + bw);
     ImGui::TextColored(col4(r.kind == LASTRUN_FIXED ? LOOK_WARN : LOOK_BAD), "%s", text);

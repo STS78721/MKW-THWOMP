@@ -10,7 +10,7 @@ its issue, #N), `### Tested` (what was run from the packages before publishing) 
 
 ## MKW-THWOMP 0.2.2
 
-THWOMP's releases come first, in the Pearl Abyss style of its other projects (■ sections, ○ groups); the GitLab release carries the same text. Upstream mkw-recomp's own notes follow from 0.1.12 down.
+THWOMP's releases come first, in the Pearl Abyss style of its other projects (■ sections, ○ groups); the GitHub release carries the same text. Upstream mkw-recomp's own notes follow from 0.1.12 down.
 
 MKW-THWOMP 0.2.2
 
@@ -57,7 +57,7 @@ NVIDIA DLSS Super Resolution and Frame Generation are much cleaner in menus and 
 
 ■ Other
 
-- Update check and installer URLs point at the SteelTemple GitLab project (`steeltemplesaint-recomps/MKW-THWOMP` Releases; the start screen pulls `*-Update.zip`).
+- Update check and installer URLs point at the SteelTemple GitHub repository (`STS78721/MKW-THWOMP` Releases; the start screen pulls `*-Update.zip`).
 - Personal settings, dumps, shader caches and logs are not part of any package.
 
 ■ Known issues
