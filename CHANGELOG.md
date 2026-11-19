@@ -6,7 +6,51 @@ its issue, #N), `### Tested` (what was run from the packages before publishing) 
 
 ## Unreleased
 
-(empty — next work after 0.2.2b)
+(empty — next work after 0.2.2c)
+
+## MKW-THWOMP 0.2.2c
+
+MKW-THWOMP 0.2.2c
+
+Stability and rendering hotfix focused on DLSS/DLAA launch compatibility (including Vulkan hook layers and overlays), water collision physics and water rendering, shader accuracy, UI transparency, and VRAM hygiene. Safe shipped defaults remain FSR, Frame Generation Off, and Presentation Mailbox.
+
+■ Major Updates
+
+- Fixed DLSS / DLAA startup crashes and exit teardown faults: Streamline now initializes before `vkCreateInstance()` (eliminating temporary nested probe instances inside an open `VkInstance`), registers all required KHR instance extensions (`VK_KHR_get_physical_device_properties2`, `VK_KHR_external_memory_capabilities`, `VK_KHR_external_semaphore_capabilities`), and shuts down before VMA/device destruction with zero leaked objects.
+- Fixed karts clipping through water: compute storage-image write-back now propagates the `256x256` water wave height map back to guest memory so water surface collision matches visuals.
+
+■ New & Improvements
+
+○ Diagnostics & Crash Reporting
+
+- Added an unhandled exception fallback filter (`SetUnhandledExceptionFilter`) plus pre-`vkCreateDevice` GPU driver version and loaded overlay/hook DLL logging (`RTSSVkLayer64.dll`, `RTSSHooks64.dll`, Steam/EOS/Galaxy/Discord overlays, `sl.interposer.dll`) so faults inside external layers record the exact DLL and offset in `mkw.log` instead of exiting silently. RTSS's Vulkan layer remains enabled so on-screen overlays stay usable.
+
+○ Rendering & Memory
+
+- Added graphics `c24` / compute `c0+0x10` push-constant support (fixing SMAA post-processing and Photo Mode).
+- Enabled event-wait dual-queue ordering by default (`MKW_QUEUE_WAITS`), added overwritten released-texture eviction (`MKW_TEX_OVERWRITTEN`), and added Photo Mode shadow-map pool headroom for 1.8.0.
+
+■ Bug Fixes
+
+○ Water, Shaders & UI
+
+- Restricted `VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT` to true cubemaps and cubemap arrays and stripped it from non-cube sparse 2D arrays.
+- Preserved integer image types and separate samplers during SPIR-V shader rewriting.
+- Split compute first-invocation counter resets (`MKW_FIRST_STORE`, automatically re-translated incrementally on upgrade).
+- Improved alpha-0 transparency weighting in ASTC-to-BC7 encoding for clean UI edges and fixed a small `VkDeviceMemory` leak during ASTC teardown.
+
+■ Other
+
+- No game-code ABI change (`mkwgame.id` unchanged at `0b58f80e2b894c32`): existing installs upgrade in-place and only incrementally update the changed shaders.
+- Personal settings, dumps, shader caches, saves, and logs are never included in any release package.
+
+■ Update
+
+- From `0.2.2b`, `0.2.2`, `0.2.1b`, `0.1.2`, or `0.1.1`: open the start screen (if **Show launcher on startup** is off, run `mkw.exe --launcher` or re-enable it in F1 → Menu). It offers **`0.2.2c`**, installs it automatically, and updates only the changed shaders. You can also extract `SteelTemple-MKW-THWOMP-0.2.2c-Update.zip` over your game folder.
+- New install: run `SteelTemple-MKW-THWOMP-0.2.2c-Full-Setup-Wizard.exe`, then open the start screen, choose Game files, select your dump, press Set up, and press Play.
+- Portable: extract `SteelTemple-MKW-THWOMP-0.2.2c-Portable-StandAlone.zip` anywhere, run `mkw.exe`, and set up the same way.
+
+Your dump, saves, and personal settings stay on your PC.
 
 ## MKW-THWOMP 0.2.2b
 
