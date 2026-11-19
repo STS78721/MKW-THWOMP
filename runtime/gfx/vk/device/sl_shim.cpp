@@ -132,7 +132,7 @@ extern "C" int sl_shim_init(const wchar_t *dir, int want_fg) {
     if (g_init) return 1;
     wchar_t path[MAX_PATH];
     _snwprintf(path, MAX_PATH, L"%ls\\sl.interposer.dll", dir);
-    g_mod = LoadLibraryW(path);
+    if (!g_mod) g_mod = LoadLibraryW(path);
     if (!g_mod) {
         rt_log("dlss: sl.interposer.dll is not beside mkw.exe: DLSS unavailable");
         return 0;
@@ -190,6 +190,29 @@ extern "C" int sl_shim_init(const wchar_t *dir, int want_fg) {
     g_init = true;
     rt_log("dlss: Streamline %d.%d.%d ready (manual hooking, no over-the-air updates%s)", SL_VERSION_MAJOR, SL_VERSION_MINOR,
            SL_VERSION_PATCH, g_want_fg ? "; DLSS frame generation, Reflex and PCL loaded" : "");
+    return 1;
+}
+
+extern "C" int sl_shim_instance_extensions(const char *const **inst_ext, uint32_t *n_inst) {
+    if (!g_init || !p_reqs) return 0;
+    g_n_inst = 0;
+    sl::FeatureRequirements req{};
+    sl::Result r = p_reqs(sl::kFeatureDLSS, req);
+    if (r != sl::Result::eOk) {
+        rt_log("dlss: no requirements for DLSS (%d): instance extensions unavailable", (int)r);
+        return 0;
+    }
+    add(g_inst_ext, g_n_inst, 32, req.vkInstanceExtensions, req.vkNumInstanceExtensions);
+    if (g_want_fg) {
+        static const sl::Feature more[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+        for (int i = 0; i < 3; i++) {
+            sl::FeatureRequirements fq{};
+            if (p_reqs(more[i], fq) == sl::Result::eOk)
+                add(g_inst_ext, g_n_inst, 32, fq.vkInstanceExtensions, fq.vkNumInstanceExtensions);
+        }
+    }
+    *inst_ext = g_inst_ext;
+    *n_inst = g_n_inst;
     return 1;
 }
 
@@ -468,7 +491,9 @@ extern "C" void sl_shim_shutdown(void) {
     if (!g_init || InterlockedExchange(&g_sl_shutting_down, 1)) return;
     if (p_shutdown) p_shutdown();
     g_init = false;
+    g_want_fg = false;
     g_have = 0;
+    g_n_dev = g_n_inst = 0;
 }
 
 // ---- DLSS frame generation
@@ -808,6 +833,11 @@ extern "C" int sl_shim_fg_preset_write(int preset) {
 
 extern "C" {
 int sl_shim_init(const wchar_t *, int) { return 0; }
+int sl_shim_instance_extensions(const char *const **inst_ext, uint32_t *n_inst) {
+    if (inst_ext) *inst_ext = nullptr;
+    if (n_inst) *n_inst = 0;
+    return 0;
+}
 int sl_shim_requirements(const VkExtensionProperties *, uint32_t, const char *const **dev_ext, uint32_t *n_dev,
                          const char *const **inst_ext, uint32_t *n_inst, uint32_t *gfx_queues,
                          uint32_t *compute_queues) {

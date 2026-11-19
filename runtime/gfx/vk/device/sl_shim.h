@@ -37,6 +37,7 @@ typedef struct {
 #define SL_SHIM_REFLEX 4
 
 int sl_shim_init(const wchar_t *dir, int want_fg);   // dir: where sl.interposer.dll and the plugins are
+int sl_shim_instance_extensions(const char *const **inst_ext, uint32_t *n_inst);
 // The device extensions and the extra queues every loaded feature asks for (graphics and compute queues: in the
 // graphics family after the host's own queue); avail/n_avail check device extension support before enabling them.
 int sl_shim_requirements(const VkExtensionProperties *avail, uint32_t n_avail, const char *const **dev_ext,

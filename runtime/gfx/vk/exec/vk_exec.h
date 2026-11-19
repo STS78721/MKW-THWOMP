@@ -87,6 +87,7 @@ typedef struct VkExec {
     NVNbufferRange vbuf[16];             // OP_BIND_VBUF
     p_bind_buf ubo[NVN_BIND_STAGES][18], ssbo[NVN_BIND_STAGES][16];   // OP_BIND_UBO / OP_BIND_SSBO per stage and index
     uint64_t tex[NVN_BIND_STAGES][128], samp[NVN_BIND_STAGES][128], img[NVN_BIND_STAGES][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
+    uint8_t c24[NVN_BIND_STAGES][NVN_C24_BYTES];   // OP_PUSH_CONST: the driver's push-constant bank c24 per stage; never pushed reads zero
 
     // ---- vk_exec_xfer.c slots (render enable, conditional rendering): left empty by vk_exec.c
     int render_disabled;                 // OP_RENDER_ENABLE false or a failed OP_RENDER_COND: clears and draws skip

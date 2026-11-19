@@ -262,6 +262,51 @@ static void dispatch_barrier(VkExec *ex) {
     vk_exec_barrier(ex);
 }
 
+// A compute dispatch's storage-image stores land in the image only; the CPU-readable collision height map the
+// water writes (a pitch-linear texture the game reads for tricks and wave riding) needs its storage updated at the
+// fence. Render and copy paths mark this via vk_texture_gpu_written, but dispatches only noted the binding's fence,
+// so the write-back never saw them and physics read a flat road (#410).
+static void mark_compute_writes(VkExec *ex, const VkPipeInfo *info) {
+    for (uint32_t i = 0; i < info->n_bindings; i++) {
+        const VkPipeBinding *bd = &info->bindings[i];
+        if (bd->kind != GFX_RES_IMG || bd->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) continue;
+        if (!bd->res || !(bd->res->flags & 4) || bd->res->slot < 0) continue;
+        uint32_t cnt = bd->count ? bd->count : 1;
+        for (uint32_t k = 0; k < cnt; k++) {
+            int slot = bd->res->slot + (int)k;
+            if (slot < 0 || slot >= 32) continue;
+            uint64_t h = ex->img[NVN_STAGE_CS][slot];
+            if (!h) continue;
+            vk_texture_compute_written((int)(h & 0xfffff));
+        }
+    }
+}
+
+// MKW_FIRST_STORE (default 1; 0 off, "ab": in the B blocks): a program whose first invocation alone resets a counter
+// the other workgroups append to with atomics (sm86 glsl/first_store.py; MKW's scenery lists) runs that reset as a
+// dispatch of one workgroup of its own before the rest, behind a barrier. Direct dispatches only, of the shape
+// the test covers (1 or 2 dimensions).
+static VkPipeline first_store_pre(const GfxShader *cs, const p_dispatch *d, VkPipeline *main) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("FIRST_STORE", "1");
+    int form = gfx_shader_first_store(cs);
+    if (!form || !RT_KNOB_ON(mode) || d->z != 1 || (form == 1 && d->y != 1)) return VK_NULL_HANDLE;
+    VkPipeline pre = vk_pipeline_compute_first(cs, 1, NULL), rest = vk_pipeline_compute_first(cs, 2, NULL);
+    if (!pre || !rest) return VK_NULL_HANDLE;
+    static const GfxShader *logged[8];
+    static int nlogged;
+    int seen = 0;
+    for (int i = 0; i < nlogged; i++) seen |= logged[i] == cs;
+    if (!seen && nlogged < 8) {   // racy between chunks at worst a line twice
+        logged[nlogged++] = cs;
+        const uint8_t *k = gfx_shader_key(cs);
+        rt_log("vk: cs %02x%02x%02x%02x: its first invocation's reset dispatched on its own first (MKW_FIRST_STORE)",
+               k[0], k[1], k[2], k[3]);
+    }
+    *main = rest;
+    return pre;
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -289,6 +334,14 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (vk_spec_census_on()) spec_census(ex, cs, NVN_STAGE_CS);
     if (pt && vk_pt_draw_mode()) vk_pt_draw(ex->cb, cs, NULL);
     else if (pt) vk_pt_mark(ex->cb, 1u << 31 | (uint32_t)(ex->prog->serial & 0x7fffffff));
+    VkPipeline rest = VK_NULL_HANDLE, pre = first_store_pre(cs, d, &rest);
+    if (pre) {   // the same layout: the resources bound above stay
+        bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, pre);
+        vkCmdDispatch(ex->cb, 1, 1, 1);
+        ex->recorded++;
+        vk_exec_barrier(ex);
+        bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, rest);
+    }
     vk_cs_hash(ex, d->caller, 0, 0);   // MKW_CS_HASH (diag/vk_cs_hash.c)
     uint32_t crumb = vk_crumb_begin(ex->cb, VK_CRUMB_DISPATCH, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z, 0, NULL, 0);
     vk_crumb_cs(crumb, gfx_shader_key(cs));
@@ -298,6 +351,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (pt) vk_pt_mark(ex->cb, 0);
     ex->recorded++;
     ex->last_dispatch = ex->recorded;
+    mark_compute_writes(ex, info);
     vk_trace_3d_writes(ex, cs, info, d);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
     if (vk_rtstats_on) vk_rtstats_dispatch(ex, info);
@@ -346,6 +400,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     vk_crumb_end(ex->cb, VK_CRUMB_DISPATCH, crumb);
     vk_cs_hash(ex, d->caller, 0, 1);
     ex->recorded++;
+    mark_compute_writes(ex, info);
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
     VK_MEM_BOUND(ip);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller});
@@ -534,6 +589,18 @@ int vk_exec_bind_state(VkExec *ex, uint32_t op, const void *payload) {
         ex->tex_serial++;   // feedback_scan reads only textures: a rescan at most
         break;
     }
+    case OP_PUSH_CONST: {   // the recorder clamped offset and size to the bank (nvn_api_cmd.c push_const)
+        // A graphics push reaches every graphics stage's c24, not only the stage it names: MKW pushes its SMAA
+        // metrics once with stage 0, and the blend-weight pass reads them in its fragment shader too.
+        const p_push_const *b = payload;
+        if (b->stage >= 0 && b->stage < NVN_BIND_STAGES && b->offset >= 0 && b->size >= 0 &&
+            (uint32_t)b->offset + (uint32_t)b->size <= NVN_C24_BYTES) {
+            for (int st = 0; st < NVN_BIND_STAGES; st++)
+                if (b->stage == NVN_STAGE_CS ? st == NVN_STAGE_CS : st != NVN_STAGE_CS)
+                    memcpy(ex->c24[st] + b->offset, b->data, (size_t)b->size);
+        }
+        break;
+    }
     default: return 0;
     }
     return 1;
@@ -552,7 +619,8 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
         return;
     }
     if (vk_exec_bind_state(ex, op, payload)) {
-        if (op == OP_BIND_PROGRAM || op == OP_BIND_UBO || op == OP_BIND_SSBO || op == OP_BIND_TEX || op == OP_BIND_IMG)
+        if (op == OP_BIND_PROGRAM || op == OP_BIND_UBO || op == OP_BIND_SSBO || op == OP_BIND_TEX || op == OP_BIND_IMG ||
+            op == OP_PUSH_CONST)
             bind_gen++;
         return;
     }

@@ -150,11 +150,14 @@ void vk_mv_jitter_px(uint64_t frame, float *x, float *y);
 int vk_dlss_wanted(void);
 int vk_dlss_active(void);
 // queues: Streamline's own, to make in the graphics family after the host's queue
+void vk_dlss_pre_instance(const VkExtensionProperties *avail, uint32_t n_avail, const char **ext, uint32_t *n_ext,
+                          uint32_t cap);
 void vk_dlss_pre_device(uint32_t vendor, const VkExtensionProperties *avail, uint32_t n_avail, const char **ext,
                         uint32_t *n_ext, uint32_t cap, uint32_t *queues);
 void vk_dlss_abort_pre_device(void);
 void vk_dlss_post_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t gfx_family,
                          uint32_t gfx_queue_count);
+void vk_dlss_shutdown(VkCtx *c);
 PFN_vkVoidFunction vk_dlss_proc(const char *name);
 PFN_vkVoidFunction vk_dlss_instance_proc(VkInstance inst, const char *name);   // with DLSS-G: the surface calls
 void vk_wait_device_idle(VkDevice dev);   // routes vkDeviceWaitIdle through Streamline's proxy when active
@@ -550,6 +553,8 @@ int vk_texture_checked(int id, uint32_t ep);   // unlocked: slot id's check in s
 uint64_t vk_texture_slot_token(int id);
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
+void vk_texture_compute_written(int id);          // a compute dispatch wrote slot id as a storage image: the same,
+// so a linear collision height map reaches its storage at the fence (MKW wave riding, #410)
 // runtime/gfx/cap: of the live image of t, if any (none is made): VK_TEXCAP_GPU its content is what the GPU wrote,
 // VK_TEXCAP_RECENT a draw sampled it within the last `recent` submissions, VK_TEXCAP_SPARSE it is a Vulkan sparse image
 // (a sparse NVN texture may be a whole image: depth formats in RADV).
@@ -752,6 +757,9 @@ void vk_pipeline_async_busy(unsigned *inflight, int *building);
 // No-op without vk_pipeline_async_enable, with MKW_PIPE_PREBUILD=0 or with MKW_GPU=null.
 void vk_pipeline_prewarm(void);
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
+// The same with the program's FIRST_STORE set (gfx_shader_first_store): 1 only the first invocation's stores, 2 all
+// but them; same layout as vk_pipeline_compute's
+VkPipeline vk_pipeline_compute_first(const GfxShader *cs, uint32_t first, const VkPipeInfo **info);
 // Task/mesh as compute (vk_mesh_cs.c): whether DrawMeshTasks goes that way, and its device-local scratch for a
 // submission (fence): buffer, offset and GPU address; 0 when no memory.
 int vk_mesh_cs_on(void);

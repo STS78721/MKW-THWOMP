@@ -1,4 +1,4 @@
-// The game's queues ordered by their events (MKW_QUEUE_WAITS, default 0; 1 on, "ab": in the B blocks). MKW's two worker
+// The game's queues ordered by their events (MKW_QUEUE_WAITS, default 1; 0 off, "ab": in the B blocks). MKW's two worker
 // queues pass stages back and forth with nvnCommandBufferWaitEvent; replayed in submit order on our one Vulkan queue,
 // a wait the signals submitted before it do not meet ran its work before what it waits for (wc1: 50-65 % of the waits,
 // each met by the other queue's next submit; Hookshot's finding in another MKW recomp, an idea only: GPL-3.0).
@@ -49,7 +49,7 @@ static uint64_t st_waits, st_unmet, st_episodes, st_held, st_forced, st_cpu, st_
 static int mode(void) {
     static int m = -1;
     if (m < 0) {
-        m = rt_knob("QUEUE_WAITS", "0");
+        m = rt_knob("QUEUE_WAITS", "1");
         rt_log("nvn: the queues' work ordered by their event waits%s (MKW_QUEUE_WAITS)",
                !m ? ": off, a census only" : m == 2 ? " in the B blocks" : "");
     }

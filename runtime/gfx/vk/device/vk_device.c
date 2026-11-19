@@ -2,6 +2,10 @@
 // Ported from LAS Recomp, runtime/nvn/vulkan/device.c:33-330
 // (https://github.com/peiikai/LASRecomp @ da35b83a9611d046a9a681aae668d7085954d37f, MIT, Copyright (c) 2026 Peiikai),
 // without SDL. The VMA implementation is runtime/vk_vma.cpp (VMA is C++ only).
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,14 +91,15 @@ static int layer_present(const char *name) {
 }
 
 static int create_instance(void) {
-    const char *ext[9];
-    uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 7);
+    const char *ext[24];
+    uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 8);
     uint32_t ni = 0;   // HDR10 swapchains (gfx_hdr.c) need the colour spaces of VK_EXT_swapchain_colorspace
     vkEnumerateInstanceExtensionProperties(NULL, &ni, NULL);
     VkExtensionProperties *ie = calloc(ni ? ni : 1, sizeof *ie);
     vkEnumerateInstanceExtensionProperties(NULL, &ni, ie);
     if (has_ext(ie, ni, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
         g_vk.has_colorspace = 1, ext[n_ext++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+    vk_dlss_pre_instance(ie, ni, ext, &n_ext, 22);
     free(ie);
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     int validate = cfg_bool("MKW_VK_VALIDATION");
@@ -110,7 +115,11 @@ static int create_instance(void) {
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
     rdoc_init();
     VkResult r = vkCreateInstance(&ci, NULL, &g_vk.instance);
-    if (r != VK_SUCCESS) { rt_log("vk: vkCreateInstance failed (%d); is a Vulkan 1.3 driver installed?", (int)r); return 0; }
+    if (r != VK_SUCCESS) {
+        rt_log("vk: vkCreateInstance failed (%d); is a Vulkan 1.3 driver installed?", (int)r);
+        vk_dlss_abort_pre_device();
+        return 0;
+    }
     g_vk.validation = validate;
     if (validate) {
         PFN_vkCreateDebugUtilsMessengerEXT f =
@@ -432,6 +441,35 @@ static int create_device(void) {
         if (1 + sl_queues > have) rt_log("vk: Streamline asks for %u queues, the graphics family has %u", sl_queues, have);
         else qi[0].queueCount = 1 + sl_queues;
     }
+    {
+        VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 dp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &dp2);
+        rt_log("vk: driver: %s (%s)", drv.driverName, drv.driverInfo);
+    }
+#ifdef _WIN32
+    {
+        static const struct { const wchar_t *w; const char *name; } hook_dlls[] = {
+            {L"RTSSVkLayer64.dll", "RTSSVkLayer64.dll"},
+            {L"RTSSHooks64.dll", "RTSSHooks64.dll"},
+            {L"GameOverlayRenderer64.dll", "GameOverlayRenderer64.dll"},
+            {L"EOSOVH-Win64-Shipping.dll", "EOSOVH-Win64-Shipping.dll"},
+            {L"GalaxyOverlayVkLayer.dll", "GalaxyOverlayVkLayer.dll"},
+            {L"DiscordHook64.dll", "DiscordHook64.dll"},
+            {L"sl.interposer.dll", "sl.interposer.dll"},
+        };
+        char overlays[256] = "";
+        size_t on = 0;
+        for (size_t i = 0; i < sizeof hook_dlls / sizeof *hook_dlls && on + 1 < sizeof overlays; i++) {
+            if (GetModuleHandleW(hook_dlls[i].w)) {
+                int w = snprintf(overlays + on, sizeof overlays - on, "%s%s", on ? ", " : "", hook_dlls[i].name);
+                if (w > 0) on += (size_t)w < sizeof overlays - on ? (size_t)w : sizeof overlays - 1 - on;
+            }
+        }
+        if (on) rt_log("vk: loaded hook/overlay DLLs: %s", overlays);
+    }
+#endif
+    rt_log("vk: calling vkCreateDevice (%u extensions, %u gfx queues)", n_ext, qi[0].queueCount);
     vk_guard_gpu_ok();
     VkResult r = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.device);
     if (vk_dlss_wanted()) rt_log("vk: vkCreateDevice with %u extensions: %d", n_ext, (int)r);
@@ -554,6 +592,7 @@ static void destroy_all(void) {
     vk_headroom_stop();
     vk_tex_pool_stop();
     vk_sparse_shutdown();
+    vk_dlss_shutdown(&g_vk);
     if (g_vk.vma) vmaDestroyAllocator(g_vk.vma);
     if (g_vk.device) vkDestroyDevice(g_vk.device, NULL);
     if (g_vk.messenger) {

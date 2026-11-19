@@ -28,6 +28,7 @@
 #include "nvn_procs.inc"
 #undef NVN_PROC
 void nvnp_nvnCommandBufferDrawMeshTasks(Cpu *c);   // NVN2 (nvn2_procs.inc)
+void nvnp_nvnCommandBufferPushGraphicsConstants(Cpu *c);
 
 typedef struct { const char *name; void (*fn)(Cpu *); } ProcRow;
 static const ProcRow procs[] = {
@@ -462,6 +463,8 @@ static uint64_t record_all(void) {
     REC(OP_CLEAR_BUF, CALL(nvnCommandBufferClearBuffer, U(c), 0xc200, 0x40, 0xdeadbeef));
     REC(OP_CLEAR_BUF, CALL(nvnCommandBufferReportValue, U(c), 0x1234, 0xc300));
     REC(OP_DRAW_MESH, CALL(nvnCommandBufferDrawMeshTasks, U(c), 3, 5));
+    static const uint32_t pc_data[4] = {0x11223344u, 0x55667788u, 0x99aabbcdu, 0xdeadbeefu};
+    REC(OP_PUSH_CONST, CALL(nvnCommandBufferPushGraphicsConstants, U(c), 0, 16, sizeof pc_data, U(pc_data)));
     static const int thresholds[4] = {1, 2, 3, 4};
     CALL(nvnCommandBufferSetColorReductionEnable, U(c), 1);   // hints: nothing recorded
     CALL(nvnCommandBufferSetColorReductionThresholds, U(c), 0, U(thresholds));
@@ -698,6 +701,12 @@ static void parse_all(uint64_t h) {
             CHECK(p->first == 3 && p->count == 5, "DRAW_MESH payload {%d, %d}", p->first, p->count);
             break;
         }
+        case OP_PUSH_CONST: {
+            const p_push_const *p = a;
+            static const uint32_t want[4] = {0x11223344u, 0x55667788u, 0x99aabbcdu, 0xdeadbeefu};
+            CHECK(p->stage == 0 && p->offset == 16 && p->size == 16 && !memcmp(p->data, want, 16), "PUSH_CONST payload");
+            break;
+        }
         default: CHECK(0, "unexpected op %s", nvn_op_name(o->op)); break;
         }
     }
@@ -837,7 +846,7 @@ static void probe_queue_order(void) {
     enum { OFF_E = 0x600, OFF_F = 0x640, OFF_Z = 0x700, OFF_R1 = 0x710, OFF_R2 = 0x720, OFF_C = 0x730 };
     static const uint8_t bb[8] = {0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb}, cc[8] = {0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc};
     uint64_t base = U(pmem);
-    plat_setenv("MKW_QUEUE_WAITS", "1");   // (off by default; read on first use, which is here)
+    plat_setenv("MKW_QUEUE_WAITS", "1");   // (the default; read on first use, which is here)
     memset(pmem + OFF_E, 0, 0x140);
     CALL(nvnEventBuilderSetStorage, U(&evb), U(&pool), OFF_E);
     CHECK((uint8_t)CALL(nvnEventInitialize, U(&evE), U(&evb)) == 1, "EventInitialize E");

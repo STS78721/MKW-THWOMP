@@ -40,7 +40,7 @@
 #include "sl_shim.h"
 
 static struct {
-    int wanted, started, ok;
+    int wanted, started, ok, inited;
     VkDevice dev;
     unsigned seen;
     int model;
@@ -68,51 +68,85 @@ static struct {
     uint32_t fg_set;          // the frames last asked of the plugin (0 off), ~0u never
     uint32_t fg_in_w, fg_in_h, fg_out_w, fg_out_h;
     uint64_t fg_status_said, fg_presented;
-} D = {.seen = ~0u, .fg_set = ~0u};
+} D = {.inited = -1, .seen = ~0u, .fg_set = ~0u};
 
 int vk_dlss_wanted(void) { return !strcmp(cfg_value("MKW_UPSCALER"), "dlss"); }
 
-// vk_device.c create_device, before vkCreateDevice: Streamline starts and its device extensions join ext (at most cap);
+static int dlss_start_shim(void) {
+    if (D.started) return 1;
+#ifdef _WIN32
+    wchar_t dir[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
+    while (n && dir[n - 1] != L'\\' && dir[n - 1] != L'/') n--;
+    if (!n) return 0;
+    dir[n - 1] = 0;
+#else
+    wchar_t dir[2] = L"";
+#endif
+    int fg = !strcmp(cfg_value("MKW_FRAMEGEN_TYPE"), "dlss");   // read at start: its plugins load with Streamline
+    if (!sl_shim_init(dir, fg)) return 0;
+    D.started = 1;
+    return 1;
+}
+
+// vk_device.c create_instance, before vkCreateInstance: start Streamline early so its temporary physical-device query
+// never nests inside our open VkInstance (which trips Vulkan hook layers), and add Streamline's instance extensions.
+void vk_dlss_pre_instance(const VkExtensionProperties *avail, uint32_t n_avail, const char **ext, uint32_t *n_ext,
+                          uint32_t cap) {
+    D.wanted = vk_dlss_wanted();
+    if (!D.wanted || !dlss_start_shim()) return;
+    const char *const *ie = NULL;
+    uint32_t ni = 0;
+    if (!sl_shim_instance_extensions(&ie, &ni)) return;
+    for (uint32_t i = 0; i < ni; i++) {
+        int sup = 0;
+        for (uint32_t a = 0; a < n_avail && !sup; a++) sup = !strcmp(avail[a].extensionName, ie[i]);
+        if (!sup) {
+            rt_log("dlss: instance lacks extension %s asked by Streamline", ie[i]);
+            continue;
+        }
+        int have = 0;
+        for (uint32_t k = 0; k < *n_ext && !have; k++) have = !strcmp(ext[k], ie[i]);
+        if (have) continue;
+        if (*n_ext >= cap) {
+            rt_log("dlss: no room for instance extension %s for Streamline", ie[i]);
+            continue;
+        }
+        ext[(*n_ext)++] = ie[i];
+        rt_log("dlss: instance extension %s for Streamline", ie[i]);
+    }
+}
+
+// vk_device.c create_device, before vkCreateDevice: Streamline's device extensions join ext (at most cap);
 // *queues: the queues it wants made in the graphics family after ours (DLSS frame generation's)
 void vk_dlss_pre_device(uint32_t vendor, const VkExtensionProperties *avail, uint32_t n_avail, const char **ext,
                         uint32_t *n_ext, uint32_t cap, uint32_t *queues) {
     *queues = 0;
     D.sl_gfx_queues = 0;
     D.sl_compute_queues = 0;
-    D.started = 0;
     D.wanted = vk_dlss_wanted();
     if (!D.wanted) return;
     if (vendor != 0x10de) {
         rt_log("dlss: not an NVIDIA GPU: DLSS unavailable, the upscaler is FSR 1");
+        vk_dlss_abort_pre_device();
         return;
     }
-#ifdef _WIN32
-    wchar_t dir[MAX_PATH];
-    DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
-    while (n && dir[n - 1] != L'\\' && dir[n - 1] != L'/') n--;
-    if (!n) return;
-    dir[n - 1] = 0;
-#else
-    wchar_t dir[2] = L"";
-#endif
-    int fg = !strcmp(cfg_value("MKW_FRAMEGEN_TYPE"), "dlss");   // read at start: its plugins load with Streamline
-    if (!sl_shim_init(dir, fg)) return;
+    if (!dlss_start_shim()) return;
     const char *const *de = NULL, *const *ie = NULL;
     uint32_t nd = 0, ni = 0, gq = 0, cq = 0;
     if (!sl_shim_requirements(avail, n_avail, &de, &nd, &ie, &ni, &gq, &cq)) {
-        sl_shim_shutdown();
+        vk_dlss_abort_pre_device();
         return;
     }
     // Streamline's queues (DLSS-G presents on one of its own): graphics then compute, in our graphics family
     // (graphics queues do compute too) after our own queue
     if (gq + cq > 15) {
         rt_log("dlss: Streamline asks for %u graphics and %u compute queues: too many, DLSS unavailable", gq, cq);
-        sl_shim_shutdown();
+        vk_dlss_abort_pre_device();
         return;
     }
     uint32_t orig_n_ext = *n_ext;
     if (gq || cq) rt_log("dlss: %u graphics and %u compute queues for Streamline", gq, cq);
-    for (uint32_t i = 0; i < ni; i++) rt_log("dlss: Streamline asks for instance extension %s", ie[i]);
     for (uint32_t i = 0; i < nd; i++) {
         // the EXT form of buffer device address may not be enabled with the KHR one (core since 1.2, already on)
         if (!strcmp(de[i], "VK_EXT_buffer_device_address")) continue;
@@ -122,7 +156,7 @@ void vk_dlss_pre_device(uint32_t vendor, const VkExtensionProperties *avail, uin
         if (*n_ext == cap) {
             rt_log("dlss: no room for device extension %s: DLSS unavailable", de[i]);
             *n_ext = orig_n_ext;
-            sl_shim_shutdown();
+            vk_dlss_abort_pre_device();
             return;
         }
         ext[(*n_ext)++] = de[i];
@@ -131,7 +165,6 @@ void vk_dlss_pre_device(uint32_t vendor, const VkExtensionProperties *avail, uin
     D.sl_gfx_queues = gq;
     D.sl_compute_queues = cq;
     *queues = gq + cq;
-    D.started = 1;
 }
 
 void vk_dlss_abort_pre_device(void) {
@@ -140,6 +173,37 @@ void vk_dlss_abort_pre_device(void) {
     D.sl_gfx_queues = 0;
     D.sl_compute_queues = 0;
     sl_shim_shutdown();
+}
+
+void vk_dlss_shutdown(VkCtx *c) {
+    // Streamline must shut down while VkDevice and VkInstance are still alive.
+    sl_shim_shutdown();
+    if (c && c->device) {
+        for (int i = 0; i < 8; i++)
+            if (D.src_view[i]) vkDestroyImageView(c->device, D.src_view[i], NULL);
+        if (D.out_v) vkDestroyImageView(c->device, D.out_v, NULL);
+        if (D.out && c->vma) vmaDestroyImage(c->vma, D.out, D.out_a);
+        if (D.comp_v) vkDestroyImageView(c->device, D.comp_v, NULL);
+        if (D.comp && c->vma) vmaDestroyImage(c->vma, D.comp, D.comp_a);
+        for (int i = 0; i < 2; i++) {
+            if (D.hudless_v[i]) vkDestroyImageView(c->device, D.hudless_v[i], NULL);
+            if (D.hudless[i] && c->vma) vmaDestroyImage(c->vma, D.hudless[i], D.hudless_a[i]);
+            if (D.ui_v[i]) vkDestroyImageView(c->device, D.ui_v[i], NULL);
+            if (D.ui[i] && c->vma) vmaDestroyImage(c->vma, D.ui[i], D.ui_a[i]);
+            if (D.in_v[i]) vkDestroyImageView(c->device, D.in_v[i], NULL);
+            if (D.in[i] && c->vma) vmaDestroyImage(c->vma, D.in[i], D.in_a[i]);
+        }
+        if (D.qp) vkDestroyQueryPool(c->device, D.qp, NULL);
+        if (D.pipe) vkDestroyPipeline(c->device, D.pipe, NULL);
+        if (D.layout) vkDestroyPipelineLayout(c->device, D.layout, NULL);
+        if (D.dsl) vkDestroyDescriptorSetLayout(c->device, D.dsl, NULL);
+        if (D.linear) vkDestroySampler(c->device, D.linear, NULL);
+        if (D.nearest) vkDestroySampler(c->device, D.nearest, NULL);
+    }
+    memset(&D, 0, sizeof D);
+    D.inited = -1;
+    D.seen = ~0u;
+    D.fg_set = ~0u;
 }
 
 // vk_device.c, right after vkCreateDevice (vk_ctx() is not set yet)
@@ -466,9 +530,8 @@ VkImage vk_dlss_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     vk_mv_set_jitter(on);
     if (!on) return VK_NULL_HANDLE;
     VkCtx *c = vk_ctx();
-    static int inited = -1;
-    if (inited < 0) inited = init(c);
-    if (!inited) return VK_NULL_HANDLE;
+    if (D.inited < 0) D.inited = init(c);
+    if (!D.inited) return VK_NULL_HANDLE;
     // FG inputs wait is GPU-side on the present/DLSS submit (sl_shim_fg_inputs_take), not a CPU stall here.
     unsigned v = cfg_version();
     if (v != D.seen) {

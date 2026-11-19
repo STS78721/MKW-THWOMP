@@ -121,14 +121,29 @@ void plat_mem_watch_hook(int (*fn)(uint64_t addr, uint64_t rip)) {
 
 static void (*crash_fn)(const PlatCrash *c);
 
-static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
+static const char *crash_reason(DWORD code) {
+    return code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
+         : code == EXCEPTION_ILLEGAL_INSTRUCTION ? "illegal instruction"
+         : code == EXCEPTION_INT_DIVIDE_BY_ZERO ? "integer division by zero"
+         : code == EXCEPTION_PRIV_INSTRUCTION ? "privileged instruction"
+         : code == EXCEPTION_STACK_OVERFLOW ? "stack overflow"
+         : code == EXCEPTION_IN_PAGE_ERROR ? "in-page error" : NULL;
+}
+
+static void fill_crash(PlatCrash *c, const char *what, EXCEPTION_POINTERS *ep, const char *mod,
+                       uintptr_t base, int in_module) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
-    const char *what = code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
-                     : code == EXCEPTION_ILLEGAL_INSTRUCTION ? "illegal instruction"
-                     : code == EXCEPTION_INT_DIVIDE_BY_ZERO ? "integer division by zero"
-                     : code == EXCEPTION_PRIV_INSTRUCTION ? "privileged instruction"
-                     : code == EXCEPTION_STACK_OVERFLOW ? "stack overflow"
-                     : code == EXCEPTION_IN_PAGE_ERROR ? "in-page error" : NULL;
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    *c = (PlatCrash){what, (uint32_t)code, rip, in_module ? rip - base : rip, -1, 0, mod, 0};
+    uintptr_t sp = (uintptr_t)ep->ContextRecord->Rsp;   // a wild call left its return address there
+    if (!in_module && sp && !(sp & 7) && plat_mem_readable(sp, 8)) c->ret = *(const uintptr_t *)sp;
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+        c->access = (int)ep->ExceptionRecord->ExceptionInformation[0],
+        c->addr = ep->ExceptionRecord->ExceptionInformation[1];
+}
+
+static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
+    const char *what = crash_reason(ep->ExceptionRecord->ExceptionCode);
     if (!what) return EXCEPTION_CONTINUE_SEARCH;
     uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
     // Ours: mkw.exe, the game code library (mkwgame.dll), or no module at all (a jump to a wild address). Faults in
@@ -139,14 +154,39 @@ static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
     if (in_module && at != exe && (!game || at != game)) return EXCEPTION_CONTINUE_SEARCH;
     MODULEINFO mi = {0};
     if (in_module) GetModuleInformation(GetCurrentProcess(), at, &mi, sizeof mi);
-    PlatCrash c = {what, (uint32_t)code, rip, in_module ? rip - (uintptr_t)mi.lpBaseOfDll : rip, -1, 0};
-    c.module = !in_module ? "no module" : at == exe ? "mkw" : "mkwgame";
-    uintptr_t sp = (uintptr_t)ep->ContextRecord->Rsp;   // a wild call left its return address there
-    if (!in_module && sp && !(sp & 7) && plat_mem_readable(sp, 8)) c.ret = *(const uintptr_t *)sp;
-    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
-        c.access = (int)ep->ExceptionRecord->ExceptionInformation[0], c.addr = ep->ExceptionRecord->ExceptionInformation[1];
+    PlatCrash c;
+    fill_crash(&c, what, ep, !in_module ? "no module" : at == exe ? "mkw" : "mkwgame", (uintptr_t)mi.lpBaseOfDll, in_module);
     crash_fn(&c);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Fallback when an unhandled exception in an external DLL (Vulkan driver, layer, overlay) terminates the process,
+// so the faulting module name and offset still land in mkw.log instead of ending silently.
+static LONG WINAPI unhandled_crash_filter(EXCEPTION_POINTERS *ep) {
+    if (!crash_fn || !ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+    const char *what = crash_reason(ep->ExceptionRecord->ExceptionCode);
+    if (!what) what = "unhandled exception";
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    HMODULE at = NULL;
+    int in_module = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       (LPCWSTR)rip, &at);
+    static char mod_name[128];
+    const char *mod = "no module";
+    MODULEINFO mi = {0};
+    if (in_module) {
+        GetModuleInformation(GetCurrentProcess(), at, &mi, sizeof mi);
+        char path[MAX_PATH] = "";
+        DWORD len = GetModuleFileNameA(at, path, sizeof path);
+        const char *base = path;
+        for (DWORD i = 0; i < len; i++)
+            if (path[i] == '\\' || path[i] == '/') base = path + i + 1;
+        snprintf(mod_name, sizeof mod_name, "%s", *base ? base : "unknown");
+        mod = mod_name;
+    }
+    PlatCrash c;
+    fill_crash(&c, what, ep, mod, (uintptr_t)mi.lpBaseOfDll, in_module);
+    crash_fn(&c);
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
 // The C runtime's check of a call's arguments (a time out of localtime_s's range, a null stream...) ends the process
@@ -175,6 +215,7 @@ static void crt_invalid_parameter(const wchar_t *expr, const wchar_t *fn, const 
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
     AddVectoredExceptionHandler(0, crash_veh);
+    SetUnhandledExceptionFilter(unhandled_crash_filter);
     _set_invalid_parameter_handler(crt_invalid_parameter);
 }
 

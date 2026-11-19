@@ -43,6 +43,7 @@ struct GfxShader {
     uint32_t local[3];
     uint32_t *spec;                                        // "spec": word k = bank << 16 | byte (specialization ids 2k, 2k+1)
     int nspec;
+    int first_store;                                       // "first_store" (glsl/first_store.py): 0, 1 or 2
     const struct GfxShader *variant_of;                    // gfx_shader_variant: the generic shader; NULL for one
     struct GfxShader *cs_variant;                          // task/mesh: the compute form (gfx_shader_cs_variant)
     int cs_of_mesh;                                        // this is the compute form of a task or mesh program
@@ -516,6 +517,7 @@ static void reflect(GfxShader *s) {
         json_objects(js, kinds[k], add_res, s, k);
     }
     reflect_spec(s);
+    s->first_store = s->stage == GFX_STAGE_CS ? (int)json_int(js, js + strlen(js), "first_store", 0) : 0;
     reflect_spirv(s);
 }
 
@@ -534,12 +536,25 @@ static const GfxShader *int_image_variant(GfxShader *s, const GfxShaderAnswers *
     GfxShader *v = mem_find(key);
     if (v) return v;
     uint64_t nw = 0;
-    uint32_t *code = spirv_int_images(s->spirv, s->words, a->img_uint, a->img_sint, &nw);
+    const char *why = NULL;
+    uint32_t *code = spirv_int_images(s->spirv, s->words, a->img_uint, a->img_sint, &nw, &why);
     if (!code) {
         static volatile int32_t n_fail;
-        if (plat_inc32(&n_fail) <= 8)
-            rt_log("gfx_shader: integer images %#llx/%#llx not patched in", (unsigned long long)a->img_uint,
-                   (unsigned long long)a->img_sint);
+        if (plat_inc32(&n_fail) <= 8) {
+            char hex[65];
+            key_hex(s->key, hex);
+            rt_log("gfx_shader: integer images %#llx/%#llx not patched in program %s: %s; using original shader",
+                   (unsigned long long)a->img_uint, (unsigned long long)a->img_sint, hex, why ? why : "unknown reason");
+            // Keep the failing input too: successful variants alone cannot reproduce a failed conversion offline.
+            const char *dd = cfg_get("MKW_SPIRV_INT_DUMP");
+            if (dd && *dd) {
+                char path[PATH_CAP + 128];
+                plat_file_mkdir_p(dd);
+                snprintf(path, sizeof path, "%s/%s-u%llx-s%llx.failed.spv", dd, hex,
+                         (unsigned long long)a->img_uint, (unsigned long long)a->img_sint);
+                plat_file_write(path, s->spirv, s->words * 4);
+            }
+        }
         return s;
     }
     if (!(v = calloc(1, sizeof *v)) || !(v->reflection = malloc(s->reflection_size + 1))) rt_fatal("gfx_shader: out of memory");
@@ -617,6 +632,7 @@ const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words) {
 }
 
 int gfx_shader_stage(const GfxShader *s) { return s->stage; }
+int gfx_shader_first_store(const GfxShader *s) { return s->first_store; }
 
 // A copy of s whose specialization constants default to val[k] for each word k with fix[k] (SCU<k> true, SCV<k> =
 // val[k]), the same as spirv-opt --set-spec-const-default-value: the pipeline code sees an ordinary shader, so the
