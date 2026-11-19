@@ -6,7 +6,58 @@ its issue, #N), `### Tested` (what was run from the packages before publishing) 
 
 ## Unreleased
 
-(empty — next work after 0.2.2)
+(empty — next work after 0.2.2b)
+
+## MKW-THWOMP 0.2.2b
+
+THWOMP's releases come first, in the Pearl Abyss style of its other projects (■ sections, ○ groups); the GitHub release carries the same text. Earlier changelog history follows from 0.2.2 down.
+
+MKW-THWOMP 0.2.2b
+
+Stability and performance hotfix focused on Grand Prix race-entry crashes/hangs, DLSS startup safety across diverse NVIDIA GPUs/drivers, smoother 60 fps racing without mid-race cache-write stutters, faster CPU-to-GPU memory synchronization, shader translation accuracy, and VRAM spill handling. Safe shipped defaults remain FSR, Frame Generation Off, and Presentation Mailbox.
+
+■ Major Updates
+
+- Fixed crashes and GPU device-lost hangs when entering Grand Prix races after the full-screen cup opening movie (cup-movie boundary guard holding DLSS Frame Generation across the opening video with hang-cluster protection, 64 KiB padded constant-buffer views for `CB1W`/`cbNw`, and fixed command-buffer reuse tracking).
+- Hardened DLSS / Streamline initialization across NVIDIA GPUs and driver setups: validates requested Vulkan device extensions before device creation, clamps queue indices, fixes extension-list lifetime, guards shutdown atomically, and automatically retries Vulkan device creation without Streamline if initialization fails.
+
+■ New & Improvements
+
+○ Performance & Frame Pacing
+
+- Race-aware pipeline-cache autosave: tracks active races and defers pipeline-cache disk writes until menus or between races so background saves cannot hitch active races.
+- AVX2 64-byte SIMD shadow memory write-back (`MKW_MERGE_SIMD`, enabled by default) speeds up CPU-to-GPU memory synchronization.
+
+○ Memory & VRAM Headroom
+
+- Automatic system-memory fallback for physical memory pool chunks when device-local VRAM stays full after texture trimming.
+- Dedicated memory allocation for oversized depth/stencil images (`MKW_POOL_SPILL`) when Vulkan layout requirements exceed the NVN pool allocation.
+
+■ Bug Fixes
+
+○ Shaders & Rendering
+
+- Fixed signed integer absolute-value (`IABS`) shader translation and SPIR-V shader prologue handling (automatically re-translated incrementally on upgrade — no full game-code rebuild needed).
+- Preserved depth feedback-loop layouts across parallel command-buffer recording chunks.
+- Zero-initialized private sparse texture mip tails.
+
+○ Stability & Shutdown
+
+- Clean Streamline shutdown on fatal errors so NVIDIA teardown does not leave secondary crash dumps.
+- Released texture pools and sparse backing memory before VMA allocator teardown, and stopped diagnostic workers cleanly before freeing the readback allocator.
+
+■ Other
+
+- No game-code ABI change (`mkwgame.id` unchanged): existing installs upgrade in-place and only incrementally update the changed shaders.
+- Personal settings, dumps, shader caches, saves, and logs are never included in any release package.
+
+■ Update
+
+- From `0.2.2`, `0.2.1b`, `0.1.2`, or `0.1.1`: open the start screen (if **Show launcher on startup** is off, run `mkw.exe --launcher` or re-enable it in F1 → Menu). It offers **`0.2.2b`**, installs it automatically, and updates only the changed shaders. You can also extract `SteelTemple-MKW-THWOMP-0.2.2b-Update.zip` over your game folder.
+- New install: run `SteelTemple-MKW-THWOMP-0.2.2b-Full-Setup-Wizard.exe`, then open the start screen, choose Game files, select your dump, press Set up, and press Play.
+- Portable: extract `SteelTemple-MKW-THWOMP-0.2.2b-Portable-StandAlone.zip` anywhere, run `mkw.exe`, and set up the same way.
+
+Your dump, saves, and personal settings stay on your PC.
 
 ## MKW-THWOMP 0.2.2
 
