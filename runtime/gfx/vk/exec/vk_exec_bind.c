@@ -191,10 +191,137 @@ void limits_init(void) {
 
 static _Thread_local int ubo_kind;   // MKW_REUSE: what gave ubo_info's last answer (RUK_*)
 
-static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
+// flags 2 word view (head.py cbNw): fixed uint w[16384]; bind must expose a full 64 KiB storage range (RM-28).
+enum { CBW_BYTES = 16384u * 4u };
+
+// Word view for a flags:2 constant bank: bind the 64 KiB uniform snapshot directly when present and aligned,
+// otherwise copy the submit snapshot into a 64 KiB zero-padded scratch buffer cached for this command buffer.
+static _Thread_local uint64_t cbw_stat[5], cbw_log_win;
+
+static inline void cbw_note(int k) {
+    cbw_stat[k]++;
+    uint64_t w = vk_exec_presented / 1800;
+    if (w && w != cbw_log_win) {
+        cbw_log_win = w;
+        rt_log("vk_exec: cbw 64 KiB views (this thread): %llu direct-snap, %llu cb-hit, %llu cb-miss, %llu volatile, %llu device",
+               (unsigned long long)cbw_stat[0], (unsigned long long)cbw_stat[1], (unsigned long long)cbw_stat[2],
+               (unsigned long long)cbw_stat[3], (unsigned long long)cbw_stat[4]);
+    }
+}
+
+static VkDescriptorBufferInfo cbw_info(VkExec *ex, const p_bind_buf *b, uint64_t align, uint64_t max) {
+    cb_res(ex);
+    uint64_t pad = CBW_BYTES < max ? CBW_BYTES : max;
+    if (!b->addr) return zero_info(pad);
+    uint64_t n = b->size && b->size < pad ? b->size : pad;
+    VkDescriptorBufferInfo bi;
+    if (b->size >= CBW_BYTES && CBW_BYTES <= max && vk_usnap_find(b->addr, CBW_BYTES, align, &bi)) {
+        count_use(VK_MCLS_SCRATCH, VK_MUSE_SSBO, bi.range);
+        cbw_note(0);
+        return bi;
+    }
+    if (b->size && n) {
+        if (!__atomic_load_n(&vk_usnap_host_wanted, __ATOMIC_RELAXED))
+            __atomic_store_n(&vk_usnap_host_wanted, 1, __ATOMIC_RELAXED);
+        uint64_t ugen = vk_usnap_gen();
+        uint32_t set = (uint32_t)((b->addr * 0x9E3779B97F4A7C15ull) >> 57) & (CBW_SETS - 1);
+        CbwEnt *ways = B.cbw[set];
+        for (int w = 0; w < CBW_WAYS; w++) {
+            const CbwEnt *e = &ways[w];
+            if (!e->buf) break;
+            if (e->addr == b->addr && e->n == n && e->usnap_gen == ugen) {
+                count_use(VK_MCLS_SCRATCH, VK_MUSE_SSBO, CBW_BYTES);
+                cbw_note(1);
+                return (VkDescriptorBufferInfo){e->buf, e->off, CBW_BYTES};
+            }
+        }
+        VkDescriptorBufferInfo sbi;
+        const uint8_t *snap = vk_usnap_peek(b->addr, n, 1);
+        if (snap && vk_usnap_find(b->addr, n, 1, &sbi)) {
+            for (int w = 0; w < CBW_WAYS; w++) {
+                CbwEnt *e = &ways[w];
+                if (!e->buf) break;
+                if (e->addr == b->addr && e->n == n && e->snap_off == sbi.offset) {
+                    e->usnap_gen = ugen;
+                    count_use(VK_MCLS_SCRATCH, VK_MUSE_SSBO, CBW_BYTES);
+                    cbw_note(1);
+                    return (VkDescriptorBufferInfo){e->buf, e->off, CBW_BYTES};
+                }
+            }
+            VkBuffer buf;
+            VkDeviceSize off;
+            uint8_t *dst = scratch(ex, CBW_BYTES, &buf, &off);
+            memcpy(dst, snap, (size_t)n);
+            if (n < CBW_BYTES) memset(dst + n, 0, (size_t)(CBW_BYTES - n));
+            uint8_t slot_w = B.cbw_rr[set];
+            B.cbw_rr[set] = (uint8_t)((slot_w + 1) & (CBW_WAYS - 1));
+            ways[slot_w] = (CbwEnt){b->addr, n, ugen, buf, off, sbi.offset};
+            count_use(VK_MCLS_SCRATCH, VK_MUSE_SSBO, CBW_BYTES);
+            cbw_note(2);
+            return (VkDescriptorBufferInfo){buf, off, CBW_BYTES};
+        }
+    }
+    VkMemSpan sp;
+    if (vk_mem_resolve(b->addr, 1, &sp) && !sp.alloc) {
+        if (n > sp.avail) n = sp.avail;
+        VkBuffer buf;
+        VkDeviceSize off;
+        RS.volatile_ = 1;
+        if (ru_cap) ru_note_bad(RUB_VOLATILE);
+        uint8_t *dst = scratch(ex, CBW_BYTES, &buf, &off);
+        if (n) memcpy(dst, (const void *)(uintptr_t)b->addr, (size_t)n);
+        if (n < CBW_BYTES) memset(dst + n, 0, (size_t)(CBW_BYTES - n));
+        count_use(sp.cls, VK_MUSE_CPU_READ, n);
+        count_use(VK_MCLS_SCRATCH, VK_MUSE_SSBO, CBW_BYTES);
+        cbw_note(3);
+        return (VkDescriptorBufferInfo){buf, off, CBW_BYTES};
+    }
+    if (bind_range(ex, b->addr, CBW_BYTES, align, max, VK_MUSE_SSBO, 0, &bi)) {
+        if (bi.range > CBW_BYTES) bi.range = CBW_BYTES;
+        cbw_note(4);
+        return bi;
+    }
+    return zero_info(pad);
+}
+
+static VkDescriptorBufferInfo c1_cbw_info(VkExec *ex, const uint8_t *src, uint32_t c1_size, uint64_t max) {
+    cb_res(ex);
+    uint64_t pad = CBW_BYTES < max ? CBW_BYTES : max;
+    uint64_t n = c1_size < pad ? c1_size : pad;
+    if (!src || !n) return zero_info(pad);
+    if (ru_cap) ru_note_bad(RUB_VOLATILE);   // per-CB scratch cannot be reused across CBs
+    uint64_t addr = (uint64_t)(uintptr_t)src;
+    uint64_t ugen = ~0ull;   // immutable compiler constants; distinct from vk_usnap_gen()
+    uint32_t set = (uint32_t)((addr * 0x9E3779B97F4A7C15ull) >> 57) & (CBW_SETS - 1);
+    CbwEnt *ways = B.cbw[set];
+    for (int w = 0; w < CBW_WAYS; w++) {
+        const CbwEnt *e = &ways[w];
+        if (!e->buf) break;
+        if (e->addr == addr && e->n == n && e->usnap_gen == ugen) {
+            count_use(VK_MCLS_SCRATCH, VK_MUSE_SSBO, CBW_BYTES);
+            cbw_note(1);
+            return (VkDescriptorBufferInfo){e->buf, e->off, CBW_BYTES};
+        }
+    }
+    VkBuffer buf;
+    VkDeviceSize off;
+    uint8_t *dst = scratch(ex, CBW_BYTES, &buf, &off);
+    memcpy(dst, src, (size_t)n);
+    if (n < CBW_BYTES) memset(dst + n, 0, (size_t)(CBW_BYTES - n));
+    uint8_t slot_w = B.cbw_rr[set];
+    B.cbw_rr[set] = (uint8_t)((slot_w + 1) & (CBW_WAYS - 1));
+    ways[slot_w] = (CbwEnt){addr, n, ugen, buf, off, 0};
+    count_use(VK_MCLS_SCRATCH, VK_MUSE_SSBO, CBW_BYTES);
+    cbw_note(2);
+    return (VkDescriptorBufferInfo){buf, off, CBW_BYTES};
+}
+
+// as_storage: GFX_RES_UBO with flags 2 / STORAGE_BUFFER — SSBO align+max, pad to CBW_BYTES. Plain UBO keeps UBO limits.
+static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot, int as_storage) {
     ubo_kind = RUK_STABLE;
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
-    uint64_t max = LIM.ubo_max, align = LIM.ubo_align;
+    uint64_t max = as_storage ? LIM.sbo_max : LIM.ubo_max, align = as_storage ? LIM.sbo_align : LIM.ubo_align;
+    int use = as_storage ? VK_MUSE_SSBO : VK_MUSE_UBO;
     VkDescriptorBufferInfo bi;
     if (slot == 0 && c0_on()) return ubo_kind = RUK_C0, c0_info(ex, st);
     if (slot == 1 && ex->prog) {   // compiler constants stored after the shader code
@@ -205,20 +332,27 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         uint32_t len, c1_size, c1, total;
         if (find_stage(ex->prog, st, &ctl, &code, &len)) {
             memcpy(&c1_size, ctl + 0x3c, 4), memcpy(&c1, ctl + 0x40, 4), memcpy(&total, ctl + 0x44, 4);
-            if (c1_size && c1 < total && c1_size <= total - c1 &&
-                bind_range(ex, (uint64_t)(uintptr_t)code + c1, c1_size, align, max, VK_MUSE_UBO, 0, &bi))
-                return bi;
+            if (c1_size && c1 < total && c1_size <= total - c1) {
+                if (as_storage) return c1_cbw_info(ex, code + c1, c1_size, max);
+                if (bind_range(ex, (uint64_t)(uintptr_t)code + c1, c1_size, align, max, use, 0, &bi))
+                    return bi;
+            }
         }
     } else if (slot >= 3 && slot - 3 < 18) {
+        if (as_storage) {
+            ubo_kind = RUK_CBW;
+            return cbw_info(ex, &ex->ubo[st][slot - 3], align, max);
+        }
         const p_bind_buf *b = &ex->ubo[st][slot - 3];
         if (b->size && vk_usnap_find(b->addr, b->size < max ? b->size : max, align, &bi)) {   // as of the submit call
             count_use(VK_MCLS_SCRATCH, VK_MUSE_UBO, bi.range);
             ubo_kind = RUK_UBO;
             return bi;
+        } else if (bind_range(ex, b->addr, b->size, align, max, use, 0, &bi)) {
+            return bi;
         }
-        if (bind_range(ex, b->addr, b->size, align, max, VK_MUSE_UBO, 0, &bi)) return bi;
     }
-    return zero_info(max);
+    return zero_info(as_storage && CBW_BYTES < max ? CBW_BYTES : max);
 }
 
 // The NVN slot of a storage binding. Ryujinx numbers a shader's storage buffers in the order it meets them
@@ -506,7 +640,9 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
                 for (uint32_t k = 0; k < cnt; k++) {
                     int slot = r->slot + (int)k;
                     if (slot == 0 && c0_on()) c0 = 1, rs_add(tmp, &n, ex, ex->ssbo[st], sizeof ex->ssbo[st]);
-                    else if (slot >= 3 && slot - 3 < 18) rs_add_k(tmp, &n, ex, &ex->ubo[st][slot - 3], sizeof(p_bind_buf), 1);
+                    else if (slot >= 3 && slot - 3 < 18)
+                        rs_add_k(tmp, &n, ex, &ex->ubo[st][slot - 3], sizeof(p_bind_buf),
+                                 b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC);
                 }   // slot 1: the program (bind_sig); others: the zero buffer
             } else if (b->kind == GFX_RES_SSBO) {   // every descriptor of the binding is the same range
                 int ubo, slot = ssbo_slot(r, st, &ubo);
@@ -771,7 +907,9 @@ static int ubo_rebind(VkExec *ex, const VkPipeInfo *info) {
         for (uint32_t k = 0; k < cnt; k++) {
             VkDescriptorBufferInfo bi;
             if (b->kind == VK_PIPE_SUPPORT) bi = (VkDescriptorBufferInfo){B.sup_buf, B.sup_off, SUPPORT_BYTES};
-            else if (b->kind == GFX_RES_UBO) bi = ubo_info(ex, nvn_stage_of(b->stage), b->res->slot + (int)k);
+            else if (b->kind == GFX_RES_UBO)
+                bi = ubo_info(ex, nvn_stage_of(b->stage), b->res->slot + (int)k,
+                              b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || (b->res && (b->res->flags & 2)));
             else return 0;
             uint32_t j = nd[s]++;
             if (j >= DCB.n[s] || bi.buffer != DCB.buf[s][j] || bi.range != DCB.range[s][j] || bi.offset >> 32) return 0;
@@ -852,8 +990,9 @@ void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             if (ru_cap) ru_note_desc(nd, RUK_SUP, 0, 0);
             BR_MARK(BR_C0);
         } else if (b->kind == GFX_RES_UBO) {
+            int as_storage = b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || (r && (r->flags & 2));
             for (uint32_t k = 0; k < cnt; k++) {
-                o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
+                o[k].buffer = ubo_info(ex, st, r->slot + (int)k, as_storage);
                 if (ru_cap) ru_note_desc(nd + k, ubo_kind, st, r->slot + (int)k - 3);
                 BR_MARK(r->slot + (int)k < 3 ? BR_C0 : BR_UBO);
             }
@@ -1059,6 +1198,18 @@ int ru_ubo_ok(VkExec *ex, int st, int slot) {
     return b->size && vk_usnap_find(b->addr, b->size < LIM.ubo_max ? b->size : LIM.ubo_max, LIM.ubo_align, &bi);
 }
 
+int ru_cbw_ok(VkExec *ex, int st, int slot) {
+    if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
+    const p_bind_buf *b = &ex->ubo[st][slot];
+    if (!b->addr) return 1;
+    uint64_t pad = CBW_BYTES < LIM.sbo_max ? CBW_BYTES : LIM.sbo_max;
+    uint64_t n = b->size && b->size < pad ? b->size : pad;
+    VkDescriptorBufferInfo bi;
+    if (!b->size || !n || !vk_usnap_find(b->addr, n, 1, &bi)) return 0;
+    return (n == CBW_BYTES && CBW_BYTES <= LIM.sbo_max && bi.offset % LIM.sbo_align == 0) ||
+           vk_usnap_peek(b->addr, n, 1) != NULL;
+}
+
 // The descriptors of the cached draw's set s, with its c0, support and snapshot uniform blocks made again for this
 // command buffer and submission, bound through the draw cache as dc_bind binds a replayed draw's. The set the last hit
 // bound (rs) is bound again with the new dynamic offsets when every descriptor made again names the buffer and range it
@@ -1074,6 +1225,7 @@ int ru_bind_set(VkExec *ex, const VkPipeInfo *info, uint32_t s, VkDescSlot *ds, 
         switch (kind[j]) {
         case RUK_C0: c0_binst = c0_binst_, ds[j].buffer = c0_info(ex, kst[j]); break;
         case RUK_SUP: ds[j].buffer = support_info(ex); break;
+        case RUK_CBW: ds[j].buffer = ubo_info(ex, kst[j], kslot[j] + 3, 1); break;
         case RUK_UBO: {
             const p_bind_buf *b = &ex->ubo[kst[j]][kslot[j]];
             VkDescriptorBufferInfo bi;

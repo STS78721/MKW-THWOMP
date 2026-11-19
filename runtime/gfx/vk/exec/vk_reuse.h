@@ -21,7 +21,7 @@ void ru_log(void);   // MKW_TRACE=perf: hits, misses by cause
 // What a draw being captured resolves (ru_cap is set only then, on the replay thread).
 typedef struct RuCap RuCap;
 extern _Thread_local RuCap *ru_cap;
-enum { RUK_STABLE = 0, RUK_UBO, RUK_C0, RUK_SUP };   // a dynamic descriptor: what gives its buffer and offset
+enum { RUK_STABLE = 0, RUK_UBO, RUK_C0, RUK_SUP, RUK_CBW };   // a dynamic descriptor: what gives its buffer and offset
 enum { RUB_VOLATILE = 1, RUB_WRITTEN, RUB_UBO_PTR, RUB_STORAGE_IMG, RUB_SCRATCH_INDEX, RUB_NO_TPL, RUB_TOO_MANY };
 void ru_note_mem(uint64_t addr, uint64_t size, const VkMemSpan *sp, int ok);
 void ru_note_tex(uint64_t h, VkImage image, int storage);
@@ -34,6 +34,7 @@ void ru_note_set(const VkPipeInfo *info, uint32_t s, const VkDescSlot *ds, uint3
 // vk_exec_bind.c: binds a reused draw's set s again from its recorded descriptors, the ones of kind RUK_* other than
 // stable made again for this submission; 0 when one cannot be (its uniform block is not in this submission's copy).
 int ru_ubo_ok(VkExec *ex, int st, int slot);   // the uniform block at slot of stage st binds from this submission's copy
+int ru_cbw_ok(VkExec *ex, int st, int slot);   // the flags:2 word view at slot of stage st binds from snapshot or zero
 // The set a hit bound last, kept in its entry: the draw cache's set, a signature of the buffers it was bound with and
 // the cache's emptyings then (vk_dcache_epoch). ru_bind_set returns 2 when it bound that set again.
 typedef struct { VkDescriptorSet set; uint64_t sig, epoch; } RuSetMemo;

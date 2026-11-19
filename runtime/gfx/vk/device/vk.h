@@ -150,8 +150,11 @@ void vk_mv_jitter_px(uint64_t frame, float *x, float *y);
 int vk_dlss_wanted(void);
 int vk_dlss_active(void);
 // queues: Streamline's own, to make in the graphics family after the host's queue
-void vk_dlss_pre_device(uint32_t vendor, const char **ext, uint32_t *n_ext, uint32_t cap, uint32_t *queues);
-void vk_dlss_post_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t gfx_family);
+void vk_dlss_pre_device(uint32_t vendor, const VkExtensionProperties *avail, uint32_t n_avail, const char **ext,
+                        uint32_t *n_ext, uint32_t cap, uint32_t *queues);
+void vk_dlss_abort_pre_device(void);
+void vk_dlss_post_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t gfx_family,
+                         uint32_t gfx_queue_count);
 PFN_vkVoidFunction vk_dlss_proc(const char *name);
 PFN_vkVoidFunction vk_dlss_instance_proc(VkInstance inst, const char *name);   // with DLSS-G: the surface calls
 void vk_wait_device_idle(VkDevice dev);   // routes vkDeviceWaitIdle through Streamline's proxy when active
@@ -350,6 +353,8 @@ void vk_mem_lost_watch(const void *pool, uint64_t addr, uint64_t size, uint32_t 
 void vk_mem_lost_log(uint64_t frame);
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size);
 void vk_gpu_written(uint64_t addr, uint64_t size);
+uint64_t vk_merge_back_probe(int runs, int cw, uint64_t addr, uint64_t size, const uint8_t *s, const uint8_t *base,
+                             uint64_t *gpu);   // --probe-merge: one write-back by either implementation (vk_mem_merge.c)
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
                                           // 1 when it has one
 void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m);   // once
@@ -365,6 +370,7 @@ void vram_log_now(void);                                  // the "mem: vram" rep
 const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void);
 void vk_headroom_start(void);
 void vk_tex_pool_start(void);   // MKW_VK_TEX_POOL_MIN: texture memory made at start (vk_tex_image.c)
+void vk_tex_pool_stop(void);    // after image destruction, before destroying the VMA allocator
 void vk_headroom_stop(void);   // before vmaDestroyAllocator
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
 int vk_mem_virt_phys(uint64_t addr, uint64_t *phys);   // virtual pool page at addr: 1 and the GPU address it maps to
@@ -374,7 +380,10 @@ int vk_mem_virt_phys(uint64_t addr, uint64_t *phys);   // virtual pool page at a
 // queue lock held, before each graphics-queue submission: the changed bindings (binds), behind every earlier submission,
 // and the wait and signal of that submission on the sparse order timeline.
 void vk_texture_report(uint64_t addr);   // MKW_CTL "tex ADDR": textures over addr (vk_texture.c)
-int vk_sparse_create(const VkImageCreateInfo *ci, const nvn_texdesc *d, uint64_t addr, uint64_t size, VkImage *img);
+typedef struct { uint32_t first; VkImageAspectFlags aspect; VkDeviceSize zero_bytes; } VkSparseTail;
+int vk_sparse_create(const VkImageCreateInfo *ci, const nvn_texdesc *d, uint64_t addr, uint64_t size, VkImage *img,
+                     VkSparseTail *tail);
+void vk_sparse_shutdown(void);   // after textures, retired work and device idle; before the VMA allocator
 uint64_t vk_sparse_destroy(VkImage img);   // the submission its binds are done by (0: none)
 int vk_sparse_is(VkImage img);   // 1: img is a sparse image made by vk_sparse_create
 void vk_sparse_remap(uint64_t addr, uint64_t size);

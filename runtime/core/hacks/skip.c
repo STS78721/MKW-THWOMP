@@ -25,7 +25,11 @@ static int is_opening(const char *path) {
 }
 
 void skip_file_opened(const char *path) {
-    if (!is_opening(path) || !cfg_bool("MKW_SKIP_MOVIES")) return;   // the path first: every guest file open comes here
+    if (!is_opening(path)) return;   // the path first: every guest file open comes here
+    // Arm the cup guard as soon as the opening file opens (before VP9 init): the hang can start while the
+    // 2560 decoder is still live after a skip (RM-28 retest of 8e90582).
+    ov_cup_movie_begin(2560);
+    if (!cfg_bool("MKW_SKIP_MOVIES")) return;
     atomic_store_explicit(&since, frame_step_ticks() + 1, memory_order_relaxed);
     rt_log("skip: %s opened: pressing A until it ends (MKW_SKIP_MOVIES)", path);
 }

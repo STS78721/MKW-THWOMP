@@ -31,6 +31,15 @@ enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_A
 void warn_once(int key, const char *fmt, ...);   // vk_exec_draw.c
 
 // ---- the recording thread's state (vk_exec_draw.c)
+// Per-CB 4-way set-associative deduplication cache for flags:2 64 KiB word views (cbw_info, vk_exec_bind.c).
+#define CBW_SETS 128
+#define CBW_WAYS 4
+typedef struct {
+    uint64_t addr, n, usnap_gen;
+    VkBuffer buf;
+    VkDeviceSize off, snap_off;
+} CbwEnt;
+
 // State of the command buffer being recorded that the Vulkan command buffer itself holds.
 typedef struct {
     VkPipeline pipe[2];                  // bound per bind point: 0 graphics, 1 compute
@@ -60,6 +69,8 @@ typedef struct {
     VkDescriptorSetLayout ds_last_layout[2];
     int ds_pushed[2];                    // set number holds the push of DS.psig under ds_layout
     int res_valid;                       // the graphics sets bound hold what the inputs in RS give (bind_resources)
+    CbwEnt cbw[CBW_SETS][CBW_WAYS];      // deduplicated 64 KiB padded snapshot views in this command buffer
+    uint8_t cbw_rr[CBW_SETS];
 } DrawB;
 extern _Thread_local DrawB *dtl_b DRAW_SHARED;   // vk_exec_draw.c
 #define B (*dtl_b)

@@ -106,14 +106,18 @@ def declarations(b, stage: str, shape: tuple[int, int, int, int] | None) -> list
         nb += 1
         if n in b.cbufs_w:
             # The same bank as words for dynamic addresses (mem.cb_word), through a read-only storage view of its own
-            # binding (flags 2: the back end binds the bank's range to it as a storage buffer) and bounded by that
-            # range: a word past it reads 0, as the console's constant bank. Until 13/11/2026 this was a second uniform
-            # block on the bank's own binding (`scalar`, uint w[16384]), the only aliased binding of the translation,
-            # and NVIDIA (616-621, Turing to Blackwell) lost the device with "instruction pointer invalid" on draws of
-            # vertex shaders whose only difference from a sound twin was one more such read (issue #22, programs
-            # c74a0d4e / 852f48d6); the same pattern faulted in mkw-thwomp ("four reads of c9 at a computed index").
-            head.append(f"layout(std430, binding = {nb}) readonly buffer CB{n}W {{ uint w[]; }} cb{n}w;")
-            head.append(f"uint cb{n}w_at(uint i) {{ return i < uint(cb{n}w.w.length()) ? cb{n}w.w[i] : 0u; }}")
+            # binding (flags 2: the back end binds a full 64 KiB bank view as a storage buffer). Until 13/11/2026 this
+            # was a second uniform block on the bank's own binding (`scalar`, uint w[16384]), the only aliased binding
+            # of the translation, and NVIDIA (616-621, Turing to Blackwell) lost the device with "instruction pointer
+            # invalid" on draws of vertex shaders whose only difference from a sound twin was one more such read
+            # (issue #22, programs c74a0d4e / 852f48d6). 86e4204 moved it to `readonly buffer { uint w[]; }` +
+            # `.length()` (OpArrayLength); that still illegal-encodes on RTX 5070 Ti driver 621.24 mid-race
+            # (RM-28: bf0e0378 / c5d3832d and Shell Cup 1c7a765b). Fixed-size w[16384] + index clamp avoids
+            # OpArrayLength; the bind path pads the descriptor to 64 KiB.
+            head.append(f"layout(std430, binding = {nb}) readonly buffer CB{n}W {{ uint w[16384]; }} cb{n}w;")
+            # Guarded ternary with >= 16384u first: avoids nvgpucomp64.dll 621.24 cold-compile crash on 1c7a765b
+            # while never issuing an out-of-bounds read when i >= 16384u.
+            head.append(f"uint cb{n}w_at(uint i) {{ return i >= 16384u ? 0u : cb{n}w.w[i]; }}")
             refl["cbufs"].append({"binding": nb, "slot": n, "flags": 2})
             nb += 1
     for o in sorted(b.ssbos):

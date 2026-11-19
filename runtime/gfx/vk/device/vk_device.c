@@ -254,7 +254,7 @@ static int create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[48];   // every optional extension at once nears 32
+    const char *ext[64];   // every optional extension plus Streamline's
     uint32_t n_ext = 0;
     for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++) ext[n_ext++] = k_required_ext[i];
 
@@ -355,7 +355,6 @@ static int create_device(void) {
         gpl_link = tail;
         CHAIN(gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
     }
-    free(ep);
 
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
@@ -388,7 +387,7 @@ static int create_device(void) {
     else if (!h->independentBlend) miss = "independentBlend";
     else if (!h->geometryShader) miss = "geometryShader";
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
-    if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
+    if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(ep); free(c); return 0; }
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_placed = has_placed && c->placed.memoryMapPlaced && c->placed.memoryUnmapReserve;
     c->placed.memoryMapRangePlaced = VK_FALSE;   // whole allocations only
@@ -418,8 +417,10 @@ static int create_device(void) {
     }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &c->f2, .queueCreateInfoCount = nqi,
                              .pQueueCreateInfos = qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    uint32_t base_n_ext = n_ext;
     uint32_t sl_queues = 0;   // THWOMP: Streamline's extensions and queues (DLSS, DLSS frame generation)
-    vk_dlss_pre_device(g_vk.props.vendorID, ext, &n_ext, (uint32_t)(sizeof ext / sizeof *ext), &sl_queues);
+    vk_dlss_pre_device(g_vk.props.vendorID, ep, ne, ext, &n_ext, (uint32_t)(sizeof ext / sizeof *ext), &sl_queues);
+    free(ep);
     di.enabledExtensionCount = n_ext;
     if (sl_queues) {   // in the graphics family after ours, where it has them
         uint32_t nfam = 0;
@@ -434,12 +435,19 @@ static int create_device(void) {
     vk_guard_gpu_ok();
     VkResult r = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.device);
     if (vk_dlss_wanted()) rt_log("vk: vkCreateDevice with %u extensions: %d", n_ext, (int)r);
+    if (r != VK_SUCCESS && (n_ext > base_n_ext || qi[0].queueCount > 1)) {
+        rt_log("vk: vkCreateDevice with Streamline failed (%d): retrying without DLSS", (int)r);
+        vk_dlss_abort_pre_device();
+        di.enabledExtensionCount = base_n_ext;
+        qi[0].queueCount = 1;
+        r = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.device);
+    }
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
     vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 0, &g_vk.gfx_queue);
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }
-    vk_dlss_post_device(g_vk.instance, g_vk.phys, g_vk.device, g_vk.gfx_family);   // THWOMP: Streamline learns the device
+    vk_dlss_post_device(g_vk.instance, g_vk.phys, g_vk.device, g_vk.gfx_family, qi[0].queueCount);   // THWOMP: Streamline learns the device
 
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};
@@ -544,6 +552,8 @@ static void destroy_all(void) {
     if (g_vk.device) vk_astc_release(), vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
     vk_headroom_stop();
+    vk_tex_pool_stop();
+    vk_sparse_shutdown();
     if (g_vk.vma) vmaDestroyAllocator(g_vk.vma);
     if (g_vk.device) vkDestroyDevice(g_vk.device, NULL);
     if (g_vk.messenger) {

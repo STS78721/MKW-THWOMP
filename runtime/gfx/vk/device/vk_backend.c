@@ -786,6 +786,8 @@ void vk_backend_shutdown(void) {
     gfx_exit_log();
     vk_present_drain();
     vk_sync_shutdown();
+    vk_rtstats_shutdown();
+    vk_dump_shutdown();
     vk_mem_shutdown();
     vk_shutdown();
 }

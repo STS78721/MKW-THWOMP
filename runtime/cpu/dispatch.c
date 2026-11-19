@@ -13,6 +13,7 @@
 #include "dispatch.h"
 #include "host.h"
 #include "platform/platform.h"
+#include "sl_shim.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -56,7 +57,10 @@ void rt_fatal(const char *fmt, ...) {
            prv / 1048576.0, used, total);
     fflush(stdout);
     fflush(stderr);
-    _Exit(70);
+    // Clean Streamline/NGX teardown before ExitProcess: _Exit(70) left 160_E658703.bin null-deref dumps
+    // (0xc0000005 / 0xc0000409) as secondary teardown noise on VK_ERROR_DEVICE_LOST (RM-28).
+    sl_shim_shutdown();
+    plat_exit(70);
 }
 
 static const RtModule *module_at(uint64_t pc) {

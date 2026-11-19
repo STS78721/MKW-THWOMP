@@ -38,9 +38,10 @@ typedef struct {
 
 int sl_shim_init(const wchar_t *dir, int want_fg);   // dir: where sl.interposer.dll and the plugins are
 // The device extensions and the extra queues every loaded feature asks for (graphics and compute queues: in the
-// graphics family after the host's own queue)
-int sl_shim_requirements(const char *const **dev_ext, uint32_t *n_dev, const char *const **inst_ext, uint32_t *n_inst,
-                         uint32_t *gfx_queues, uint32_t *compute_queues);
+// graphics family after the host's own queue); avail/n_avail check device extension support before enabling them.
+int sl_shim_requirements(const VkExtensionProperties *avail, uint32_t n_avail, const char *const **dev_ext,
+                         uint32_t *n_dev, const char *const **inst_ext, uint32_t *n_inst, uint32_t *gfx_queues,
+                         uint32_t *compute_queues);
 // SL_SHIM_* bits of what runs on this device
 int sl_shim_set_vulkan(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t gfx_family, uint32_t gfx_index,
                        uint32_t compute_family, uint32_t compute_index);

@@ -393,9 +393,32 @@ static int pipe_skip_mode(void) {
 // the breadcrumb and "last programs" lines) starts with one of these are left out, each one logged the first time.
 // Why: issue #22's NVIDIA faults ("instruction pointer invalid") were each narrowed to one program by skipping it on a
 // reporter's debug branch (c74a0d4e at Star High Sundae, 1c7a765b in the Shell Cup); in the release every reporter can.
+//
+// RM-28: root-cause is flags&2 SSBO bind + OpArrayLength (head.py / ubo_info), not a growing VS blacklist.
+// Cup-guard hang-cluster skips removed. Optional narrow Shell Cup #22 pair remains behind cached MKW_NV_SKIP22
+// (default on) until the retranslated SPIR-V is verified; MKW_SKIP_PROGRAMS still stacks on top.
 #define SKIP_PROGS 16
 static struct { int n; uint8_t key[SKIP_PROGS][32]; uint8_t len[SKIP_PROGS]; int logged[SKIP_PROGS]; } SP = {.n = -1};
 static int hexval(char c) { return c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : -1; }
+
+// Narrow remnant only: original Shell Cup #22 VS pair (CHANGELOG). Mid-race bf0e0378/c5d3832d are fixed in translate+bind.
+static const uint8_t NV22_ALWAYS[][4] = {
+    {0x1c, 0x7a, 0x76, 0x5b},   // 1c7a765b
+    {0x94, 0x3e, 0x3d, 0x42},   // 943e3d42
+};
+static int nv22_logged;
+
+static int nv_skip22_on(void) {   // like c0_on: never getenv/cfg_bool per draw (UCRT)
+    static int on = -1;
+    if (on < 0) on = cfg_bool("MKW_NV_SKIP22");
+    return on;
+}
+
+static int key_pref4(const uint8_t *k, const uint8_t (*list)[4], size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (!memcmp(k, list[i], 4)) return 1;
+    return 0;
+}
 
 static int skip_listed(const GfxShader *vs, const GfxShader *fs) {
     if (SP.n < 0) {
@@ -424,6 +447,16 @@ static int skip_listed(const GfxShader *vs, const GfxShader *fs) {
                        s ? "fragment" : "vertex");
             return 1;
         }
+    VkCtx *ctx = vk_ctx();
+    if (!ctx || ctx->props.vendorID != 0x10de || !nv_skip22_on() || !vs) return 0;
+    const uint8_t *k = gfx_shader_key(vs);
+    if (key_pref4(k, NV22_ALWAYS, sizeof NV22_ALWAYS / sizeof *NV22_ALWAYS)) {
+        if (!__atomic_exchange_n(&nv22_logged, 1, __ATOMIC_RELAXED))
+            rt_log("vk_exec: NVIDIA #22 Shell Cup VS %02x%02x%02x%02x skipped (MKW_NV_SKIP22; narrow remnant until "
+                   "cbNw retranslate verified; RM-28)",
+                   k[0], k[1], k[2], k[3]);
+        return 1;
+    }
     return 0;
 }
 
@@ -489,16 +522,6 @@ int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int mesh) 
     }
     cb_res(ex);
     dummies_init();
-    if (ex->pass_noatt) {   // no attachment: the pass covers this draw's viewport or scissor, reopened when it needs more
-        uint32_t w, h;
-        vk_exec_noatt_dims(ex, &w, &h);
-        if (ex->in_pass && (w > ex->pass_w || h > ex->pass_h)) vk_exec_pass_end(ex);
-        if (!ex->in_pass) ex->rt_resolved = 0;
-    }
-    if (!ex->in_pass) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
-    vk_exec_pass_begin(ex);
-    VkRect2D sc = vk_exec_scissor(ex);
-    if (!sc.extent.width || !sc.extent.height) return vk_exec_frame.skip[VK_SKIP_SCISSOR]++, 0;
     if (!ex->prog) return vk_exec_frame.skip[VK_SKIP_PROGRAM]++, warn_once(W_PROGRAM, "a draw without a bound program is skipped"), 0;
     PD_MARK(PD_HEAD);
     int has_vs, has_fs, memo = mesh ? 0 : shader_memo_on();
@@ -527,7 +550,18 @@ int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int mesh) 
     // draw into per-frame targets is skipped until it is ready and comes back next frame.
     int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
     if (!vs || (has_fs && !fs)) return vk_exec_frame.skip[VK_SKIP_SHADER_MISSING]++, 0;
-    if (SP.n && skip_listed(vs, has_fs ? fs : NULL)) return 0;
+    // Skip before pass_begin so listed/NV_SKIP22 draws do not open an empty pass (RM-28).
+    if (skip_listed(vs, has_fs ? fs : NULL)) return vk_exec_frame.skip[VK_SKIP_LISTED]++, 0;
+    if (ex->pass_noatt) {   // no attachment: the pass covers this draw's viewport or scissor, reopened when it needs more
+        uint32_t w, h;
+        vk_exec_noatt_dims(ex, &w, &h);
+        if (ex->in_pass && (w > ex->pass_w || h > ex->pass_h)) vk_exec_pass_end(ex);
+        if (!ex->in_pass) ex->rt_resolved = 0;
+    }
+    if (!ex->in_pass) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
+    vk_exec_pass_begin(ex);
+    VkRect2D sc = vk_exec_scissor(ex);
+    if (!sc.extent.width || !sc.extent.height) return vk_exec_frame.skip[VK_SKIP_SCISSOR]++, 0;
     PD_MARK(PD_SHADER);
     uint32_t fbl = feedback_prepare(ex, fs);
     if (ru_cap) ru_note_fbl(fbl);

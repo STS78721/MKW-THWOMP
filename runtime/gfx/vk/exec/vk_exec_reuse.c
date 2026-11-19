@@ -557,8 +557,10 @@ static int sets_possible(VkExec *ex, const RuEnt *e) {
     for (int i = 0; i < e->nset; i++) {
         const RuSetH *h = (const RuSetH *)at;
         const uint8_t *k = at + sizeof *h + sizeof(VkDescSlot) * h->n;
-        for (uint32_t j = 0; j < h->n; j++)
+        for (uint32_t j = 0; j < h->n; j++) {
             if (k[j] == RUK_UBO && !ru_ubo_ok(ex, k[h->n + j], k[2 * h->n + j])) return RS2.miss_set++, 0;
+            if (k[j] == RUK_CBW && !ru_cbw_ok(ex, k[h->n + j], k[2 * h->n + j])) return RS2.miss_set++, 0;
+        }
         at += set_bytes(h->n);
     }
     return 1;

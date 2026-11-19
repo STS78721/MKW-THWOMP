@@ -106,6 +106,7 @@ typedef struct Dec {
     uint32_t id;
     vpx_codec_ctx_t vpx;
     int live;
+    uint16_t init_w, init_h;      // InitializeVp9Decoder size: cup openings are 1280+ wide
     uint64_t ready_ev;            // guest SystemEventType: submission ready
     uint64_t decoded, acquired;   // frames decoded so far; slots handed out so far
     uint64_t slot_ord[MAX_SLOTS]; // ordinal of the frame each slot holds (0: not acquired)
@@ -312,11 +313,43 @@ static Dec *pool_owner(uint64_t pool, int *slot) {
 
 // Result ReadDecoderOutputImageNv12(const PoolType *, unsigned index, u16 x, u16 y, u16 w, u16 h, void *luma,
 // size_t luma_pitch, size_t luma_size, void *chroma, size_t chroma_pitch, size_t chroma_size)
-static volatile uint64_t movie_at;   // 1 + the tick of the last frame read of a full-screen movie; 0 none yet
+static volatile uint64_t movie_at;        // 1 + the tick of the last frame read of a full-screen movie; 0 none yet
+static volatile int32_t cup_live;         // live full-screen (cup) VP9 decoders / openings
+static volatile uint64_t cup_began_at;    // 1 + the tick the cup guard armed; 0 none
+static volatile uint64_t cup_ended_at;    // 1 + the tick the last full-screen decoder was finalized; 0 none
+enum { CUP_SETTLE_TICKS = 300 };          // ~5 s after end: race-start load after a skip (RM-28)
 
 int ov_movie_playing(void) {
     uint64_t at = movie_at;
     return at && frame_step_ticks() + 1 - at < 30;
+}
+
+int ov_cup_movie_guard(void) {
+    if (__atomic_load_n(&cup_live, __ATOMIC_RELAXED) > 0) {
+        uint64_t began = cup_began_at;
+        if (ov_movie_playing() || !began || frame_step_ticks() + 1 - began < 1200) return 1;
+        __atomic_store_n(&cup_live, 0, __ATOMIC_RELAXED);
+    }
+    uint64_t at = cup_ended_at;
+    return at && frame_step_ticks() + 1 - at < CUP_SETTLE_TICKS;
+}
+
+void ov_cup_movie_begin(uint32_t w) {
+    if (w < 1280) return;   // ad boards stay small; cup openings are 2560x1440 (or 1280+)
+    // Idempotent: Op.webm open and VP9 init both call this; stay armed until the matching end.
+    int was = __atomic_exchange_n(&cup_live, 1, __ATOMIC_RELAXED);
+    cup_ended_at = 0;
+    if (!was) {
+        cup_began_at = frame_step_ticks() + 1;
+        rt_log("codec: full-screen movie begin (%ux): cup guard on (DLSS-G hold + NVIDIA hang-cluster skips; RM-28)", w);
+    }
+}
+
+void ov_cup_movie_end(uint32_t w) {
+    if (w < 1280) return;
+    __atomic_store_n(&cup_live, 0, __ATOMIC_RELAXED);
+    cup_ended_at = frame_step_ticks() + 1;
+    rt_log("codec: full-screen movie end (%ux): cup guard settle %d ticks", w, CUP_SETTLE_TICKS);
 }
 
 static void ov_read_nv12(Cpu *c) {
@@ -371,6 +404,7 @@ static void vp9_init(Cpu *c, uint8_t *o, uint32_t w, uint32_t h) {
     if (!vpx_open(d)) rt_fatal("codec: libvpx VP9 decoder init failed");
     plat_mutex_lock(&lock);
     d->id = next_id++;
+    d->init_w = (uint16_t)w, d->init_h = (uint16_t)h;
     d->next = decs, decs = d;
     plat_mutex_unlock(&lock);
     d->ready_ev = event_new(c);
@@ -379,6 +413,7 @@ static void vp9_init(Cpu *c, uint8_t *o, uint32_t w, uint32_t h) {
     uint32_t magic = DEC_MAGIC;
     memcpy(o + 8, &magic, 4), memcpy(o + 12, &d->id, 4);
     rt_log("codec: VP9 decoder %u (%ux%u) on the host", d->id, w, h);
+    ov_cup_movie_begin(w);   // RM-28: arm before the first frame (skip can race-load while the decoder is still live)
 }
 // Result InitializeVp9Decoder(Vp9DecoderType *, void *work, size_t, size_t, u16 w, u16 h, unsigned, in, out)
 static void ov_vp9_init_work(Cpu *c) { vp9_init(c, arg_p(c, 0), (uint16_t)arg_x(c, 4), (uint16_t)arg_x(c, 5)); ret_x(c, 0); }
@@ -388,6 +423,9 @@ static void ov_vp9_init(Cpu *c) { vp9_init(c, arg_p(c, 0), (uint16_t)arg_x(c, 3)
 static void ov_vp9_fini(Cpu *c) {
     Dec *d = dec_of(c, 0);
     uint8_t *o = arg_p(c, 0);
+    uint32_t cup_w = d->init_w;
+    for (int i = 0; i < d->nframes; i++)
+        if (d->frames[i].w > cup_w) cup_w = d->frames[i].w;
     plat_mutex_lock(&lock);
     for (Dec **pp = &decs; *pp; pp = &(*pp)->next)
         if (*pp == d) { *pp = d->next; break; }
@@ -405,6 +443,7 @@ static void ov_vp9_fini(Cpu *c) {
     rt_log("codec: VP9 decoder %u finalized", d->id);
     free(d);
     skip_movie_closed();   // core/hacks/skip.c: MKW_SKIP_MOVIES stops pressing
+    ov_cup_movie_end(cup_w);   // RM-28: keep guard through race-start settle
     ret_x(c, 0);
 }
 

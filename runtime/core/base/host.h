@@ -306,6 +306,10 @@ void ctl_run(char *line);                                  // one ctl command no
 void rt_shot_request(const char *path);                    // the next presented frame to path, full size (boot.c)
 void gfx_aspect_set(float a);  // gfx_present.c, from patches.c: MKW_ASPECT's width / height when wider than 16:9, else 0
 int ov_movie_playing(void);  // ov_codec.c: a full-screen movie (1280 wide or more) gave a frame in the last half second
+// ov_codec.c: cup opening is live or in the post-end settle (RM-28). Hold DLSS-G off and skip hang-cluster draws.
+int ov_cup_movie_guard(void);
+void ov_cup_movie_begin(uint32_t w);   // VP9 init / Op.webm open: arm guard for full-screen openings
+void ov_cup_movie_end(uint32_t w);     // VP9 finalize: keep guard through settle ticks
 uint64_t frame_step_ticks(void);                           // game time since the first present in 60 Hz ticks (input scripts)
 // In-launch A/B measurement: MKW_AB=<seconds> splits the world clock (frame_step_world_us) into blocks of that much
 // game time in the order A B B A (repeated; B A A B with MKW_AB_INVERT=1); rt_ab() is 1 in the B blocks, 0 in A
@@ -321,6 +325,9 @@ void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTe
                                                            // present interval (60 Hz ticks)
 void frame_rate_host(uint64_t patch_page);                 // game.c MKW_FPS: register its host function (patches.c)
 void frame_rate_init(uint64_t patch_page);                 // and point the frame object's vtable slot at it
+void race_scene_host(uint64_t patch_page);                 // race_scene.c: register its host function (patches.c)
+void race_scene_init(uint64_t patch_page);                 // point the race nodes' start slots at it (after seqwatch)
+int race_scene_on(void);                                   // the game is in a race (pipeline cache autosave waits)
 // ---- boot (boot.c, main.c)
 typedef struct { const char *exefs, *romfs, *profile; int boot; double seconds; const char *shot, *gpu, *profile_base; } RtConfig;
                                                            // profile: the player's folder (core/base/players.h);
@@ -344,5 +351,6 @@ int probe_window(void);                                    // gfx_window_probe.c
 int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // tex_probe.c, vk_exec_probe.c, astc_probe.c
 int probe_texpre(void);                                    // texpre_probe.c: GPU BC7 against bc7enc on game textures
 int probe_framegen(void);                                  // fg_probe.c: frame generation on two pictures
+int probe_merge(void);                                     // merge_probe.c: the shadow write-back's two implementations
 
 int vk_texpre_encode(void);                                  // vk_texpre.c: --texpre (BC7 of the recorded ASTC textures)

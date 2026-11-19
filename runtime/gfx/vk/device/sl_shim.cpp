@@ -39,6 +39,7 @@ extern "C" {
 namespace {
 HMODULE g_mod;
 bool g_init, g_want_fg;
+volatile LONG g_sl_shutting_down;
 int g_have;   // SL_SHIM_* that run
 PFun_slInit *p_init;
 PFun_slShutdown *p_shutdown;
@@ -112,6 +113,12 @@ sl::FrameToken *token(uint32_t frame) {
 // the extensions of every loaded feature, without repeats (they outlive the call: plugin-owned strings)
 const char *g_dev_ext[64], *g_inst_ext[32];
 uint32_t g_n_dev, g_n_inst;
+bool has_dev_ext(const VkExtensionProperties *avail, uint32_t n_avail, const char *name) {
+    if (!strcmp(name, "VK_EXT_buffer_device_address")) return true;   // skipped in vk_dlss.c (KHR core 1.2)
+    for (uint32_t i = 0; i < n_avail; i++)
+        if (!strcmp(avail[i].extensionName, name)) return true;
+    return false;
+}
 void add(const char **list, uint32_t &n, uint32_t cap, const char *const *ext, uint32_t ne) {
     for (uint32_t i = 0; i < ne; i++) {
         bool have = false;
@@ -179,20 +186,29 @@ extern "C" int sl_shim_init(const wchar_t *dir, int want_fg) {
         rt_log("dlss: slInit failed (%d): DLSS unavailable", (int)r);
         return 0;
     }
+    InterlockedExchange(&g_sl_shutting_down, 0);
     g_init = true;
     rt_log("dlss: Streamline %d.%d.%d ready (manual hooking, no over-the-air updates%s)", SL_VERSION_MAJOR, SL_VERSION_MINOR,
            SL_VERSION_PATCH, g_want_fg ? "; DLSS frame generation, Reflex and PCL loaded" : "");
     return 1;
 }
 
-extern "C" int sl_shim_requirements(const char *const **dev_ext, uint32_t *n_dev, const char *const **inst_ext,
-                                    uint32_t *n_inst, uint32_t *gfx_queues, uint32_t *compute_queues) {
+extern "C" int sl_shim_requirements(const VkExtensionProperties *avail, uint32_t n_avail, const char *const **dev_ext,
+                                    uint32_t *n_dev, const char *const **inst_ext, uint32_t *n_inst,
+                                    uint32_t *gfx_queues, uint32_t *compute_queues) {
     if (!g_init) return 0;
     sl::FeatureRequirements req{};
     sl::Result r = p_reqs(sl::kFeatureDLSS, req);
     if (r != sl::Result::eOk) {
         rt_log("dlss: no requirements for DLSS (%d): unavailable", (int)r);
         return 0;
+    }
+    for (uint32_t i = 0; i < req.vkNumDeviceExtensions; i++) {
+        if (!has_dev_ext(avail, n_avail, req.vkDeviceExtensions[i])) {
+            rt_log("dlss: GPU/driver lacks device extension %s: DLSS unavailable, falling back to FSR 1",
+                   req.vkDeviceExtensions[i]);
+            return 0;
+        }
     }
     g_n_dev = g_n_inst = 0;
     add(g_dev_ext, g_n_dev, 64, req.vkDeviceExtensions, req.vkNumDeviceExtensions);
@@ -206,20 +222,37 @@ extern "C" int sl_shim_requirements(const char *const **dev_ext, uint32_t *n_dev
     if (g_want_fg) {
         static const sl::Feature more[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
         static const char *const names[] = {"DLSS frame generation", "Reflex", "PCL"};
+        sl::FeatureRequirements fq[3]{};
+        bool fg_ok = true;
         for (int i = 0; i < 3; i++) {
-            sl::FeatureRequirements q{};
-            if (p_reqs(more[i], q) != sl::Result::eOk) {
+            if (p_reqs(more[i], fq[i]) != sl::Result::eOk) {
                 rt_log("dlss: no requirements for %s: DLSS frame generation unavailable", names[i]);
-                g_want_fg = false;
-                continue;
+                fg_ok = false;
+                break;
             }
-            // optical flow runs in interop mode: its own queue family is not made (ProgrammingGuideManualHooking 5.2.1)
-            rt_log("dlss: %s asks for %u graphics, %u compute, %u optical flow queues, %u device extensions", names[i],
-                   q.vkNumGraphicsQueuesRequired, q.vkNumComputeQueuesRequired, q.vkNumOpticalFlowQueuesRequired,
-                   q.vkNumDeviceExtensions);
-            add(g_dev_ext, g_n_dev, 64, q.vkDeviceExtensions, q.vkNumDeviceExtensions);
-            add(g_inst_ext, g_n_inst, 32, q.vkInstanceExtensions, q.vkNumInstanceExtensions);
-            gq += q.vkNumGraphicsQueuesRequired, cq += q.vkNumComputeQueuesRequired;
+            for (uint32_t j = 0; j < fq[i].vkNumDeviceExtensions; j++) {
+                if (!has_dev_ext(avail, n_avail, fq[i].vkDeviceExtensions[j])) {
+                    rt_log("dlss: GPU/driver lacks device extension %s for %s: DLSS frame generation unavailable",
+                           fq[i].vkDeviceExtensions[j], names[i]);
+                    fg_ok = false;
+                    break;
+                }
+            }
+            if (!fg_ok) break;
+        }
+        if (!fg_ok) {
+            g_want_fg = false;
+        } else {
+            for (int i = 0; i < 3; i++) {
+                const sl::FeatureRequirements &q = fq[i];
+                // optical flow runs in interop mode: its own queue family is not made (ProgrammingGuideManualHooking 5.2.1)
+                rt_log("dlss: %s asks for %u graphics, %u compute, %u optical flow queues, %u device extensions", names[i],
+                       q.vkNumGraphicsQueuesRequired, q.vkNumComputeQueuesRequired, q.vkNumOpticalFlowQueuesRequired,
+                       q.vkNumDeviceExtensions);
+                add(g_dev_ext, g_n_dev, 64, q.vkDeviceExtensions, q.vkNumDeviceExtensions);
+                add(g_inst_ext, g_n_inst, 32, q.vkInstanceExtensions, q.vkNumInstanceExtensions);
+                gq += q.vkNumGraphicsQueuesRequired, cq += q.vkNumComputeQueuesRequired;
+            }
         }
     }
     *dev_ext = g_dev_ext, *n_dev = g_n_dev;
@@ -432,7 +465,8 @@ extern "C" void sl_shim_fg_clear_tags(VkCommandBuffer cb, uint32_t frame_index, 
 }
 
 extern "C" void sl_shim_shutdown(void) {
-    if (g_init && p_shutdown) p_shutdown();
+    if (!g_init || InterlockedExchange(&g_sl_shutting_down, 1)) return;
+    if (p_shutdown) p_shutdown();
     g_init = false;
     g_have = 0;
 }
@@ -774,8 +808,9 @@ extern "C" int sl_shim_fg_preset_write(int preset) {
 
 extern "C" {
 int sl_shim_init(const wchar_t *, int) { return 0; }
-int sl_shim_requirements(const char *const **dev_ext, uint32_t *n_dev, const char *const **inst_ext, uint32_t *n_inst,
-                         uint32_t *gfx_queues, uint32_t *compute_queues) {
+int sl_shim_requirements(const VkExtensionProperties *, uint32_t, const char *const **dev_ext, uint32_t *n_dev,
+                         const char *const **inst_ext, uint32_t *n_inst, uint32_t *gfx_queues,
+                         uint32_t *compute_queues) {
     if (dev_ext) *dev_ext = nullptr;
     if (n_dev) *n_dev = 0;
     if (inst_ext) *inst_ext = nullptr;

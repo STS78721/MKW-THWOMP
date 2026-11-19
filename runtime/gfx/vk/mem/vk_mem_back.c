@@ -224,7 +224,7 @@ uint64_t chunk_len(const PoolRec *r, uint32_t i) {
     return r->size - lo < ch ? r->size - lo : ch;
 }
 
-int64_t phys_backed_n, phys_backed_bytes, phys_failed_n;   // phys_lock
+int64_t phys_backed_n, phys_backed_bytes, phys_failed_n, phys_host_n;   // phys_lock
 
 // Serializes chunk allocation: made outside pool_lock (the zero fill records an upload) and published under it.
 PlatMutex phys_lock = PLAT_MUTEX_INIT;
@@ -251,7 +251,8 @@ static int alloc_chunk(VkCtx *c, uint64_t size, PhysChunk *out) {
     VkMemoryRequirements req = {.size = (rb.size + align - 1) & ~(align - 1), .alignment = align, .memoryTypeBits = bits};
     // Chunks share VMA blocks; a pool taken whole (MKW_PHYS_CHUNK=0) gets memory of its own as before.
     VmaAllocationCreateInfo aci = {.flags = size > (64ull << 20) ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0,
-                                   .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
+                                   .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                   .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
     res = vmaAllocateMemory(c->vma, &req, &aci, &out->alloc, NULL);
     // Out of memory: released and idle textures go first, as for a texture or a staging buffer (vk_texture_trim).
     // Steam Deck, 13/11/2026 (1 GB UMA carve-out, low preset, time trial): released render targets held 2 601 MiB
@@ -261,10 +262,19 @@ static int alloc_chunk(VkCtx *c, uint64_t size, PhysChunk *out) {
         vk_mem_collect();
         res = vmaAllocateMemory(c->vma, &req, &aci, &out->alloc, NULL);
     }
+    // Still full: system memory, slower but drawn. A chunk left without memory read as unmapped pages, and what
+    // the game had placed there drew wrong (dark bands/flicker when VRAM is full).
+    if (res == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        aci.requiredFlags = 0;
+        res = vmaAllocateMemory(c->vma, &req, &aci, &out->alloc, NULL);
+        if (res == VK_SUCCESS && phys_host_n++ < 4)
+            rt_log("vk: physical pool chunk of %#llx bytes in memory outside the GPU's own (device-local full)",
+                   (unsigned long long)size);
+    }
     if (res != VK_SUCCESS ||
         (res = vmaBindBufferMemory(c->vma, out->alloc, out->buf)) != VK_SUCCESS) {
-        rt_log("vk: physical pool chunk of %#llx bytes: device-local allocation failed (%d)", (unsigned long long)size,
-               (int)res);
+        rt_log("vk: physical pool chunk of %#llx bytes: %s allocation failed (%d)", (unsigned long long)size,
+               aci.requiredFlags ? "device-local" : "any memory", (int)res);
         if (out->alloc) vmaFreeMemory(c->vma, out->alloc);
         vkDestroyBuffer(c->device, out->buf, NULL);
         *out = (PhysChunk){0};

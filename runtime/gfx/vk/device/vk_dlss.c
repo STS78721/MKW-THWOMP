@@ -62,6 +62,7 @@ static struct {
     uint32_t ms_n, qp_used;   // qp_used: bit per slot with stamps written
     int have;                 // SL_SHIM_* that run on the device
     uint32_t sl_gfx_queues;   // Streamline's own queues, after ours in the graphics family
+    uint32_t sl_compute_queues;
     uint32_t fg_max;          // DLSS-G: the most frames it makes per game frame (numFramesToGenerateMax), 0 unknown
     int fg_tagged;            // this frame's DLSS ran with frame generation's tags
     uint32_t fg_set;          // the frames last asked of the plugin (0 off), ~0u never
@@ -73,8 +74,12 @@ int vk_dlss_wanted(void) { return !strcmp(cfg_value("MKW_UPSCALER"), "dlss"); }
 
 // vk_device.c create_device, before vkCreateDevice: Streamline starts and its device extensions join ext (at most cap);
 // *queues: the queues it wants made in the graphics family after ours (DLSS frame generation's)
-void vk_dlss_pre_device(uint32_t vendor, const char **ext, uint32_t *n_ext, uint32_t cap, uint32_t *queues) {
+void vk_dlss_pre_device(uint32_t vendor, const VkExtensionProperties *avail, uint32_t n_avail, const char **ext,
+                        uint32_t *n_ext, uint32_t cap, uint32_t *queues) {
     *queues = 0;
+    D.sl_gfx_queues = 0;
+    D.sl_compute_queues = 0;
+    D.started = 0;
     D.wanted = vk_dlss_wanted();
     if (!D.wanted) return;
     if (vendor != 0x10de) {
@@ -94,14 +99,18 @@ void vk_dlss_pre_device(uint32_t vendor, const char **ext, uint32_t *n_ext, uint
     if (!sl_shim_init(dir, fg)) return;
     const char *const *de = NULL, *const *ie = NULL;
     uint32_t nd = 0, ni = 0, gq = 0, cq = 0;
-    if (!sl_shim_requirements(&de, &nd, &ie, &ni, &gq, &cq)) return;
+    if (!sl_shim_requirements(avail, n_avail, &de, &nd, &ie, &ni, &gq, &cq)) {
+        sl_shim_shutdown();
+        return;
+    }
     // Streamline's queues (DLSS-G presents on one of its own): graphics then compute, in our graphics family
     // (graphics queues do compute too) after our own queue
     if (gq + cq > 15) {
         rt_log("dlss: Streamline asks for %u graphics and %u compute queues: too many, DLSS unavailable", gq, cq);
+        sl_shim_shutdown();
         return;
     }
-    D.sl_gfx_queues = gq;
+    uint32_t orig_n_ext = *n_ext;
     if (gq || cq) rt_log("dlss: %u graphics and %u compute queues for Streamline", gq, cq);
     for (uint32_t i = 0; i < ni; i++) rt_log("dlss: Streamline asks for instance extension %s", ie[i]);
     for (uint32_t i = 0; i < nd; i++) {
@@ -112,20 +121,37 @@ void vk_dlss_pre_device(uint32_t vendor, const char **ext, uint32_t *n_ext, uint
         if (have) continue;
         if (*n_ext == cap) {
             rt_log("dlss: no room for device extension %s: DLSS unavailable", de[i]);
+            *n_ext = orig_n_ext;
+            sl_shim_shutdown();
             return;
         }
         ext[(*n_ext)++] = de[i];
         rt_log("dlss: device extension %s for Streamline", de[i]);
     }
+    D.sl_gfx_queues = gq;
+    D.sl_compute_queues = cq;
     *queues = gq + cq;
     D.started = 1;
 }
 
+void vk_dlss_abort_pre_device(void) {
+    if (!D.started) return;
+    D.started = 0;
+    D.sl_gfx_queues = 0;
+    D.sl_compute_queues = 0;
+    sl_shim_shutdown();
+}
+
 // vk_device.c, right after vkCreateDevice (vk_ctx() is not set yet)
-void vk_dlss_post_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t gfx_family) {
+void vk_dlss_post_device(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t gfx_family,
+                         uint32_t gfx_queue_count) {
     if (!D.started) return;
     D.dev = dev;
-    D.have = sl_shim_set_vulkan(inst, phys, dev, gfx_family, 1, gfx_family, 1 + D.sl_gfx_queues);
+    uint32_t gfx_idx = (D.sl_gfx_queues > 0 && 1 < gfx_queue_count) ? 1 : 0;
+    uint32_t cmp_idx = (D.sl_compute_queues > 0 && 1 + D.sl_gfx_queues < gfx_queue_count) ? (1 + D.sl_gfx_queues) : 0;
+    if ((D.sl_gfx_queues || D.sl_compute_queues) && 1 + D.sl_gfx_queues + D.sl_compute_queues > gfx_queue_count)
+        rt_log("dlss: graphics family has %u queue(s); Streamline sharing queue 0", gfx_queue_count);
+    D.have = sl_shim_set_vulkan(inst, phys, dev, gfx_family, gfx_idx, gfx_family, cmp_idx);
     D.ok = (D.have & SL_SHIM_DLSS) != 0;
     if (D.have & SL_SHIM_FG) {
         uint32_t mx = 0;
@@ -187,7 +213,9 @@ uint32_t vk_dlssg_take_presented(void) { return __atomic_exchange_n(&g_fg_overla
 // open (docs/ProgrammingGuideDLSS_G.md 6.4)
 void vk_dlssg_present(uint32_t frames, int hdr) {
     if (!(D.have & SL_SHIM_FG)) return;
-    uint32_t want = D.fg_tagged && !hdr && !menu_is_open() ? frames : 0;
+    // Hold FG off for the whole cup opening + post-end settle (ov_cup_movie_guard): retest of 8e90582 hung while the
+    // 2560 decoder was still live, so end-only settle never armed. 5x / THWOMP FG gate / compose path stay.
+    uint32_t want = D.fg_tagged && !hdr && !menu_is_open() && !ov_cup_movie_guard() ? frames : 0;
     D.fg_tagged = 0;
     if (want != D.fg_set &&
         sl_shim_fg_set(want, D.fg_in_w, D.fg_in_h, D.fg_out_w, D.fg_out_h, (uint32_t)vk_present_image_count())) {
