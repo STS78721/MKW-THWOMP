@@ -6,7 +6,47 @@ its issue, #N), `### Tested` (what was run from the packages before publishing) 
 
 ## Unreleased
 
-(empty — next work after 0.2.2c)
+(empty — next work after 0.2.3)
+
+## MKW-THWOMP 0.2.3
+
+MKW-THWOMP 0.2.3
+
+Performance, memory reliability, and diagnostics release focused on smoother frame pacing, driver fallback resilience for missing geometry on Windows, accurate sub-page GPU render write-backs, lower shader variant RAM usage, and cleaner crash/setup handling. Safe shipped defaults remain FSR, Frame Generation Off, and Presentation Mailbox.
+
+■ Major Updates
+
+- Faster Vulkan descriptor recording and cleaner parallel replay: template-based descriptor set writes now run off the replay thread on the recorder thread (`MKW_REC_SET_WRITE`), and parallel replay chunks deduplicate GPU-written memory ranges so each range is tracked and written back once per submission (`MKW_REPLAY_PAR_WSHARE`).
+- Automatic shadow-memory fallback when a graphics driver refuses host-memory pool imports (`VK_ERROR_INVALID_EXTERNAL_HANDLE`): instead of binding a zero buffer and dropping track geometry or props (seen on some AMD Windows drivers such as RX 5700 XT / RX 7600), refused pools now seamlessly fall back to shadow storage.
+- Fixed sub-page GPU render-target write-backs (`MKW_TEX_WB_BYTES`): small GPU-rendered pitch textures that share a 4 KiB memory page with CPU-written neighbors now compare their own bytes instead of the whole page, so neighboring CPU writes no longer discard GPU renders.
+
+■ New & Improvements
+
+○ Performance & Memory
+
+- Reduced C heap usage by shrinking long-lived integer-I/O and integer-image SPIR-V shader variant buffers to their exact word size after rewriting.
+- Kept whole-range VRAM mirror write-backs as the default (`MKW_MIRROR_MERGE=0`) for steady frame pacing, with an optional GPU byte-merged write-back compute path (`MKW_MIRROR_MERGE=1`, runtime-gated on `storageBuffer8BitAccess` and descriptor-indexing support) available opt-in.
+- Added optional multi-threaded fence write-backs (`MKW_WB_PAR`, off by default) for shadow-backed pools, with shared locking during lazy-base comparisons.
+- Added optional cascaded shadow-map skipping (`MKW_SHADOW_DRAWS=auto|0`, full shadows on by default) to ease CPU/GPU load in 3–4 player split-screen races.
+
+○ Diagnostics, Setup & Crash Reporting
+
+- Startup logs now record Windows hardware-enforced stack protection (CET shadow stacks) status and early guest thread exits to help diagnose silent Windows fast-fail exits (`0xC0000409`).
+- Improved last-run crash detection so unrecovered GPU hangs followed by a window close, as well as shutdown faults occurring after the window closes, are flagged accurately instead of marked clean (while recovered slow frames stay clean).
+- Fixed Setup stdout encoding (`prepare.py`) to always emit UTF-8 so accented, non-ASCII, and CJK dump or install paths display and log cleanly without pipe encoding errors.
+
+■ Other
+
+- No game-code ABI change (`mkwgame.id` unchanged at `0b58f80e2b894c32`) and no shader translator changes: existing installs upgrade in-place with no game rebuild or shader re-translation required.
+- Personal settings, dumps, shader caches, saves, and logs are never included in any release package.
+
+■ Update
+
+- From `0.2.2c`, `0.2.2b`, `0.2.2`, `0.2.1b`, `0.1.2`, or `0.1.1`: open the start screen (if **Show launcher on startup** is off, run `mkw.exe --launcher` or re-enable it in F1 → Menu). It offers **`0.2.3`** and installs it automatically. You can also extract `SteelTemple-MKW-THWOMP-0.2.3-Update.zip` over your game folder.
+- New install: run `SteelTemple-MKW-THWOMP-0.2.3-Full-Setup-Wizard.exe`, then open the start screen, choose Game files, select your dump, press Set up, and press Play.
+- Portable: extract `SteelTemple-MKW-THWOMP-0.2.3-Portable-StandAlone.zip` anywhere, run `mkw.exe`, and set up the same way.
+
+Your dump, saves, and personal settings stay on your PC.
 
 ## MKW-THWOMP 0.2.2c
 

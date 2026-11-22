@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#-requirements)
 [![Vulkan](https://img.shields.io/badge/Vulkan-1.3-AC162C?style=for-the-badge&logo=vulkan&logoColor=white)](#-under-the-hood)
 [![Game version](https://img.shields.io/badge/game-1.0.0%20%7C%201.8.0-E60012?style=for-the-badge)](#-quick-start)
-[![Release](https://img.shields.io/badge/release-0.2.2c-E60012?style=for-the-badge)](#-quick-start)
+[![Release](https://img.shields.io/badge/release-0.2.3-E60012?style=for-the-badge)](#-quick-start)
 [![Status](https://img.shields.io/badge/status-races%20at%2060%20fps-2ea44f?style=for-the-badge)](#-status)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](#-credits--licence)
 
