@@ -258,6 +258,9 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c));
 // Windows: is hardware-enforced stack protection (CET shadow stacks) on for this process: 1 yes, 0 no, -1 not
 // reported (older Windows, and always on Linux). Logged at start: a silent 0xC0000409 exit was seen only on Windows.
 int plat_shadow_stack(void);
+// Windows: 1 when running in a remote or non-console session (e.g. Duo / RDP multi-session streaming), 0 on the active
+// console session (and always on Linux).
+int plat_remote_session(void);
 int plat_mem_read(uint64_t addr, void *out, size_t n);    // copies n bytes, 0 instead of faulting on unmapped memory
 int plat_mem_readable(uint64_t addr, uint64_t n);         // every page of [addr, addr + n) can be read; no fault
 void *plat_aligned_alloc(size_t size, size_t align);      // free with plat_aligned_free; NULL on failure

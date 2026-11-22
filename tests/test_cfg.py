@@ -19,3 +19,8 @@ def test_menu_settings_are_known_keys() -> None:
     menu = set(re.findall(r'\{"([A-Z0-9_]+)", "[^"]*", "[^"]*", (?:LIVE|RESTART)', SRC))
     assert menu, "the menu's settings table was not found"
     assert not menu - known, f"menu settings missing from known[]: {sorted(menu - known)}"
+
+
+def test_pad_backend_setting_defaults() -> None:
+    assert '{"PAD_BACKEND", "input"}' in SRC
+    assert '{"PAD_BACKEND", "auto", "auto|xinput|all", RESTART}' in SRC

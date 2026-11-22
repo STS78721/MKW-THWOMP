@@ -46,7 +46,7 @@ static const char *const known[] = {
     "MENU_TEST_DIR", "MENU_TEST_SET", "MINIMAL_LAYOUT", "MIRROR_GAP", "MIRROR_MERGE", "MIRROR_MERGE_ALL", "MIRROR_MERGE_CENSUS", "MIRROR_MERGE_TIME", "MODS", "MODS_ACK", "MODS_PLAYED", "MOTION",
     "KEYBOARD", "MOUSE_SENS", "PLAYER",   // PLAYER: the launcher's choice (core/base/players.h), no row: Reset all leaves it
     "SHOW_LAUNCHER",   // start screen on a plain start (core/boot/main.c); Menu tab On/Off, default On
-    "ONE_PER_CORE", "OPERATION_MODE", "PAD_LAYOUT", "PERF_OVERLAY", "PERF_SLOW_MS", "PICTURE_FIT", "PIPELINE_CACHE", "PIPE_MEMO", "PIPE_PREBUILD", "PIPE_SKIP", "PIPE_STALL", "PIPE_SYNC", "PIPE_TRACE", "POOL_SPILL", "PIPE_WAIT", "PIPE_WORKERS",
+    "ONE_PER_CORE", "OPERATION_MODE", "PAD_BACKEND", "PAD_LAYOUT", "PERF_OVERLAY", "PERF_SLOW_MS", "PICTURE_FIT", "PIPELINE_CACHE", "PIPE_MEMO", "PIPE_PREBUILD", "PIPE_SKIP", "PIPE_STALL", "PIPE_SYNC", "PIPE_TRACE", "POOL_SPILL", "PIPE_WAIT", "PIPE_WORKERS",
     "PROBE", "PROFILE", "PROFILE_CHAINS", "PROFILE_DIR", "PROFILE_FRAMES",
     "PROFILE_MAIN", "PROFILE_RENDER", "PUSH_CONST", "PUSH_SKIP", "PUSH_STAGE", "QUEUE_WAITS", "RDOC", "RDOC_DIR", "RDOC_DLL", "REC_SET_WRITE", "REEXEC",
     "BIND_XF", "REG_LATE", "REG_QUEUED", "REPLAY_ASYNC", "REPLAY_PAR_WSHARE", "USNAP_CMP",
@@ -69,7 +69,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"COLOR_CONTRAST", "display"}, {"COLOR_SATURATION", "display"}, {"COLOR_GAMMA", "display"}, {"LANG", "language"}, {"OPERATION_MODE", "language"}, {"LAN", "language"},
     {"VOLUME", "audio"}, {"AUDIO_CHANNELS", "audio"}, {"BACKGROUND_MUTE", "audio"},
     {"MOTION", "input"}, {"KEYBOARD", "input"}, {"RUMBLE_STRENGTH", "input"}, {"RUMBLE_CURVE", "input"}, {"RUMBLE_TRIGGERS", "input"},
-    {"PAD_LAYOUT", "input"}, {"BUTTON_ICONS", "input"}, {"MOUSE_SENS", "input"}, {"STICK_DEADZONE", "input"}, {"SWITCH2", "input"}, {"INPUT_RECORD", "input"},
+    {"PAD_BACKEND", "input"}, {"PAD_LAYOUT", "input"}, {"BUTTON_ICONS", "input"}, {"MOUSE_SENS", "input"}, {"STICK_DEADZONE", "input"}, {"SWITCH2", "input"}, {"INPUT_RECORD", "input"},
     {"BIND_A", "input"}, {"BIND_B", "input"}, {"BIND_X", "input"}, {"BIND_Y", "input"}, {"BIND_LCLICK", "input"},
     {"BIND_RCLICK", "input"}, {"BIND_L", "input"}, {"BIND_R", "input"}, {"BIND_ZL", "input"}, {"BIND_ZR", "input"},
     {"BIND_PLUS", "input"}, {"BIND_MINUS", "input"}, {"BIND_LEFT", "input"}, {"BIND_UP", "input"},
@@ -125,6 +125,7 @@ static const CfgMeta metas[] = {
     {"MOTION", "1", "0|1", LIVE}, {"KEYBOARD", "1", "0|1", LIVE}, {"RUMBLE_STRENGTH", "130", "0..300", LIVE},
     {"RUMBLE_CURVE", "0.6", "0.2..1.5", LIVE},
     {"RUMBLE_TRIGGERS", "0", "0|1", LIVE}, {"PAD_LAYOUT", "auto", "auto|nintendo|xbox", LIVE},
+    {"PAD_BACKEND", "auto", "auto|xinput|all", RESTART},
     {"BUTTON_ICONS", "auto", "auto|nintendo|xbox|playstation|keyboard", LIVE},
     {"MOUSE_SENS", "1", "0..10", LIVE}, {"STICK_DEADZONE", "8", "0..40", LIVE}, {"SWITCH2", "0", "0|1|2", RESTART},
     {"MENU_LANG", "", "en|ja|fr|de|it|es|nl|pt|pt-BR|ru|zh-Hans|zh-Hant|ko|es-419|ca|gl|eu|pl|tr|uk|th", LIVE}, {"UPDATE_CHECK", "1", "0|1", LIVE},

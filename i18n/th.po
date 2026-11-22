@@ -898,6 +898,29 @@ msgctxt "UI_MENU_PAD_LAYOUT_IN_USE"
 msgid "in use: %s"
 msgstr "ใช้อยู่: %s"
 
+msgctxt "UI_MENU_PAD_BACKEND"
+msgid "Controller backend"
+msgstr ""
+
+msgctxt "UI_MENU_PAD_BACKEND_DESC"
+msgid ""
+"Which Windows controller backends SDL uses. Automatic uses XInput-only in remote or multi-session "
+"streaming (such as Duo) and keeps all backends locally. XInput only isolates controllers per "
+"session. Applies at the next start."
+msgstr ""
+
+msgctxt "UI_MENU_PAD_BACKEND_AUTO"
+msgid "Automatic"
+msgstr ""
+
+msgctxt "UI_MENU_PAD_BACKEND_XINPUT"
+msgid "XInput only"
+msgstr ""
+
+msgctxt "UI_MENU_PAD_BACKEND_ALL"
+msgid "All backends"
+msgstr ""
+
 msgctxt "UI_MENU_MOUSE_SENS"
 msgid "Mouse camera sensitivity"
 msgstr "ความไวกล้องของเมาส์"

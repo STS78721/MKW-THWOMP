@@ -111,6 +111,7 @@ def test_early_setup_log_preserves_alias(tmp_path: Path) -> None:
 def test_versions() -> None:
     assert update.version_key("0.1.2-12-g1c15097") == (0, 1, 2, 0)
     assert update.version_key("0.2.1") < update.version_key("0.2.1b-3-gabc1234") < update.version_key("0.2.1c") < update.version_key("0.2.2")
+    assert update.version_key("0.2.3") < update.version_key("0.2.3b") < update.version_key("0.2.4")
     assert update.version_key("v0.1.10") > update.version_key("0.1.9")
     assert update.version_key("dev") is None
 

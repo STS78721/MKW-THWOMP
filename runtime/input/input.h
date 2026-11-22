@@ -2,6 +2,10 @@
 #pragma once
 #include <stdint.h>
 
+// Configure SDL3 gamepad backend hints before SDL_Init(SDL_INIT_GAMEPAD) (called by both the launcher and input.c).
+// On Windows remote/non-console sessions (e.g. Duo multi-session streaming) under MKW_PAD_BACKEND=auto, or whenever
+// MKW_PAD_BACKEND=xinput, restricts SDL3 to XInput so each session only sees its own virtual controller.
+void input_configure_sdl_hints(void);
 // Bits of libnx HidNpadButton (A=0 B=1 X=2 Y=3 StickL=4 StickR=5 L=6 R=7 ZL=8 ZR=9 Plus=10 Minus=11 Left=12 Up=13 Right=14
 // Down=15) and the stick directions (StickLLeft..Down 16-19, StickRLeft..Down 20-23, derived from the sticks).
 // Sticks are -32767..32767, up is +y. MKW_INPUT=none reports no input. Callable from any thread.

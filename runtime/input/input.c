@@ -134,6 +134,61 @@ static int pad_is_open(SDL_JoystickID id) {
 
 static void pad_adopt(void);
 
+#ifdef _WIN32
+// Duo multi-session streaming exposes every session's virtual controller to Windows RawInput / HIDAPI / WGI under a
+// HID path containing "DUOCONTROLLER" (e.g. "\\?\HID#VID_045E&PID_02FF&DUOCONTROLLER&..."). Skip those cross-session
+// HID handles when not forced to "all" so a console session never grabs a remote session's pad (#3).
+static int is_duo_hid_path(const char *path) {
+    if (!path) return 0;
+    static const char needle[] = "DUOCONTROLLER";
+    for (const char *p = path; *p; p++) {
+        size_t j = 0;
+        while (needle[j] && p[j]) {
+            char c = p[j];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            if (c != needle[j]) break;
+            j++;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
+}
+
+static int pad_backend_xinput(int *explicit_out) {
+    const char *mode = cfg_value("MKW_PAD_BACKEND");
+    if (mode && !SDL_strcasecmp(mode, "xinput")) {
+        if (explicit_out) *explicit_out = 1;
+        return 1;
+    }
+    if (mode && !SDL_strcasecmp(mode, "all")) {
+        if (explicit_out) *explicit_out = 0;
+        return 0;
+    }
+    if (explicit_out) *explicit_out = 0;
+    return plat_remote_session();
+}
+#endif
+
+void input_configure_sdl_hints(void) {
+#ifdef _WIN32
+    int force = 0;
+    if (!pad_backend_xinput(&force)) return;
+    // Duo isolates XInput per Windows session while RawInput, HIDAPI, WGI and DirectInput enumerate virtual pads from
+    // every session on the host (#3). Explicit pad_backend=xinput uses OVERRIDE so it takes effect even under launchers
+    // that inject SDL_JOYSTICK_* env vars; auto-detected remote sessions use NORMAL so explicit user env vars win.
+    SDL_HintPriority prio = force ? SDL_HINT_OVERRIDE : SDL_HINT_NORMAL;
+    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_RAWINPUT, "0", prio);
+    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI, "0", prio);
+    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_WGI, "0", prio);
+    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_DIRECTINPUT, "0", prio);
+    SDL_SetHintWithPriority(SDL_HINT_XINPUT_ENABLED, "1", prio);
+    static int logged;
+    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+        rt_log("input: XInput-only gamepad backend enabled (%s)",
+               force ? "pad_backend = xinput" : "remote/non-console Windows session detected");
+#endif
+}
+
 // Close the gamepads that went away and open the new ones (player 1 first, then the first free player); logs each change.
 static void scan_pads(void) {
     if (pad && !SDL_GamepadConnected(pad)) {
@@ -151,6 +206,25 @@ static void scan_pads(void) {
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
     for (int i = 0; ids && i < n; i++) {
         if (pad_is_open(ids[i])) continue;
+#ifdef _WIN32
+        const char *mode = cfg_value("MKW_PAD_BACKEND");
+        if (!mode || SDL_strcasecmp(mode, "all") != 0) {
+            const char *path = SDL_GetGamepadPathForID(ids[i]);
+            if (!path) path = SDL_GetJoystickPathForID(ids[i]);
+            if (is_duo_hid_path(path)) {
+                static SDL_JoystickID duo_seen[16];
+                static int nduo;
+                int seen = 0;
+                for (int k = 0; k < nduo; k++)
+                    if (duo_seen[k] == ids[i]) { seen = 1; break; }
+                if (!seen) {
+                    if (nduo < 16) duo_seen[nduo++] = ids[i];
+                    rt_log("input: skipping cross-session Duo HID gamepad (%s); set pad_backend = xinput in mkw.ini if streaming this session", path);
+                }
+                continue;
+            }
+        }
+#endif
         int p = 0;
         while (p < INPUT_MAX_PLAYERS && (p ? extra[p] != NULL : pad != NULL)) p++;
         if (p == INPUT_MAX_PLAYERS) break;
@@ -247,6 +321,7 @@ static void start(void) {
     binds_refresh();
     const char *e = cfg_get("MKW_INPUT");
     if (e && !strcmp(e, "none")) { state = -1; rt_log("input: disabled (MKW_INPUT=none)"); return; }
+    input_configure_sdl_hints();
     if (!SDL_Init(SDL_INIT_GAMEPAD)) { state = -1; rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError()); }
     else state = 1;
     if (state == 1) {

@@ -54,6 +54,7 @@
 extern "C" {
 #include "cfg.h"
 #include "gamelib.h"
+#include "input.h"
 #include "platform/platform.h"
 #include "ui_text.h"
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -1088,6 +1089,7 @@ static bool open_window(void) {
     bool background = bg && *bg && strcmp(bg, "0");
     SDL_SetHint(SDL_HINT_APP_ID, background ? "mkw-recomp-run" : "mkw-recomp");
     if (background) SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+    input_configure_sdl_hints();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         rt_log("launcher: SDL_Init failed: %s", SDL_GetError());
         return false;

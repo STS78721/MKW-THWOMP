@@ -448,3 +448,10 @@ int plat_cond_wait_ns(PlatCond *c, PlatMutex *m, uint64_t ns) {
 void plat_cond_signal(PlatCond *c) { WakeConditionVariable((PCONDITION_VARIABLE)c); }
 void plat_cond_broadcast(PlatCond *c) { WakeAllConditionVariable((PCONDITION_VARIABLE)c); }
 
+int plat_remote_session(void) {
+    if (GetSystemMetrics(SM_REMOTESESSION)) return 1;
+    DWORD sid = 0, console = WTSGetActiveConsoleSessionId();
+    if (console != 0xFFFFFFFFu && ProcessIdToSessionId(GetCurrentProcessId(), &sid) && sid != console) return 1;
+    return 0;
+}
+

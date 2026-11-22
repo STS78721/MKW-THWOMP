@@ -496,3 +496,5 @@ int plat_thread_priority_get(void) {
 
 void plat_yield(void) { sched_yield(); }
 
+int plat_remote_session(void) { return 0; }
+
