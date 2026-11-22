@@ -12,5 +12,5 @@ totk-pc-recomp, MIT) and THWOMP's colour profiles (`color_grade.comp`: brightnes
 on the present, `gfx/vk/device/vk_color.c`, from STS78721's DKB build) and THWOMP's DLSS inputs (`gfx/vk/device/vk_mv.c`,
 `vk_dlss.c`: `mv_vel_vs.vert` + `mv_vel_fs.frag` draw each object's motion from its two captured positions,
 `mv_out.comp` the motion vectors and the bias-current-colour hint, `dlss_compose.comp` DLSS's picture encoded for the present,
-`mv_debug.comp` the `MKW_MV_DEBUG` views). Compiled into `gfx/vk/*_spv.h`; a
+`mv_debug.comp` the `MKW_MV_DEBUG` views), plus `mem/` (VRAM mirror base-copy and byte-merged write-back compute shaders for `MKW_MIRROR_MERGE`). Compiled into `gfx/vk/*_spv.h`; a
 new or changed one is regenerated with `uv run tools/shaders/embed_spv.py runtime/shaders/<name>.comp`.

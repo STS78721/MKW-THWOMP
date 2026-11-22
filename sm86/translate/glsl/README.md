@@ -13,6 +13,7 @@ The SM86 → GLSL 4.6 translator, split by responsibility. Used as `import glsl`
 | `thread.py` | Subgroups (`SHFL`, `VOTE`, `MATCH`, `REDUX`), system values (`S2R`), task/mesh outputs (`ISBEWR`/`ISBERD`) and `EXIT` |
 | `head.py` | Declarations before `main()` (extensions, helper functions, inputs and outputs, bindings and their reflection) and the task/mesh wrappers |
 | `subroutines.py` | Subroutines called from several places (CALL/RET): a copy of the body in each call for the structured form, once the return address is proven to be the instruction after the CALL |
+| `first_store.py` | Detects straight-line first-invocation preamble stores (such as append-counter resets) and splits them behind the `FIRST_STORE` specialization constant so the runtime can run and synchronize them before the main dispatch |
 | `common.py` | Shared pieces: `Unsupported`, GLSL helper functions, comparison and `LOP3` tables, register and predicate names |
 
 The groups in `alu`, `mem`, `tex` and `thread` are mixins of `Builder`: they use its operand helpers (`src_u`, `dst`…)

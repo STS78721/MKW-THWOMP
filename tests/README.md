@@ -14,6 +14,8 @@ end's regression test runs over captures instead (`tools/test/`).
 | `test_switch2.py` | The Switch 2 controllers' Bluetooth LE protocol (`runtime/input/switch2_proto.h`): mkw-neo's test (`c/t_switch2.c`, reports recorded from real Joy-Con 2s) built against our copy |
 | `test_mods.py` | Code patches shipped by mods (`recomp/patches.py` `load_mods`): a mod with spans only, two mods on one address stop the generate, no `mods/` folder leaves the table as it was |
 | `test_cfg.py` | Every setting the in-game menu writes to `mkw.ini` is a key `runtime/core/base/cfg.c` reads back (#168: `HDR` was dropped as unknown) |
+| `test_spirv_images.py` | Integer-image SPIR-V shader variant patching (`c/t_spirv_images.c`): storage and separate sampled images, signed/unsigned views, failure diagnostics, and optional `spirv-val` validation |
 | `test_defaults.py` | The memory caps a player gets with nothing set (`runtime/gfx/vk/device/vk_defaults.c`), built alone and checked on the GPUs players reported: the Radeon 660M keeps its measured caps, a large discrete GPU is not held to them (issue #31) |
+| `translator/` | Unit tests for the SM86 → GLSL shader translator passes (`test_first_store.py`) |
 
 Usage: `uv run pytest tests`

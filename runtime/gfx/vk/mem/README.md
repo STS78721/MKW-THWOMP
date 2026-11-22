@@ -11,6 +11,7 @@ submit's copies of constant blocks.
 | `vk_mem_shadow.c` | Shadow copies of the CPU-visible pools, synced on their own thread as the replay touches them (`MKW_SHADOW_EARLY`) |
 | `vk_mem_shadow_nc.c` | The shadow's memory type: cached, and where the driver has no cached coherent type (ANV on Meteor Lake, #283) not coherent, with explicit flush and invalidate around the CPU's copies (`MKW_SHADOW_CACHED`) |
 | `vk_mem_wback.c` | GPU writes to shadowed pools: pending from recording and written back to game memory at their fence; `MKW_WB_ORDER`: a part that rewrites a page with its write-back pending waits on the GPU for that write-back |
+| `vk_wb_par.c` | Optional worker pool (`MKW_WB_PAR`, off by default) that distributes fence write-back ranges and large merge slices across helper threads |
 | `vk_mem_merge.c` | Byte-wise merge of the shadow in the ranges the GPU may write (`MKW_SHADOW_MERGE`): the CPU's bytes reach the GPU and the write-back does not overwrite them |
 | `vk_mem_capture.c` | Measurement `MKW_SHADOW_SUBMIT`: what the CPU writes, snapshotted at each submit and applied to the shadow when that submit syncs (discarded) |
 | `vk_mem_lazy.c` | Lazy merge bases (`MKW_LAZY_BASE`): instead of copying the shadow of a large range, its game pages stay read-only and are copied only if written; `MKW_LAZY_BASE_CHECK=1` compares with the usual copy |

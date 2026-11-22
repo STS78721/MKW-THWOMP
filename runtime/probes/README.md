@@ -12,6 +12,7 @@ except `texpre_probe.c` and `fg_probe.c`.
 | `gfx_abi_probe.c` | `--probe-gfx-abi` | Our objects fit in NVN's and the fields the game reads are where it expects them |
 | `gfx_window_probe.c` | `--probe-window` | Window present, vsync, focus, cursor and resize |
 | `kernel_probe.c` | `--probe-kernel` | Waits, wakeups, virtual cores and their arguments (cores 0-5), fibers (also one moved between threads) and translated code on four threads |
+| `merge_probe.c` | `--probe-merge` | Shadow byte-wise write-back (`vk_mem_merge.c`): verifies SIMD/run-based `merge_back_runs` against the reference byte loop on synthetic ranges and benchmarks race-like shapes |
 | `nvn_probe.c` | `--probe-nvn` | The NVN front end over the null back end, called as the game calls it |
 | `nvn_tex_probe.c` | `--probe-nvn-tex` | Size, alignment and mip offsets of textures (`nvn_tex.c`) |
 | `ov_probe.c`, `ov_probe.h` | `--probe-services` | Each replacement of `runtime/sdk/` and NVN2's native images called through its synthetic address; a linked one the loaded game imports and no probe calls fails it |
