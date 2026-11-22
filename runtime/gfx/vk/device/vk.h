@@ -35,6 +35,8 @@ typedef struct VkCtx {
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock,
+        has_8bit_storage,                   // storageBuffer8BitAccess: the mirror's merged write-back (vk_mem_mmerge.c)
+        has_ssbo_nonuniform,                // its arrays: non-uniform storage buffer indexing and partially bound sets
         has_unused_attachments,             // VK_EXT_dynamic_rendering_unused_attachments
         has_buffer_marker,                  // VK_AMD_buffer_marker: the GPU breadcrumbs (vk_crumbs.c)
         has_nv_checkpoints,                 // VK_NV_device_diagnostic_checkpoints: the same on NVIDIA
@@ -356,6 +358,10 @@ void vk_mem_lost_watch(const void *pool, uint64_t addr, uint64_t size, uint32_t 
 void vk_mem_lost_log(uint64_t frame);
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size);
 void vk_gpu_written(uint64_t addr, uint64_t size);
+// MKW_WB_PAR (vk_wb_par.c): fn(ctx, i) for i in [0, n) on the caller and a pool; serial when off or nested
+void vk_wb_par(int n, void (*fn)(void *, int), void *ctx);
+int vk_wb_par_threads(void);   // threads besides the caller (0: off)
+int vk_wb_par_inside(void);    // 1 on a thread running a vk_wb_par item
 uint64_t vk_merge_back_probe(int runs, int cw, uint64_t addr, uint64_t size, const uint8_t *s, const uint8_t *base,
                              uint64_t *gpu);   // --probe-merge: one write-back by either implementation (vk_mem_merge.c)
 int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;

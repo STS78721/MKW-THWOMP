@@ -299,7 +299,12 @@ static void thread_finish(RtThread *t) {
 // ExitThread: back to the thread start with a non-unwinding longjmp; no SEH unwinding through lifted frames.
 // (__builtin_setjmp is not usable: on Win64 LLVM saves the frame address, which is not rbp when the frame register
 // is offset, and the landing code then reads its locals through the wrong base.)
-__attribute__((noreturn)) void exit_now(RtThread *t) { longjmp(t->exit_jmp, 1); }
+// The first few exits are logged: a Windows fast fail in longjmp leaves nothing else in the log (see win32_mem.c).
+__attribute__((noreturn)) void exit_now(RtThread *t) {
+    static int logged;
+    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 3) rt_log("kernel: a guest thread exits (longjmp to its start)");
+    longjmp(t->exit_jmp, 1);
+}
 
 // The calling host thread, for ap_try (MKW_ASYNC_PREEMPT) and dg_sample (MKW_CORE_DIAG).
 static PlatIntr *ap_open_self(void) {

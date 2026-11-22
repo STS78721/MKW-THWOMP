@@ -143,6 +143,8 @@ static void log_open(int game) {
     // commit no release has tells a report from a build with local changes (#88 on 11/11/2026: a log line of a
     // transcoder that is in no commit)
     rt_log("log: %s (Mario Kart World PC %s)", g_log_path, rt_port_version);
+    int ss = plat_shadow_stack();   // Windows 0xC0000409/0xD exits: is hardware stack protection on (platform.h)
+    if (ss >= 0) rt_log("host: hardware stack protection %s for this process", ss ? "ON" : "off");
 }
 
 static void parse_trace(void) {

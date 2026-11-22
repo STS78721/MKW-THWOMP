@@ -88,7 +88,8 @@ uint32_t *spirv_int_images(const uint32_t *w, uint64_t n, uint64_t umask, uint64
         memcpy(out, w, (size_t)n * 4);
         free(binding), free(pointee), free(si_img), free(img_at), free(newt), free(kind);
         *out_n = n;
-        return out;
+        uint32_t *fit = realloc(out, (size_t)n * 4);   // kept for the process's life: only its words
+        return fit ? fit : out;
     }
     for (uint64_t i = 5; i < fn_at;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
@@ -223,7 +224,8 @@ uint32_t *spirv_int_images(const uint32_t *w, uint64_t n, uint64_t umask, uint64
     out[3] = nu;
     free(binding), free(pointee), free(si_img), free(img_at), free(newt), free(kind);
     *out_n = o;
-    return out;
+    uint32_t *fit = realloc(out, sizeof *out * (size_t)o);
+    return fit ? fit : out;
 fail:
     if (why) *why = error;
     free(binding), free(pointee), free(si_img), free(img_at), free(newt), free(kind), free(out);

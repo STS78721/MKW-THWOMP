@@ -131,7 +131,9 @@ uint32_t *spirv_int_io(const uint32_t *w, uint64_t n, uint32_t umask, uint32_t s
     out[3] = nu;
     free(loc), free(kind);
     *out_n = o;
-    return out;
+    // The variant lives as long as the process (gfx_shader_int.c): keep its words, not the worst-case buffer.
+    uint32_t *fit = realloc(out, sizeof *out * (size_t)o);
+    return fit ? fit : out;
 fail:
     free(loc), free(kind), free(out);
     return NULL;

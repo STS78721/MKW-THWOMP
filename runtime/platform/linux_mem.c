@@ -372,6 +372,8 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     fault_install();
 }
 
+int plat_shadow_stack(void) { return -1; }
+
 void plat_reexec(void) {
     static char args[16384];
     char *argv[256];

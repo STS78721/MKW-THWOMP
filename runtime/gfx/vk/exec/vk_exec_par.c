@@ -488,6 +488,7 @@ int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag) {
     if (P.nch < 2) return P.n_serial[WHY_FEW]++, 0;
     uint64_t t1 = kern_now_ns();
     P.handles = handles, P.n = n, P.fence = ex->fence, P.ex = ex, P.sent = 0, P.t_job = t1;
+    vk_exec_written_share(ex);   // before the head: the chunk threads and this one note at the same fence
     for (int k = 0; k < P.nch; k++) __atomic_store_n(&P.ready[k], 0, __ATOMIC_RELEASE);
     plat_mutex_lock(&P.lock);
     uint32_t gen = ++P.gen;

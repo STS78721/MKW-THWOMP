@@ -37,7 +37,22 @@ def test_cc_survives_spaces(tmp_path: Path) -> None:
 
 def run_prepare(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-I", str(ROOT / "tools/prepare/prepare.py"), *args],
-                          capture_output=True, text=True, timeout=60)  # fmt: skip
+                          capture_output=True, text=True, encoding="utf-8", timeout=60)  # fmt: skip
+
+
+@pytest.mark.parametrize("name", ["Plain", "Café", "玩家"])
+def test_moved_source_event_uses_utf8(tmp_path: Path, name: str) -> None:
+    gone = tmp_path / name
+    state = {"version": 1, "done": {}, "source": str(gone), "romfs_mode": "link"}
+    (tmp_path / "setup-state.json").write_text(json.dumps(state), encoding="utf-8")
+    # The launcher uses -I, so model the Windows pipe's encoding inside the child.
+    driver = ("import runpy,sys; sys.stdout.reconfigure(encoding='cp1252'); "
+              "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')")
+    p = subprocess.run([sys.executable, "-I", "-c", driver, str(ROOT / "tools/prepare/prepare.py"),
+                        "--game", str(tmp_path)], capture_output=True, timeout=60)  # fmt: skip
+    assert p.returncode == 1
+    assert p.stdout.decode("utf-8").splitlines() == [f"error moved {gone}"]
+    assert f"error moved {gone}" in (tmp_path / "logs/setup.log").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("external", [False, True])
@@ -399,4 +414,14 @@ def test_lastrun_reads_how_the_last_game_ended() -> None:
     assert lastrun.verdict("spec.py ... args.cc.split()\n", "0.1.5", sigs) == "known 29"
     assert lastrun.verdict("[host] FATAL: SIGSEGV at host 0x1\n", "0.1.11", sigs) == "crash"
     assert lastrun.verdict("[host] frame 300\n", "0.1.11", sigs) == ""   # killed or power off: nothing to say
+    # a hang the player closed the window on is a crash; one that ended ("slow, not hung") before the close is clean
+    hang = "vk: the GPU has not finished submission 7 in 5.0 s and the driver reports no device loss\n"
+    slow = "vk: the GPU finished submission 7 after 6.2 s: it was slow, not hung\n"
+    closed = "[host] gfx: window closed; exiting\n"
+    assert lastrun.verdict(hang + closed, "0.1.11", sigs) == "crash"
+    assert lastrun.verdict(hang + slow + closed, "0.1.11", sigs) == "clean"
+    assert lastrun.verdict(slow + hang + closed, "0.1.11", sigs) == "crash"
+    assert lastrun.verdict(closed + "[host] FATAL: SIGSEGV during shutdown\n", "0.1.11", sigs) == "crash"
+    assert lastrun.verdict(closed + "vk: device fault: Instruction pointer invalid\n", "0.1.11", sigs) == "known 22"
+    assert lastrun.verdict("[host] FATAL: earlier\n" + closed, "0.1.11", sigs) == "clean"
     assert (ROOT / "tools/github/signatures.toml").is_file()

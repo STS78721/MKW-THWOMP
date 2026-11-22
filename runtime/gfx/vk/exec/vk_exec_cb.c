@@ -31,7 +31,7 @@ static void *grow(void *p, int *cap, size_t elem) {
 // ---- resources of one command buffer, freed by its completion callback
 
 typedef struct { VkBuffer buf; VmaAllocation alloc; uint8_t *map; uint64_t size, used; } Chunk;
-typedef struct { uint64_t addr, size; } Range;
+typedef struct { uint64_t addr, size; int own; } Range;   // own: reported at the fence here (vk_exec_written.c)
 struct CbRes {
     Chunk *chunks;
     int nchunks, cchunks;
@@ -55,10 +55,23 @@ static VkDescriptorPool spare_pool[SPARE_POOLS];
 static Chunk spare_chunk[SPARE_CHUNKS];
 static int nspare_pool, nspare_chunk;
 
+static void written_one(void *ctx, int i) {
+    const CbRes *r = ctx;
+    if (r->written[i].own) vk_gpu_written(r->written[i].addr, r->written[i].size);
+}
+
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
     VkCtx *c = vk_ctx();
-    for (int i = 0; i < r->nwritten; i++) vk_gpu_written(r->written[i].addr, r->written[i].size);
+    // MKW_WB_PAR: a callback with enough bytes to compare shares its ranges out (vk_wb_par.c)
+    uint64_t wbytes = 0;
+    int nown = 0;
+    for (int i = 0; i < r->nwritten; i++)
+        if (r->written[i].own) wbytes += r->written[i].size, nown++;
+    if (nown >= 4 && wbytes >= (256u << 10)) vk_wb_par(r->nwritten, written_one, r);
+    else
+        for (int i = 0; i < r->nwritten; i++)
+            if (r->written[i].own) vk_gpu_written(r->written[i].addr, r->written[i].size);
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
         plat_mutex_lock(&spare_lock);
@@ -178,9 +191,17 @@ void note_written(VkExec *ex, uint64_t addr, uint64_t size) {
         memset(r->wslot, 0xff, sizeof *r->wslot * 2 * (size_t)r->cwritten);
         for (int i = 0; i < r->nwritten; i++) wslot_put(r, i);
     }
-    r->written[r->nwritten++] = (Range){addr, size};
+    int own = vk_exec_wshare_owner(ex->fence, addr, size);   // kept either way: the lookup above skips it next time
+    r->written[r->nwritten++] = (Range){addr, size, own};
     wslot_put(r, r->nwritten - 1);
-    vk_mem_gpu_pending(addr, size);
+    if (own) vk_mem_gpu_pending(addr, size);
+}
+
+void vk_exec_written_share(VkExec *ex) {
+    vk_exec_wshare_set(ex->fence);
+    if (cur && cur_fence == ex->fence)   // what this thread noted of the submission before its chunks
+        for (int i = 0; i < cur->nwritten; i++)
+            if (cur->written[i].own) vk_exec_wshare_owner(ex->fence, cur->written[i].addr, cur->written[i].size);
 }
 
 VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {

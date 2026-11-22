@@ -219,6 +219,17 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     _set_invalid_parameter_handler(crt_invalid_parameter);
 }
 
+// Exit 0xC0000409 with data 0xD (FAST_FAIL_INVALID_SET_OF_CONTEXT) after "fs mount save" on several Windows machines
+// leaves no FATAL line (a fast fail skips every handler). Whether hardware stack protection is on for this process
+// (PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY, class 19, first flag = enabled) goes in the log so a report says it.
+int plat_shadow_stack(void) {
+    typedef BOOL(WINAPI * GetPol)(HANDLE, int, PVOID, SIZE_T);
+    GetPol get = (GetPol)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetProcessMitigationPolicy");
+    DWORD flags[2] = {0, 0};
+    if (!get || !get(GetCurrentProcess(), 19, flags, sizeof flags)) return -1;
+    return flags[0] & 1;
+}
+
 // A fresh process gets a fresh layout: Windows places DLLs, heaps and thread stacks at random addresses. The parent
 // waits and exits with the child's code.
 void plat_reexec(void) {
