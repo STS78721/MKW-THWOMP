@@ -6,7 +6,40 @@ its issue, #N), `### Tested` (what was run from the packages before publishing) 
 
 ## Unreleased
 
-(empty — next work after 0.2.3)
+(empty — next work after 0.2.3b)
+
+## MKW-THWOMP 0.2.3b
+
+MKW-THWOMP 0.2.3b
+
+Controller hotfix fixing multi-session Windows streaming (such as Duo / Sunshine-Moonlight multi-session setups, #3) where SDL3 could pick up another Windows session's virtual controller instead of the current session's pad. Local console players keep full native controller support by default; safe shipped defaults remain FSR, Frame Generation Off, Presentation Mailbox, and Automatic controller backend.
+
+■ Major Updates
+
+- Fixed controllers not responding in Duo and other multi-session Windows streaming environments (#3): when running inside a remote or non-console Windows session (`SM_REMOTESESSION` or session ID differing from the active console session), both the start screen and the game now automatically restrict SDL3 to XInput before `SDL_Init` so each Windows session only reads its own virtual controller instead of enumerating RawInput / HIDAPI / WGI / DirectInput devices belonging to other sessions.
+- Filtered cross-session Duo virtual controller HID paths (`DUOCONTROLLER`) in game controller scanning on Windows (unless set to `All`), preventing a local console session from accidentally grabbing a remote session's virtual gamepad while keeping native DualSense, Switch, and Xbox HID features intact on the console.
+
+■ New & Improvements
+
+○ Controls & Configuration
+
+- Added a **Controller backend** setting in **F1 → Controls** (and the start screen **Settings → Controls**), backed by `pad_backend` under `[input]` in `mkw.ini` (or `MKW_PAD_BACKEND`, takes effect after restart):
+  - `Automatic` (`auto`, default): uses all controller backends on local console sessions (skipping cross-session `DUOCONTROLLER` HID handles) and switches automatically to XInput-only in remote or non-console Windows sessions (while still respecting explicit `SDL_JOYSTICK_*` environment overrides).
+  - `XInput only` (`xinput`): forces SDL3 XInput-only on Windows (useful for custom multi-session or console-streaming setups).
+  - `All` (`all`): leaves every SDL3 controller backend enabled with no filtering.
+
+■ Other
+
+- No game-code ABI change (`mkwgame.id` unchanged at `0b58f80e2b894c32`) and no shader translator changes: existing installs upgrade in-place with no game rebuild or shader re-translation required.
+- Personal settings, dumps, shader caches, saves, and logs are never included in any release package.
+
+■ Update
+
+- From `0.2.3`, `0.2.2c`, `0.2.2b`, `0.2.2`, `0.2.1b`, `0.1.2`, or `0.1.1`: open the start screen (if **Show launcher on startup** is off, run `mkw.exe --launcher` or re-enable it in F1 → Menu). It offers **`0.2.3b`** and installs it automatically. You can also extract `SteelTemple-MKW-THWOMP-0.2.3b-Update.zip` over your game folder.
+- New install: run `SteelTemple-MKW-THWOMP-0.2.3b-Full-Setup-Wizard.exe`, then open the start screen, choose Game files, select your dump, press Set up, and press Play.
+- Portable: extract `SteelTemple-MKW-THWOMP-0.2.3b-Portable-StandAlone.zip` anywhere, run `mkw.exe`, and set up the same way.
+
+Your dump, saves, and personal settings stay on your PC.
 
 ## MKW-THWOMP 0.2.3
 
