@@ -6,7 +6,35 @@ its issue, #N), `### Tested` (what was run from the packages before publishing) 
 
 ## Unreleased
 
-(empty — next work after 0.2.3b)
+(empty — next work after 0.2.3c)
+
+## MKW-THWOMP 0.2.3c
+
+MKW-THWOMP 0.2.3c
+
+Split-screen DLSS, DLSS Frame Generation, and multi-player performance update. 2-player, 3-player, and 4-player split-screen now run full DLSS Super Resolution and DLSS Frame Generation (2×–6×) with crisp per-viewport motion vectors and depth, alongside automatic multi-threaded command replay for heavy split-screen frames and a 2-player internal resolution fix. 1-player stays untouched on its serial fast path, and safe shipped defaults remain FSR, Frame Generation Off, Presentation Mailbox, and Automatic controller backend.
+
+■ Major Updates
+
+- Enabled DLSS Super Resolution and DLSS Frame Generation (2×–6×) across 2-player, 3-player, and 4-player split-screen: each player's scene depth, camera matrix, and HUD-less composite are stitched into a full-screen composite depth ring (`0` bytes allocated in 1-player), with per-viewport clamped camera motion vectors and moving-kart reactive bias preventing seam bleeding and UI smear.
+- Fixed 2-player split-screen internal resolution over-scaling (`*For3DForDiv` in `romfs_res.c`): 2-player now renders at 1:1 target height instead of `1 / 0.65` (cutting 2-player internal pixel count by 2.36× and eliminating the 2P 4K bottleneck; existing resolution overlays regenerate cleanly).
+- Automatic multi-threaded Vulkan replay for split-screen (`MKW_REPLAY_PAR=auto` default): added `OP_QUEUE` switch handling, motion-vector chunk planning, pre-creation of copy/clear texture targets, and a `use_lock` race fix in device-local mirror prologues so heavy 2P/3P/4P submissions (~4,000–12,000 draws/frame) record across CPU worker threads without mid-pass GPU overhead (`inpass=0`) or dark terrain glitches.
+- Eliminated wasted transform-feedback drains during split-screen depth passes, further cutting CPU and GPU frame time in 2P/3P/4P.
+
+■ Improvements & Safety
+
+- 1-player behavior is unchanged: `MKW_REPLAY_PAR=auto` stays completely serial below 4,000 draws (0 extra worker threads spawned, 0.000 ms walk overhead), keeping 1P's full object-motion XFB capture and locked 60 / 180 fps pacing intact.
+- Worker thread counts scale safely from detected CPU core count (`plat_cpu_count()`) and stay serial on CPUs with fewer than 4 logical cores.
+- No game-code ABI change (`mkwgame.id` unchanged at `0b58f80e2b894c32`) and no shader translator changes: existing installs upgrade in-place with no game rebuild or shader re-translation required.
+- Personal settings, dumps, shader caches, saves, and logs are never included in any release package.
+
+■ Update
+
+- From `0.2.3b`, `0.2.3`, `0.2.2c`, `0.2.2b`, `0.2.2`, `0.2.1b`, `0.1.2`, or `0.1.1`: open the start screen (if **Show launcher on startup** is off, run `mkw.exe --launcher` or re-enable it in F1 → Menu). It offers **`0.2.3c`** and installs it automatically. You can also extract `SteelTemple-MKW-THWOMP-0.2.3c-Update.zip` over your game folder.
+- New install: run `SteelTemple-MKW-THWOMP-0.2.3c-Full-Setup-Wizard.exe`, then open the start screen, choose Game files, select your dump, press Set up, and press Play.
+- Portable: extract `SteelTemple-MKW-THWOMP-0.2.3c-Portable-StandAlone.zip` anywhere, run `mkw.exe`, and set up the same way.
+
+Your dump, saves, and personal settings stay on your PC.
 
 ## MKW-THWOMP 0.2.3b
 
