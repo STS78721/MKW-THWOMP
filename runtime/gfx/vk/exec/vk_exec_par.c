@@ -69,6 +69,7 @@ enum { WHY_REPORT, WHY_RESET, WHY_COND, WHY_QUEUE, WHY_FEW, WHY_BUSY, WHY_N };
 
 static struct {
     int mode, walk_diag, threads, chunk_draws, first_draws, reverse, warm, depth_off;
+    int auto_hot, auto_idle, workers_up;   // MKW_REPLAY_PAR=auto: armed after >=4200-draw sub; lazy worker spawn
     int order[MAX_CHUNKS], norder;   // MKW_REPLAY_PAR_ORDER=a,b,c...: the first chunks taken in that order
     int cut, cut_op;                 // MKW_REPLAY_PAR_CUT, MKW_REPLAY_PAR_CUT_OP
     int oplog[2];                    // MKW_REPLAY_PAR_OPLOG
@@ -120,6 +121,20 @@ static void dimg_note(VkImage img) {
 static int is_draw(uint32_t op) {
     return op == OP_DRAW || op == OP_DRAW_IDX || op == OP_DRAW_IDX_IND || op == OP_DISPATCH || op == OP_DISPATCH_IND ||
            op == OP_DRAW_MESH;
+}
+
+static int is_gfx_draw(uint32_t op) {
+    return op == OP_DRAW || op == OP_DRAW_IDX || op == OP_DRAW_IDX_IND || op == OP_DRAW_MESH;
+}
+
+static int closes_pass(uint32_t op) {
+    switch (op) {
+    case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_BARRIER: case OP_DISPATCH: case OP_DISPATCH_IND:
+    case OP_COPY_B2B: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX: case OP_CLEAR_BUF:
+    case OP_SIGNAL_EVENT: case OP_REPORT_COUNTER: case OP_RESET_COUNTER:
+        return 1;
+    default: return 0;
+    }
 }
 
 // Moves p to the next op that is not BEGIN, END, JUMP or CALL; 0 past the submission's last op.
@@ -176,12 +191,17 @@ static int chunk_size(int k, int C) {
 // GPU busy +2.7 ms a frame with 10 chunks); at twice its draws without a change, it is cut anyway. Not where only the
 // layer of the depth image changes: the layered depth clears (vk_exec.c dc_layered, GPU -2.8 ms a frame, rt-z5) clear
 // every layer of the shadow map at once only within the chunk that bound it first.
-static int plan(const VkExec *ex0, const uint64_t *handles, int n, int C) {
+static int plan(const VkExec *ex0, const uint64_t *handles, int n, int C, int mv_plan) {
     VkExec *w = &P.end;
     *w = *ex0;
     P.nch = P.nupd = P.ncond = P.cplan.n = 0;
     P.plan_ops = 0;
     P.ndimg = P.dimg_over = 0, P.wdimg = P.dc_img = VK_NULL_HANDLE, P.wdlayers = P.dc_left = 0;
+    struct { uint64_t id; VkExec st; VkImage wdimg; uint32_t wdlayers; } pqs[4];
+    int npqs = 0;
+    uint64_t pqs_cur = 0;
+    int pass_open = 0;
+    if (mv_plan) vk_mv_par_plan_begin(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1);
     Pos p = {0, 0, nvn_op_first(handles[0]), {0}};
     chunk_add(&p, w);
     int draws = 0, in_chunk = 0;
@@ -190,13 +210,21 @@ static int plan(const VkExec *ex0, const uint64_t *handles, int n, int C) {
         const void *a = nvn_op_payload(h);
         Pos at = p;   // the op itself: a cut before it starts the next chunk there
         p.h = nvn_op_next(h);
-        if (P.cut_op && P.plan_ops == (uint64_t)P.cut_op && P.nch < MAX_CHUNKS) in_chunk = 0, chunk_add(&at, w);
+        if (P.cut_op && P.plan_ops == (uint64_t)P.cut_op && P.nch < MAX_CHUNKS) {
+            if (pass_open) { if (mv_plan) vk_mv_par_plan_pass_close(P.plan_ops + 1); pass_open = 0; }
+            in_chunk = 0, chunk_add(&at, w);
+        }
         if (P.oplog[1] && draws >= P.oplog[0] && draws <= P.oplog[1])
             rt_log("vk: par oplog: submission %llu after draw %d: op %llu %s", (unsigned long long)P.subs, draws,
                    (unsigned long long)P.plan_ops, nvn_op_name(h->op));
+        if (pass_open && closes_pass(h->op)) {
+            if (mv_plan) vk_mv_par_plan_pass_close(P.plan_ops + 1);
+            pass_open = 0;
+        }
         switch (h->op) {
         case OP_SET_RT:
             if (memcmp(&w->rt, a, sizeof w->rt)) {
+                if (pass_open) { if (mv_plan) vk_mv_par_plan_pass_close(P.plan_ops + 1); pass_open = 0; }
                 const p_set_rt *r = a;
                 const VkTexImage *di = r->depth ? vk_texture_get(r->depth) : NULL;
                 VkImage dimg = di ? di->image : VK_NULL_HANDLE;
@@ -223,12 +251,52 @@ static int plan(const VkExec *ex0, const uint64_t *handles, int n, int C) {
             if (!vk_exec_state_op(w, h->op, a) && !vk_exec_bind_state(w, h->op, a)) vk_exec_xfer_state(w, h->op, a);
             break;
         case OP_REPORT_COUNTER:
-            if (((const p_report_counter *)a)->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) return P.n_serial[WHY_REPORT]++, 0;
+            if (((const p_report_counter *)a)->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
+                if (mv_plan) vk_mv_par_plan_commit(0);
+                return P.n_serial[WHY_REPORT]++, 0;
+            }
             vk_exec_cond_plan(&P.cplan, h->op, a);
             break;
-        case OP_QUEUE: return P.n_serial[WHY_QUEUE]++, 0;   // the queues' states swap there (vk_exec.c queue_switch)
+        case OP_QUEUE: {
+            // Queue switch (vk_exec.c queue_switch): swap per-queue VkExec state and cut a chunk right after OP_QUEUE
+            // so the preceding chunk ends with pass_end + full barrier before the next queue begins.
+            uint64_t qid = ((const p_queue *)a)->id;
+            if (qid == pqs_cur) break;
+            if (pass_open) { if (mv_plan) vk_mv_par_plan_pass_close(P.plan_ops + 1); pass_open = 0; }
+            int from = -1, to = -1;
+            for (int i = 0; i < npqs; i++) {
+                if (pqs[i].id == pqs_cur) from = i;
+                if (pqs[i].id == qid) to = i;
+            }
+            if (pqs_cur && from < 0) {
+                if (npqs >= 4) {
+                    if (mv_plan) vk_mv_par_plan_commit(0);
+                    return P.n_serial[WHY_QUEUE]++, 0;
+                }
+                from = npqs++, pqs[from].id = pqs_cur;
+            }
+            if (from >= 0) pqs[from].st = *w, pqs[from].wdimg = P.wdimg, pqs[from].wdlayers = P.wdlayers;
+            int had_cur = pqs_cur != 0;
+            pqs_cur = qid;
+            if (to >= 0) {
+                *w = pqs[to].st, w->rt_resolved = 0;
+                P.wdimg = pqs[to].wdimg, P.wdlayers = pqs[to].wdlayers;
+            }
+            P.dc_img = VK_NULL_HANDLE, P.dc_left = 0;
+            if (had_cur) {
+                if (P.nch >= MAX_CHUNKS) {
+                    if (mv_plan) vk_mv_par_plan_commit(0);
+                    return P.n_serial[WHY_QUEUE]++, 0;
+                }
+                P.plan_ops++, in_chunk = 0, chunk_add(&p, w), P.plan_ops--;
+            }
+            break;
+        }
         case OP_RESET_COUNTER:
-            if (((const p_reset_counter *)a)->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) return P.n_serial[WHY_RESET]++, 0;
+            if (((const p_reset_counter *)a)->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
+                if (mv_plan) vk_mv_par_plan_commit(0);
+                return P.n_serial[WHY_RESET]++, 0;
+            }
             break;
         case OP_RENDER_COND: {
             if (P.ncond == P.ccond) {
@@ -241,6 +309,16 @@ static int plan(const VkExec *ex0, const uint64_t *handles, int n, int C) {
             P.n_cond++;
             break;
         }
+        case OP_COPY_B2T:
+            if (((const p_copy_b2t *)a)->tex) vk_texture_get(((const p_copy_b2t *)a)->tex);
+            break;
+        case OP_COPY_T2T:
+            if (((const p_copy_t2t *)a)->src) vk_texture_get(((const p_copy_t2t *)a)->src);
+            if (((const p_copy_t2t *)a)->dst) vk_texture_get(((const p_copy_t2t *)a)->dst);
+            break;
+        case OP_CLEAR_TEX:
+            if (((const p_clear_tex *)a)->tex) vk_texture_get(((const p_clear_tex *)a)->tex);
+            break;
         case OP_UPDATE_UB:
             if (P.nupd == P.cupd) {
                 P.cupd = P.cupd ? P.cupd * 2 : 1024;
@@ -250,16 +328,23 @@ static int plan(const VkExec *ex0, const uint64_t *handles, int n, int C) {
             break;
         default:
             if (is_draw(h->op)) {
+                if (is_gfx_draw(h->op) && !w->render_disabled) {
+                    if (mv_plan) vk_mv_par_plan_draw(w, P.plan_ops + 1, !pass_open);
+                    pass_open = 1;
+                }
                 draws++;
                 if (P.cut_op ? 0 : P.cut ? draws == P.cut
-                             : ++in_chunk >= 2 * chunk_size(P.nch - 1, C) && P.inpass && P.nch < MAX_CHUNKS && !P.dc_img)
+                             : ++in_chunk >= 2 * chunk_size(P.nch - 1, C) && P.inpass && P.nch < MAX_CHUNKS && !P.dc_img) {
+                    if (pass_open) { if (mv_plan) vk_mv_par_plan_pass_close(P.plan_ops + 1); pass_open = 0; }
                     P.plan_ops++, in_chunk = 0, chunk_add(&p, w), P.plan_ops--, P.n_inpass += !P.cut;
+                }
             } else if (!vk_exec_state_op(w, h->op, a) && !vk_exec_bind_state(w, h->op, a)) {
                 vk_exec_xfer_state(w, h->op, a);
             }
         }
         P.plan_ops++;
     }
+    if (pass_open && mv_plan) vk_mv_par_plan_pass_close(P.plan_ops + 1);
     P.plan_draws = draws;
     return 1;
 }
@@ -320,6 +405,10 @@ static void chunk_record(int k, int t, int again) {
     while (ops-- && settle(&p, P.handles, P.n)) {
         const op_hdr *h = p.h;
         p.h = nvn_op_next(h);
+        if (h->op == OP_QUEUE) {
+            vk_exec_op_pos_set(vk_exec_op_pos() + 1);   // queue state switched by plan() at the chunk cut
+            continue;
+        }
         vk_exec_op(ex, h);
     }
     vk_exec_chunk_end(ex);
@@ -366,7 +455,15 @@ static void worker_main(void *arg) {
 }
 
 static void setup(void) {
-    P.mode = rt_knob("REPLAY_PAR", "0");
+    const char *m = cfg_get("MKW_REPLAY_PAR");
+    if (!m || !*m || !strcmp(m, "auto")) {
+        // Default "auto": stays 100% serial for 1P/menus (<4200 draws) and automatically parallelizes heavy
+        // split-screen submissions (>=4200 draws) on 4+ core CPUs without mid-pass cuts (inpass=0).
+        const char *ru = cfg_get("MKW_REUSE");
+        P.mode = (ru && *ru && strcmp(ru, "0")) ? 0 : 3;
+    } else {
+        P.mode = rt_knob("REPLAY_PAR", "0");
+    }
     const char *e = cfg_get("MKW_REPLAY_WALK");
     P.walk_diag = e && atoi(e) > 0;
     e = cfg_get("MKW_REPLAY_PAR_DRAWS");
@@ -377,13 +474,15 @@ static void setup(void) {
     P.warm = e ? atoi(e) : 120;
     e = cfg_get("MKW_REPLAY_PAR_FIRST");   // the first chunk's draws, doubling up to MKW_REPLAY_PAR_DRAWS; 0: all equal
     P.first_draws = e ? atoi(e) : 64;
-    // MKW_REPLAY_PAR_INPASS=0 (a measurement): no cut inside a pass, only where the target changes. Those cuts store
-    // and load the pass's targets again behind a full barrier (pab3); with them the GPU went +1.6-1.9 ms a frame on the
-    // 660M (cut2) and +3 on the GTX 1050 Ti (wpar1).
-    P.inpass = rt_knob("REPLAY_PAR_INPASS", "1") != 0;
+    // MKW_REPLAY_PAR_INPASS: 0 in auto mode (avoids mid-pass store/load doubling GPU time in 4P split-screen),
+    // 1 by default when explicitly forced via MKW_REPLAY_PAR=1|ab.
+    P.inpass = rt_knob("REPLAY_PAR_INPASS", P.mode == 3 ? "0" : "1") != 0;
     e = cfg_get("MKW_REPLAY_PAR_THREADS");   // threads besides the replay thread
     uint32_t cpus = plat_cpu_count();
-    P.threads = e ? atoi(e) : cpus >= 8 ? 3 : cpus >= 4 ? 2 : 1;
+    if (e) P.threads = atoi(e);
+    else if (P.mode == 3) P.threads = cpus >= 10 ? 5 : cpus >= 6 ? 3 : cpus >= 4 ? 2 : 0;
+    else P.threads = cpus >= 8 ? 3 : cpus >= 4 ? 2 : 1;
+    if (P.mode == 3 && !e && P.threads == 0) P.mode = 0;   // <4 logical cores: stay serial
     if (P.threads < 0) P.threads = 0;   // 0: the chunks in order on the replay thread (a check of the chunking alone)
     // MKW_REPLAY_PAR_DEPTH=0 (a measurement): as before 07/11/2026, chunks after the first clear depth layer by layer
     // and are cut between the layers of one depth image.
@@ -414,10 +513,14 @@ static void setup(void) {
     if (P.walk_diag) rt_log("vk: light walk of each submission before its replay (MKW_REPLAY_WALK, a measurement)");
     if (!P.mode) return;
     plat_cond_init(&P.work), plat_cond_init(&P.finished);
-    for (int t = 1; t <= P.threads; t++)
-        if (!plat_thread_spawn(worker_main, (void *)(intptr_t)t, "vk chunks", 0)) rt_fatal("vk: cannot start a replay chunk thread");
-    rt_log("vk: replay in chunks of %d draws on %d threads besides the replay thread%s (MKW_REPLAY_PAR)", P.chunk_draws,
-           P.threads, P.mode == 2 ? ", in the B blocks" : "");
+    if (P.mode != 3) {
+        for (int t = 1; t <= P.threads; t++)
+            if (!plat_thread_spawn(worker_main, (void *)(intptr_t)t, "vk chunks", 0))
+                rt_fatal("vk: cannot start a replay chunk thread");
+        P.workers_up = 1;
+        rt_log("vk: replay in chunks of %d draws on %d threads besides the replay thread%s (MKW_REPLAY_PAR)", P.chunk_draws,
+               P.threads, P.mode == 2 ? ", in the B blocks" : "");
+    }
 }
 
 // A chunk that bound a uniform snapshot copy at a position after a GPU write into that region (made by an earlier
@@ -453,10 +556,6 @@ static void send_ready(int wait) {
         if (P.sent == from) return;
         VkCommandBuffer cbs[MAX_CHUNKS];
         for (int k = from; k < P.sent; k++) cbs[k - from] = P.ch[k].cb;
-        // The part before ends outside a pass, and with its feedback-layout targets back in GENERAL: the chunks begin
-        // with none (vk_exec_chunk_begin), so a depth target the head left in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT was
-        // attached by chunk 0 in GENERAL (the validation layer at vkQueueSubmit2: expects GENERAL, current layout
-        // ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT, depth and stencil aspects, val1 17/11/2026).
         if (!from) {
             if (P.ex->nfbl) vk_exec_barrier(P.ex);
             else vk_exec_pass_end(P.ex);
@@ -467,11 +566,21 @@ static void send_ready(int wait) {
     }
 }
 
+void vk_exec_par_note_draws(uint64_t draws) {
+    if (P.mode != 3) return;
+    if (draws >= 4000 || (P.auto_hot > 0 && draws >= 3300)) {
+        P.auto_hot = 60, P.auto_idle = 0;
+    } else if (P.auto_hot > 0) {
+        if (draws >= 500) P.auto_hot--;
+        else if (++P.auto_idle >= 240) P.auto_hot = 0, P.auto_idle = 0;
+    }
+}
+
 int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag) {
     if (!P.subs++) setup();
     if (P.walk_diag && !P.mode) {   // the walk alone
         uint64_t t0 = kern_now_ns();
-        plan(ex, handles, n, 256);
+        plan(ex, handles, n, 256, 0);
         P.n_draws += (uint64_t)P.plan_draws;
         uint64_t d = kern_now_ns() - t0;
         P.walk_ns += d, P.w_subs++;
@@ -481,11 +590,35 @@ int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag) {
     // A frame dump (MKW_DUMP) records its copies into the command buffer being recorded: with chunk threads that is
     // several at once, so it stays serial; with none (MKW_REPLAY_PAR_THREADS=0) the chunks may be dumped, in their order
     // (diag, which a dump also sets, still keeps them serial: the next step for the title's order fault).
-    if (!P.mode || !RT_KNOB_ON(P.mode) || diag || (vk_dump_armed && P.threads) || P.subs <= (uint64_t)P.warm) return 0;
+    if (!P.mode || (P.mode != 3 && !RT_KNOB_ON(P.mode)) || (P.mode == 3 && P.auto_hot <= 0) || diag ||
+        (vk_dump_armed && P.threads) || P.subs <= (uint64_t)P.warm)
+        return 0;
     if (vk_exec_oq_busy()) return P.n_serial[WHY_BUSY]++, 0;
+    int mv_plan = vk_mv_armed > 0;
     uint64_t t0 = kern_now_ns();
-    if (!plan(ex, handles, n, P.chunk_draws)) return 0;
-    if (P.nch < 2) return P.n_serial[WHY_FEW]++, 0;
+    if (!plan(ex, handles, n, P.chunk_draws, mv_plan)) return 0;
+    if (P.mode == 3) {
+        if (P.plan_draws >= 3300) P.auto_hot = 60, P.auto_idle = 0;
+        else {
+            if (mv_plan) vk_mv_par_plan_commit(0);
+            if (P.plan_draws >= 500 && P.auto_hot > 0) P.auto_hot--;
+            else if (P.plan_draws < 500 && ++P.auto_idle >= 240) P.auto_hot = 0, P.auto_idle = 0;
+            return P.n_serial[WHY_FEW]++, 0;
+        }
+    }
+    if (P.nch < 2) {
+        if (mv_plan) vk_mv_par_plan_commit(0);
+        return P.n_serial[WHY_FEW]++, 0;
+    }
+    if (mv_plan) vk_mv_par_plan_commit(1);
+    if (!P.workers_up) {
+        for (int t = 1; t <= P.threads; t++)
+            if (!plat_thread_spawn(worker_main, (void *)(intptr_t)t, "vk chunks", 0))
+                rt_fatal("vk: cannot start a replay chunk thread");
+        P.workers_up = 1;
+        rt_log("vk: replay in chunks of %d draws on %d threads besides the replay thread, auto on split-screen (MKW_REPLAY_PAR)",
+               P.chunk_draws, P.threads);
+    }
     uint64_t t1 = kern_now_ns();
     P.handles = handles, P.n = n, P.fence = ex->fence, P.ex = ex, P.sent = 0, P.t_job = t1;
     vk_exec_written_share(ex);   // before the head: the chunk threads and this one note at the same fence
@@ -497,6 +630,7 @@ int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag) {
     plat_mutex_unlock(&P.lock);
     take_chunks(0, gen);
     send_ready(1);
+    if (mv_plan) vk_mv_par_end();
     uint64_t t2 = kern_now_ns();
     // The rest of the submission continues from the state after its last op, in the command buffer of the last send.
     VkExec keep = *ex;

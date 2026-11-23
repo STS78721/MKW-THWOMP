@@ -146,6 +146,13 @@ void vk_mv_pass_begin(VkExec *ex);   // THWOMP: before a pass begins: the copy o
 void vk_mv_pass_end(VkExec *ex);     // THWOMP: after a pass completes: capture post-SMAA HUD-less scene before UI
 int vk_mv_capture(VkExec *ex, const void *vs, VkPipelineLayout lay, int minus_w, uint64_t ibuf, int32_t count,
                   int32_t base_vertex, int32_t instances, int32_t base_instance, int triangles);   // THWOMP motion vectors (device/vk_mv.c): the camera block of a scene draw
+// Parallel-replay motion-vector planner (vk_exec_par.c -> vk_mv.c): records split-screen depth blits and HUD-less
+// snapshots during plan()'s sequential walk so worker threads record them without order races or allocations.
+void vk_mv_par_plan_begin(uint64_t frame);
+void vk_mv_par_plan_pass_close(uint64_t op_pos);
+void vk_mv_par_plan_draw(const VkExec *w, uint64_t op_pos, int first_in_pass);
+void vk_mv_par_plan_commit(int ok);
+void vk_mv_par_end(void);
 // Scissor 0 clipped to the render area of the open pass; extent 0: nothing to draw.
 VkRect2D vk_exec_scissor(const VkExec *ex);
 void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h);   // pass size when no attachment is set
@@ -239,6 +246,7 @@ void vk_exec_chunk_end(VkExec *ex);
 // chunks (ex then holds the state after the last op and a new command buffer for the rest); 0: walk as usual. diag: a
 // diagnosis that times ops or passes is on (chunks stay off). vk_exec_par_log: the perf line (MKW_TRACE=perf).
 int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag);
+void vk_exec_par_note_draws(uint64_t draws);   // serial submission draw count, for MKW_REPLAY_PAR=auto
 void vk_exec_written_share(VkExec *ex);   // vk_exec_cb.c: its chunks report each GPU-written range once (vk_exec_written.c)
 void vk_exec_par_log(void);
 void vk_exec_draw_probe_log(void);   // MKW_DRAW_CACHE_PROBE (vk_exec_dcache.c)

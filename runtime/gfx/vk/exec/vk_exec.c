@@ -717,8 +717,11 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     for (int i = 0; i < n; i++)
         if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
     if (n && vk_exec_par(ex, handles, n, op_timing > 0 || pt_on > 0)) part_start = ex->recorded;   // chunks submitted
-    else
+    else {
+        uint64_t d0 = vk_exec_frame.draws_seen;
         for (int i = 0; i < n; i++) walk(ex, nvn_op_first(handles[i]), 0);
+        if (n) vk_exec_par_note_draws(vk_exec_frame.draws_seen - d0);
+    }
     b0 = op_timing > 0 ? plat_cycles() : 0;
     vk_exec_pass_end(ex);
     x_cur = x_here_ex = NULL;

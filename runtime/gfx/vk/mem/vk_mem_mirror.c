@@ -253,7 +253,6 @@ void mirror_reset(VkCtx *c) {
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
 static void mirror_sync(PoolRec *r) {
     uint64_t t0 = qpc();
-    r->acc_sub = msub;
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
     int excl = 0;
@@ -304,6 +303,7 @@ static void mirror_sync(PoolRec *r) {
         b = b < hi ? (b + 0xfff) & ~0xfffull : hi;
         if (a < b) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
     }
+    __atomic_store_n(&r->acc_sub, msub, __ATOMIC_RELEASE);
     mrep.syncs++;
     mrep.sync_t += qpc() - t0;
 }
@@ -416,11 +416,18 @@ void vk_mem_mirror_begin(void) {
     mrep.presnap_t += qpc() - t0;
 }
 
-int vk_mem_mirror_pending(void) { return npend + mmerge_pending(); }
+int vk_mem_mirror_pending(void) {
+    plat_mutex_lock(&use_lock);
+    int n = npend + mmerge_pending();
+    plat_mutex_unlock(&use_lock);
+    return n;
+}
 
 void vk_mem_mirror_prologue(VkCommandBuffer cb) {
+    plat_mutex_lock(&use_lock);
     if (!npend) {   // only the bases of the merged write-backs (vk_mem_mmerge.c), which need no barrier before them
         mmerge_prologue(cb, 0);
+        plat_mutex_unlock(&use_lock);
         return;
     }
     // A shadowed pool's mirror is copied from its shadow, which holds the writes stamped up to its sgen only. A pool
@@ -448,6 +455,7 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb) {
     vk_crumb_end(cb, VK_CRUMB_OP, crumb);
     npend = 0;
     mrep.prologues++;
+    plat_mutex_unlock(&use_lock);
 }
 
 // ---- verify mode

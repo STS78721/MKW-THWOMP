@@ -25,6 +25,7 @@
 #include "mv_vel_vs_spv.h"
 #include "nvn_api.h"
 #include "platform/platform.h"
+#include "tex.h"
 #include "vk_exec.h"
 
 #define SLOTS 8
@@ -42,8 +43,62 @@ typedef struct {
     int cut;
 } Cam;
 
+#define SP_SLOTS 3
+#define SP_MAX_VIEWS 4
+
+typedef struct {
+    float r[32][4];
+    int32_t vx, vy, vw, vh;
+    int cut;
+} SpView;
+
+typedef struct {
+    uint64_t frame;
+    uint32_t w, h;
+    VkFormat dfmt;
+    int nviews;
+    SpView v[SP_MAX_VIEWS];
+} SpFrame;
+
 static PlatMutex ml = PLAT_MUTEX_INIT;
-static Cam pend, ready, last;
+static Cam pend, ready, last, cur_v;
+static SpFrame sp_pend, sp_ready, sp_last;
+static uint32_t last_crop_w, last_crop_h;   // atomic: last present crop size (splits skip XFB & jitter)
+
+// Parallel-replay planner state (vk_exec_par.c): plan() walks ops sequentially on the replay thread and records
+// depth-tile copies and HUD-less snapshots keyed by op_pos range, then pre-allocates SP.depth/H.img before chunk
+// worker threads start so workers record pure Vulkan commands with zero locks, allocations, or order races.
+enum { PAR_ACT_NONE = 0, PAR_ACT_SP_DEPTH, PAR_ACT_HUD_BEGIN, PAR_ACT_HUD_END };
+#define PAR_MAX_ACTS 16
+typedef struct {
+    uint64_t lo, hi;
+    int kind;
+    VkImage src_depth;
+    VkFormat dfmt;
+    uint32_t sw, sh;
+    int32_t vx, vy, vw, vh;
+    int first_tile;
+    VkExecTarget src;
+    int copy_after;
+} MvParAct;
+
+static struct {
+    int active;
+    uint64_t frame;
+    Cam pend, cur_v;
+    SpFrame sp_pend;
+    VkExecTarget comp_exec, scene;
+    uint64_t comp_frame, scene_frame, smaa_frame, done_frame;
+    VkImage smaa_target;
+    MvParAct acts[PAR_MAX_ACTS];
+    int nacts, open_act;
+    int sp_needed;
+    uint32_t sp_w, sp_h;
+    VkFormat sp_dfmt;
+    int hud_needed;
+    uint32_t hud_w, hud_h;
+    VkFormat hud_f;
+} PP;
 static int flipy = 1, zmode = 0;
 static int jitter_on;   // MKW_MV_JITTER (camera jitter, below)
 static uint64_t shot_lo, shot_hi, shot_step;
@@ -143,15 +198,29 @@ static void jitter_apply(const p_bind_buf *u, uint64_t frame) {
 }
 
 void vk_mv_draw(VkExec *ex) {
+    if (__atomic_load_n(&PP.active, __ATOMIC_ACQUIRE)) return;
     const p_bind_buf *u = &ex->ubo[0][1];   // vertex stage, c4
     if (u->size != CAM_SIZE || !u->addr || !ex->depth.image) return;
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    if (jitter_on && ex->depth.width == (uint32_t)((const float *)(uintptr_t)u->addr)[18 * 4]) jitter_apply(u, frame);
-    if (__atomic_load_n(&pend.frame, __ATOMIC_RELAXED) == frame) return;
+    uint32_t lcw = __atomic_load_n(&last_crop_w, __ATOMIC_RELAXED);
+    uint32_t lch = __atomic_load_n(&last_crop_h, __ATOMIC_RELAXED);
+    int full_sz = !lcw || (ex->depth.width == lcw && ex->depth.height == lch);
+    if (jitter_on && full_sz && ex->depth.width == (uint32_t)((const float *)(uintptr_t)u->addr)[18 * 4])
+        jitter_apply(u, frame);
+    // In 1P (full-size target), fast-exit once pend is recorded for this frame; in split-screen (sub-frame target),
+    // keep tracking cur_v so every player's camera block and scene depth image are captured in turn.
+    if (full_sz && __atomic_load_n(&pend.frame, __ATOMIC_RELAXED) == frame) return;
+    // Ignore secondary RGBA8 overlay depth passes (e.g. split-screen per-pane UI depth): keep only the 3D scene depth.
+    if (ex->pass_ncolor > 0 && ex->color[0].format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return;
     VkMemSpan ms;
     if (!vk_mem_resolve(u->addr, 1, &ms) || ms.avail < 32 * 16) return;
     const float *f = (const float *)(uintptr_t)u->addr;
     if ((uint32_t)f[18 * 4] != ex->depth.width || (uint32_t)f[18 * 4 + 1] != ex->depth.height) return;
+    // Fast skip in split-screen when cur_v already holds this player's camera & depth on this frame.
+    if (__atomic_load_n(&cur_v.frame, __ATOMIC_RELAXED) == frame && cur_v.depth == ex->depth.image &&
+        fabsf(f[11 * 4 + 3] - cur_v.r[11][3]) < 1e-4f && fabsf(f[12 * 4 + 3] - cur_v.r[12][3]) < 1e-4f &&
+        fabsf(f[13 * 4 + 3] - cur_v.r[13][3]) < 1e-4f)
+        return;
     plat_mutex_lock(&ml);
     if (pend.frame != frame) {
         memcpy(pend.r, f, sizeof pend.r);
@@ -159,23 +228,31 @@ void vk_mv_draw(VkExec *ex) {
         pend.w = ex->depth.width, pend.h = ex->depth.height;
         pend.frame = frame;
     }
+    memcpy(cur_v.r, f, sizeof cur_v.r);
+    cur_v.depth = ex->depth.image, cur_v.dfmt = ex->depth.format;
+    cur_v.w = ex->depth.width, cur_v.h = ex->depth.height;
+    cur_v.frame = frame;
     plat_mutex_unlock(&ml);
+}
+
+static int is_camera_cut_rows(const float cur_r[32][4], const float prev_r[32][4]) {
+    // Game writes prev view-projection into rows 24..27; any jump relative to last frame's 3..6 means a camera cut.
+    float worst = 0;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) worst = fmaxf(worst, fabsf(cur_r[24 + i][j] - prev_r[3 + i][j]));
+    if (worst > 0.05f) return 1;
+    // Also detect same-frame map teleports or FOV snaps where the game updated rows 24..27 together with the jump.
+    float dx = cur_r[11][3] - prev_r[11][3], dy = cur_r[12][3] - prev_r[12][3], dz = cur_r[13][3] - prev_r[13][3];
+    if (dx * dx + dy * dy + dz * dz > 80.0f * 80.0f) return 1;
+    float fdot = cur_r[11][2] * prev_r[11][2] + cur_r[12][2] * prev_r[12][2] + cur_r[13][2] * prev_r[13][2];
+    if (fdot < 0.7f) return 1;
+    if (fabsf(cur_r[8][1] - prev_r[8][1]) > 0.25f * fabsf(prev_r[8][1])) return 1;
+    return 0;
 }
 
 static int is_camera_cut(const Cam *cur, const Cam *prev) {
     if (!prev->frame || prev->frame + 1 != cur->frame) return 1;
-    // Game writes prev view-projection into rows 24..27; any jump relative to last frame's 3..6 means a camera cut.
-    float worst = 0;
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) worst = fmaxf(worst, fabsf(cur->r[24 + i][j] - prev->r[3 + i][j]));
-    if (worst > 0.05f) return 1;
-    // Also detect same-frame map teleports or FOV snaps where the game updated rows 24..27 together with the jump.
-    float dx = cur->r[11][3] - prev->r[11][3], dy = cur->r[12][3] - prev->r[12][3], dz = cur->r[13][3] - prev->r[13][3];
-    if (dx * dx + dy * dy + dz * dz > 80.0f * 80.0f) return 1;
-    float fdot = cur->r[11][2] * prev->r[11][2] + cur->r[12][2] * prev->r[12][2] + cur->r[13][2] * prev->r[13][2];
-    if (fdot < 0.7f) return 1;
-    if (fabsf(cur->r[8][1] - prev->r[8][1]) > 0.25f * fabsf(prev->r[8][1])) return 1;
-    return 0;
+    return is_camera_cut_rows(cur->r, prev->r);
 }
 
 // The replay thread at frame's present: its capture becomes the one the present uses.
@@ -198,6 +275,19 @@ void vk_mv_frame(uint64_t frame) {
         ready = pend;
     } else {
         ready.frame = 0;   // no 3D scene this frame (a menu): the debug view shows the picture
+    }
+    if (sp_pend.frame == frame && sp_pend.nviews >= 2) {
+        int cont = sp_last.frame + 1 == frame && sp_last.nviews == sp_pend.nviews;
+        for (int k = 0; k < sp_pend.nviews; k++) {
+            int same_rect = cont && sp_last.v[k].vx == sp_pend.v[k].vx && sp_last.v[k].vy == sp_pend.v[k].vy &&
+                            sp_last.v[k].vw == sp_pend.v[k].vw && sp_last.v[k].vh == sp_pend.v[k].vh;
+            sp_pend.v[k].cut = !same_rect || is_camera_cut_rows(sp_pend.v[k].r, sp_last.v[k].r);
+        }
+        sp_last = sp_pend;
+        sp_ready = sp_pend;
+    } else {
+        sp_ready.frame = 0;
+        sp_ready.nviews = 0;
     }
     plat_mutex_unlock(&ml);
 }
@@ -515,7 +605,11 @@ static VkPipeline capture_pipeline(VkExec *ex, const GfxShader *vs, VkPipelineLa
 // discard turned on; the caller binds the game's pipeline and its discard state again.
 int vk_mv_capture(VkExec *ex, const void *vs, VkPipelineLayout lay, int minus_w, uint64_t ibuf, int32_t count,
                   int32_t base_vertex, int32_t instances, int32_t base_instance, int triangles) {
+    if (__atomic_load_n(&PP.active, __ATOMIC_ACQUIRE)) return 0;
     if (!triangles || instances > 1 || !lay || !vs || !ex->pipe.ds.dw || !ex->depth.image || count <= 0) return 0;
+    uint32_t lcw = __atomic_load_n(&last_crop_w, __ATOMIC_RELAXED);
+    uint32_t lch = __atomic_load_n(&last_crop_h, __ATOMIC_RELAXED);
+    if (lcw && (ex->depth.width != lcw || ex->depth.height != lch)) return 0;   // split-screen: skip XFB drains
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     if (__atomic_load_n(&pend.frame, __ATOMIC_RELAXED) != frame || ex->depth.width != pend.w ||
         ex->depth.image != pend.depth)
@@ -753,6 +847,11 @@ static struct {
 
 static int hud_images(VkCtx *c, uint32_t w, uint32_t h, VkFormat f) {
     if (H.img[0] && H.w == w && H.h == h && H.f == f) return 1;
+    if (H.img[0]) {
+        vk_queue_lock();
+        vkDeviceWaitIdle(c->device);
+        vk_queue_unlock();
+    }
     for (int i = 0; i < HUD_SLOTS; i++) {
         if (!H.img[i]) continue;
         vkDestroyImageView(c->device, H.v[i], NULL), vmaDestroyImage(c->vma, H.img[i], H.a[i]);
@@ -775,9 +874,15 @@ static int hud_images(VkCtx *c, uint32_t w, uint32_t h, VkFormat f) {
     return 1;
 }
 
-static void hud_copy(VkExec *ex, const VkExecTarget *src, VkImageLayout src_layout, uint64_t frame, int after_pass) {
-    if (!src->image || !hud_images(vk_ctx(), src->width, src->height, src->format)) return;
+static VkImageLayout live_layout(const VkExec *ex, VkImage img) {
+    for (int i = 0; i < ex->nfbl; i++)
+        if (ex->fbl_img[i] == img) return VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+    return VK_IMAGE_LAYOUT_GENERAL;
+}
+
+static void hud_copy_cb(VkExec *ex, const VkExecTarget *src, VkImageLayout src_layout, uint64_t frame, int after_pass) {
     int s = (int)(frame % HUD_SLOTS);
+    if (!src->image || !H.img[s]) return;
     VkImageMemoryBarrier2 bs[2];
     uint32_t nb = 0;
     if (after_pass) {
@@ -819,18 +924,402 @@ static void hud_copy(VkExec *ex, const VkExecTarget *src, VkImageLayout src_layo
         ex->recorded += 2;
         vk_exec_barrier(ex);
     }
-    H.frame[s] = frame;
+}
+
+static void hud_copy(VkExec *ex, const VkExecTarget *src, VkImageLayout src_layout, uint64_t frame, int after_pass) {
+    if (!src->image || !hud_images(vk_ctx(), src->width, src->height, src->format)) return;
+    hud_copy_cb(ex, src, src_layout, frame, after_pass);
+    H.frame[frame % HUD_SLOTS] = frame;
     if (++H.copies == 1) rt_log("mv: picture without the HUD taken at frame %llu", (unsigned long long)frame);
 }
 
-// The replay thread, in vk_exec_pass_begin after its barrier and before the pass begins.
+// ---- split-screen composite depth ring (2P/3P/4P): MKW reuses one per-player depth image sequentially across
+// player views and composites each view into a full-screen B10G11R11 target using that player's viewport rect.
+// Copying/blitting each player's depth into SP.depth[frame % SP_SLOTS] right before its composite pass preserves
+// every player's depth and camera matrix without affecting 1P (0 bytes allocated when split-screen is not used).
+static struct {
+    VkImage depth[SP_SLOTS];
+    VmaAllocation a[SP_SLOTS];
+    VkImageView v[SP_SLOTS];
+    uint64_t frame[SP_SLOTS];
+    uint32_t w, h;
+    VkFormat f;
+    VkExecTarget comp_exec;
+    uint64_t comp_frame;
+    int logged;
+} SP;
+
+static VkImageAspectFlags depth_aspect(VkFormat fmt) {
+    return fmt == VK_FORMAT_D32_SFLOAT_S8_UINT || fmt == VK_FORMAT_D24_UNORM_S8_UINT
+               ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+               : VK_IMAGE_ASPECT_DEPTH_BIT;
+}
+
+static int sp_depth_images(VkCtx *c, uint32_t w, uint32_t h, VkFormat f) {
+    if (SP.depth[0] && SP.w == w && SP.h == h && SP.f == f) return 1;
+    if (SP.depth[0]) {
+        vk_queue_lock();
+        vkDeviceWaitIdle(c->device);
+        vk_queue_unlock();
+        for (int i = 0; i < SP_SLOTS; i++) {
+            if (!SP.depth[i]) continue;
+            vkDestroyImageView(c->device, SP.v[i], NULL), vmaDestroyImage(c->vma, SP.depth[i], SP.a[i]);
+            SP.depth[i] = VK_NULL_HANDLE, SP.v[i] = VK_NULL_HANDLE, SP.frame[i] = 0;
+        }
+    }
+    VkImageUsageFlags u = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    for (int i = 0; i < SP_SLOTS; i++) {
+        VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
+                                .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = u};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(c->vma, &ii, &ai, &SP.depth[i], &SP.a[i], NULL) != VK_SUCCESS)
+            return SP.depth[i] = VK_NULL_HANDLE, 0;
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = SP.depth[i],
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = f,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(c->device, &vi, NULL, &SP.v[i]) != VK_SUCCESS) return 0;
+    }
+    SP.w = w, SP.h = h, SP.f = f;
+    rt_log("mv: split-screen depth composite %ux%u, format %d", w, h, (int)f);
+    return 1;
+}
+
+static void sp_copy_depth_tile(VkExec *ex, VkImage src_depth, VkFormat dfmt, uint32_t sw, uint32_t sh,
+                               int32_t vx, int32_t vy, int32_t vw, int32_t vh, uint64_t frame, int first_tile) {
+    int s = (int)(frame % SP_SLOTS);
+    VkImage dst = SP.depth[s];
+    if (!dst) return;
+    VkImageAspectFlags dasp = depth_aspect(dfmt);
+    VkImageMemoryBarrier2 bs[2];
+    bs[0] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                    .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                    .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                    .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .image = src_depth, .subresourceRange = {dasp, 0, 1, 0, 1}};
+    bs[1] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                    .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                    .srcAccessMask = first_tile ? 0 : VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                    .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                    .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                    .oldLayout = first_tile ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+                                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .image = dst, .subresourceRange = {dasp, 0, 1, 0, 1}};
+    VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = bs};
+    vkCmdPipelineBarrier2(ex->cb, &d);
+    if (first_tile) {
+        VkClearDepthStencilValue clr = {1.0f, 0};
+        VkImageSubresourceRange rng = {dasp, 0, 1, 0, 1};
+        vkCmdClearDepthStencilImage(ex->cb, dst, VK_IMAGE_LAYOUT_GENERAL, &clr, 1, &rng);
+        VkImageMemoryBarrier2 cb = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                    .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                    .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                    .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                    .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .image = dst, .subresourceRange = {dasp, 0, 1, 0, 1}};
+        VkDependencyInfo cd = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &cb};
+        vkCmdPipelineBarrier2(ex->cb, &cd);
+        ex->recorded += 2;
+    }
+    if ((int32_t)sw == vw && (int32_t)sh == vh) {
+        VkImageCopy r = {.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .srcOffset = {0, 0, 0},
+                         .dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .dstOffset = {vx, vy, 0},
+                         .extent = {(uint32_t)vw, (uint32_t)vh, 1}};
+        vkCmdCopyImage(ex->cb, src_depth, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    } else {
+        VkImageBlit r = {.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)sw, (int32_t)sh, 1}},
+                         .dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .dstOffsets = {{vx, vy, 0}, {vx + vw, vy + vh, 1}}};
+        vkCmdBlitImage(ex->cb, src_depth, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &r, VK_FILTER_NEAREST);
+    }
+    VkImageMemoryBarrier2 post = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                  .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                  .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                  .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                  .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                  .image = dst, .subresourceRange = {dasp, 0, 1, 0, 1}};
+    VkDependencyInfo pd = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &post};
+    vkCmdPipelineBarrier2(ex->cb, &pd);
+    ex->recorded += 3;
+    if (!__atomic_load_n(&PP.active, __ATOMIC_ACQUIRE)) SP.frame[s] = frame;
+}
+
+static uint32_t mv_level_ext(uint32_t v, uint32_t level) {
+    v >>= level;
+    return v ? v : 1;
+}
+
+static int plan_target(const tex_t *tx, const view_t *v, int has_v, int depth_slot, VkExecTarget *o) {
+    memset(o, 0, sizeof *o);
+    if (!tx) return 0;
+    const VkTexImage *img = vk_texture_get(tx);
+    if (!img || !img->image) return 0;
+    uint32_t level = has_v && v->set_levels ? v->base_level : 0;
+    if (img->drop) {
+        if (level < img->drop) return 0;
+        level -= img->drop;
+    }
+    if (level >= img->levels) return 0;
+    o->tex = tx, o->img = img, o->image = img->image, o->format = img->format;
+    if (!depth_slot && has_v && v->set_format) {
+        TexVkFormat tf;
+        if (tex_vk_format(v->format, &tf) && tf.vk == tf.ideal && !tf.depth && !tf.stencil) o->format = tf.vk;
+    }
+    o->level = level, o->base_layer = has_v && v->set_layers ? v->min_layer : 0;
+    o->width = mv_level_ext(img->width, level), o->height = mv_level_ext(img->height, level);
+    o->is3d = img->type == VK_IMAGE_TYPE_3D && !depth_slot;
+    return 1;
+}
+
+void vk_mv_par_plan_begin(uint64_t frame) {
+    memset(&PP, 0, sizeof PP);
+    PP.frame = frame, PP.open_act = -1;
+    plat_mutex_lock(&ml);
+    PP.pend = pend, PP.cur_v = cur_v, PP.sp_pend = sp_pend;
+    PP.comp_exec = SP.comp_exec, PP.comp_frame = SP.comp_frame;
+    PP.scene = H.scene, PP.scene_frame = H.scene_frame;
+    PP.smaa_target = H.smaa_target, PP.smaa_frame = H.smaa_frame, PP.done_frame = H.done_frame;
+    plat_mutex_unlock(&ml);
+}
+
+void vk_mv_par_plan_pass_close(uint64_t op_pos) {
+    if (PP.open_act >= 0) {
+        PP.acts[PP.open_act].hi = op_pos;
+        PP.open_act = -1;
+    }
+}
+
+void vk_mv_par_plan_draw(const VkExec *w, uint64_t op_pos, int first_in_pass) {
+    uint64_t frame = PP.frame;
+    uint32_t lcw = __atomic_load_n(&last_crop_w, __ATOMIC_RELAXED);
+    uint32_t lch = __atomic_load_n(&last_crop_h, __ATOMIC_RELAXED);
+    VkExecTarget dt = {0}, ct = {0};
+    int has_d = w->rt.depth && plan_target(w->rt.depth, &w->rt.dview, w->rt.has_dview, 1, &dt);
+    int has_c = w->rt.n >= 1 && w->rt.color[0] && plan_target(w->rt.color[0], &w->rt.cview[0], w->rt.has_cview[0], 0, &ct);
+
+    // 1. Track camera + scene depth (mirrors vk_mv_draw in exact chronological order).
+    if (has_d) {
+        const p_bind_buf *u = &w->ubo[0][1];
+        if (u->size == CAM_SIZE && u->addr) {
+            int full_sz = !lcw || (dt.width == lcw && dt.height == lch);
+            if (!(full_sz && PP.pend.frame == frame) && (!has_c || ct.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)) {
+                VkMemSpan ms;
+                if (vk_mem_resolve(u->addr, 1, &ms) && ms.avail >= 32 * 16) {
+                    const float *f = (const float *)(uintptr_t)u->addr;
+                    if ((uint32_t)f[18 * 4] == dt.width && (uint32_t)f[18 * 4 + 1] == dt.height) {
+                        if (PP.pend.frame != frame) {
+                            memcpy(PP.pend.r, f, sizeof PP.pend.r);
+                            PP.pend.depth = dt.image, PP.pend.dfmt = dt.format;
+                            PP.pend.w = dt.width, PP.pend.h = dt.height, PP.pend.frame = frame;
+                        }
+                        if (PP.cur_v.frame != frame || PP.cur_v.depth != dt.image ||
+                            fabsf(f[11 * 4 + 3] - PP.cur_v.r[11][3]) >= 1e-4f ||
+                            fabsf(f[12 * 4 + 3] - PP.cur_v.r[12][3]) >= 1e-4f ||
+                            fabsf(f[13 * 4 + 3] - PP.cur_v.r[13][3]) >= 1e-4f) {
+                            memcpy(PP.cur_v.r, f, sizeof PP.cur_v.r);
+                            PP.cur_v.depth = dt.image, PP.cur_v.dfmt = dt.format;
+                            PP.cur_v.w = dt.width, PP.cur_v.h = dt.height, PP.cur_v.frame = frame;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!first_in_pass || !has_c || ct.is3d) return;
+
+    // 2. Plan split-screen depth tile copies and HUD-less snapshots (mirrors vk_mv_pass_begin / vk_mv_pass_end).
+    int is_sub_pend = lcw && (PP.pend.w != lcw || PP.pend.h != lch);
+    if (!has_d) {
+        int32_t vx = w->has_vp ? (int32_t)lroundf(w->vp[0][0]) : 0;
+        int32_t vy = w->has_vp ? (int32_t)lroundf(w->vp[0][1]) : 0;
+        int32_t vw = w->has_vp ? (int32_t)lroundf(w->vp[0][2]) : (int32_t)ct.width;
+        int32_t vh = w->has_vp ? (int32_t)lroundf(w->vp[0][3]) : (int32_t)ct.height;
+        int sub_vp = w->has_vp && vw > 0 && vh > 0 && (vw < (int32_t)ct.width || vh < (int32_t)ct.height) &&
+                     vx >= 0 && vy >= 0 && vx + vw <= (int32_t)ct.width && vy + vh <= (int32_t)ct.height;
+        if (ct.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && sub_vp && PP.cur_v.frame == frame && PP.cur_v.depth &&
+            (ct.width > PP.cur_v.w || ct.height > PP.cur_v.h)) {
+            if (PP.sp_pend.frame != frame || PP.sp_pend.w != ct.width || PP.sp_pend.h != ct.height) {
+                PP.sp_pend.frame = frame, PP.sp_pend.w = ct.width, PP.sp_pend.h = ct.height;
+                PP.sp_pend.dfmt = PP.cur_v.dfmt, PP.sp_pend.nviews = 0;
+            }
+            int dup = 0;
+            for (int k = 0; k < PP.sp_pend.nviews; k++)
+                if (PP.sp_pend.v[k].vx == vx && PP.sp_pend.v[k].vy == vy && PP.sp_pend.v[k].vw == vw &&
+                    PP.sp_pend.v[k].vh == vh)
+                    dup = 1;
+            if (!dup && PP.sp_pend.nviews < SP_MAX_VIEWS && PP.nacts < PAR_MAX_ACTS) {
+                SpView *sv = &PP.sp_pend.v[PP.sp_pend.nviews];
+                memcpy(sv->r, PP.cur_v.r, sizeof sv->r);
+                sv->vx = vx, sv->vy = vy, sv->vw = vw, sv->vh = vh, sv->cut = 0;
+                int first_tile = PP.sp_pend.nviews == 0;
+                PP.sp_pend.nviews++;
+                PP.comp_exec = ct, PP.comp_frame = frame;
+                MvParAct *act = &PP.acts[PP.nacts];
+                memset(act, 0, sizeof *act);
+                act->lo = op_pos, act->hi = UINT64_MAX, act->kind = PAR_ACT_SP_DEPTH;
+                act->src_depth = PP.cur_v.depth, act->dfmt = PP.cur_v.dfmt;
+                act->sw = PP.cur_v.w, act->sh = PP.cur_v.h;
+                act->vx = vx, act->vy = vy, act->vw = vw, act->vh = vh, act->first_tile = first_tile;
+                PP.open_act = PP.nacts++;
+                PP.sp_needed = 1, PP.sp_w = ct.width, PP.sp_h = ct.height, PP.sp_dfmt = PP.cur_v.dfmt;
+            }
+        } else if (PP.sp_pend.frame == frame && PP.sp_pend.nviews >= 2 && PP.comp_frame == frame &&
+                   PP.done_frame != frame && PP.nacts < PAR_MAX_ACTS) {
+            int full_on_comp = ct.image == PP.comp_exec.image && !sub_vp;
+            int final_srgb = ct.format == VK_FORMAT_R8G8B8A8_SRGB;
+            if (full_on_comp || final_srgb) {
+                PP.done_frame = frame;
+                MvParAct *act = &PP.acts[PP.nacts];
+                memset(act, 0, sizeof *act);
+                act->lo = op_pos, act->hi = UINT64_MAX, act->kind = PAR_ACT_HUD_BEGIN;
+                act->src = PP.comp_exec, act->copy_after = 1;
+                PP.open_act = PP.nacts++;
+                PP.hud_needed = 1, PP.hud_w = PP.comp_exec.width, PP.hud_h = PP.comp_exec.height;
+                PP.hud_f = PP.comp_exec.format;
+            }
+        }
+    }
+    if (PP.pend.frame == frame && PP.done_frame != frame && !is_sub_pend && PP.nacts < PAR_MAX_ACTS) {
+        int render_size = ct.width == PP.pend.w && ct.height == PP.pend.h;
+        if (render_size) {
+            if (has_d && dt.image == PP.pend.depth && ct.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+                PP.scene = ct, PP.scene_frame = frame;
+            else if (!has_d && ct.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && PP.scene_frame == frame) {
+                if (ct.image != PP.scene.image) {
+                    PP.smaa_target = ct.image, PP.smaa_frame = frame, PP.done_frame = frame;
+                    MvParAct *act = &PP.acts[PP.nacts];
+                    memset(act, 0, sizeof *act);
+                    act->lo = op_pos, act->hi = UINT64_MAX, act->kind = PAR_ACT_HUD_END;
+                    act->src = ct, act->copy_after = 1;
+                    PP.open_act = PP.nacts++;
+                    PP.hud_needed = 1, PP.hud_w = ct.width, PP.hud_h = ct.height, PP.hud_f = ct.format;
+                } else {
+                    PP.done_frame = frame;
+                    MvParAct *act = &PP.acts[PP.nacts];
+                    memset(act, 0, sizeof *act);
+                    act->lo = op_pos, act->hi = UINT64_MAX, act->kind = PAR_ACT_HUD_BEGIN;
+                    act->src = PP.scene, act->copy_after = 0;
+                    PP.open_act = PP.nacts++;
+                    PP.hud_needed = 1, PP.hud_w = PP.scene.width, PP.hud_h = PP.scene.height, PP.hud_f = PP.scene.format;
+                }
+            }
+        } else if (!has_d && ct.format == VK_FORMAT_R8G8B8A8_SRGB && PP.scene_frame == frame) {
+            PP.done_frame = frame;
+            MvParAct *act = &PP.acts[PP.nacts];
+            memset(act, 0, sizeof *act);
+            act->lo = op_pos, act->hi = UINT64_MAX, act->kind = PAR_ACT_HUD_BEGIN;
+            act->src = PP.scene, act->copy_after = 0;
+            PP.open_act = PP.nacts++;
+            PP.hud_needed = 1, PP.hud_w = PP.scene.width, PP.hud_h = PP.scene.height, PP.hud_f = PP.scene.format;
+        }
+    }
+}
+
+void vk_mv_par_plan_commit(int ok) {
+    if (PP.open_act >= 0) PP.open_act = -1;
+    if (!ok) {
+        PP.nacts = 0;
+        __atomic_store_n(&PP.active, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    VkCtx *c = vk_ctx();
+    int sp_ok = !PP.sp_needed || sp_depth_images(c, PP.sp_w, PP.sp_h, PP.sp_dfmt);
+    int hud_ok = !PP.hud_needed || hud_images(c, PP.hud_w, PP.hud_h, PP.hud_f);
+    plat_mutex_lock(&ml);
+    pend = PP.pend, cur_v = PP.cur_v, sp_pend = PP.sp_pend;
+    SP.comp_exec = PP.comp_exec, SP.comp_frame = PP.comp_frame;
+    H.scene = PP.scene, H.scene_frame = PP.scene_frame;
+    H.smaa_target = PP.smaa_target, H.smaa_frame = PP.smaa_frame, H.done_frame = PP.done_frame;
+    if (PP.sp_needed && sp_ok) SP.frame[PP.frame % SP_SLOTS] = PP.frame;
+    if (PP.hud_needed && hud_ok) {
+        H.frame[PP.frame % HUD_SLOTS] = PP.frame;
+        if (++H.copies == 1) rt_log("mv: picture without the HUD taken at frame %llu", (unsigned long long)PP.frame);
+    }
+    plat_mutex_unlock(&ml);
+    __atomic_store_n(&PP.active, 1, __ATOMIC_RELEASE);
+}
+
+void vk_mv_par_end(void) { __atomic_store_n(&PP.active, 0, __ATOMIC_RELEASE); }
+
+// The replay thread (or chunk workers during MKW_REPLAY_PAR), in vk_exec_pass_begin after its barrier.
 void vk_mv_pass_begin(VkExec *ex) {
+    if (__atomic_load_n(&PP.active, __ATOMIC_ACQUIRE)) {
+        uint64_t pos = vk_exec_op_pos();
+        for (int i = 0; i < PP.nacts; i++) {
+            const MvParAct *act = &PP.acts[i];
+            if (pos < act->lo || pos > act->hi) continue;
+            if (act->kind == PAR_ACT_SP_DEPTH)
+                sp_copy_depth_tile(ex, act->src_depth, act->dfmt, act->sw, act->sh, act->vx, act->vy, act->vw, act->vh,
+                                   PP.frame, act->first_tile);
+            else if (act->kind == PAR_ACT_HUD_BEGIN)
+                hud_copy_cb(ex, &act->src, live_layout(ex, act->src.image), PP.frame, act->copy_after);
+        }
+        return;
+    }
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     const VkExecTarget *t = &ex->color[0];
-    int render_size = ex->pass_ncolor >= 1 && t->image && !t->is3d && t->width == pend.w && t->height == pend.h;
+    uint32_t lcw = __atomic_load_n(&last_crop_w, __ATOMIC_RELAXED);
+    uint32_t lch = __atomic_load_n(&last_crop_h, __ATOMIC_RELAXED);
+    int is_sub_pend = lcw && (pend.w != lcw || pend.h != lch);
+    int render_size = !is_sub_pend && ex->pass_ncolor >= 1 && t->image && !t->is3d && t->width == pend.w && t->height == pend.h;
     VkExecTarget src = {0};
+    int copy_after = 0;
+    // Deferred depth blit info if this pass is a split-screen player composite pass
+    int do_sp_depth = 0, sp_first = 0;
+    VkImage sp_src_depth = VK_NULL_HANDLE;
+    VkFormat sp_dfmt = VK_FORMAT_UNDEFINED;
+    uint32_t sp_sw = 0, sp_sh = 0, sp_tw = 0, sp_th = 0;
+    int32_t sp_vx = 0, sp_vy = 0, sp_vw = 0, sp_vh = 0;
+
     plat_mutex_lock(&ml);
-    if (pend.frame == frame && H.done_frame != frame) {
+    // Split-screen: detect each player's sub-viewport composite into the full-screen B10G11R11 target, then
+    // snapshot that composite target right before the full-screen HUD or final sRGB pass.
+    if (!ex->depth.image && ex->pass_ncolor >= 1 && t->image && !t->is3d) {
+        int32_t vx = ex->has_vp ? (int32_t)lroundf(ex->vp[0][0]) : 0;
+        int32_t vy = ex->has_vp ? (int32_t)lroundf(ex->vp[0][1]) : 0;
+        int32_t vw = ex->has_vp ? (int32_t)lroundf(ex->vp[0][2]) : (int32_t)t->width;
+        int32_t vh = ex->has_vp ? (int32_t)lroundf(ex->vp[0][3]) : (int32_t)t->height;
+        int sub_vp = ex->has_vp && vw > 0 && vh > 0 && (vw < (int32_t)t->width || vh < (int32_t)t->height) &&
+                     vx >= 0 && vy >= 0 && vx + vw <= (int32_t)t->width && vy + vh <= (int32_t)t->height;
+        if (t->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && sub_vp && cur_v.frame == frame && cur_v.depth &&
+            (t->width > cur_v.w || t->height > cur_v.h)) {
+            if (sp_pend.frame != frame || sp_pend.w != t->width || sp_pend.h != t->height) {
+                sp_pend.frame = frame, sp_pend.w = t->width, sp_pend.h = t->height;
+                sp_pend.dfmt = cur_v.dfmt, sp_pend.nviews = 0;
+            }
+            int dup = 0;
+            for (int k = 0; k < sp_pend.nviews; k++)
+                if (sp_pend.v[k].vx == vx && sp_pend.v[k].vy == vy && sp_pend.v[k].vw == vw && sp_pend.v[k].vh == vh)
+                    dup = 1;
+            if (!dup && sp_pend.nviews < SP_MAX_VIEWS) {
+                SpView *sv = &sp_pend.v[sp_pend.nviews];
+                memcpy(sv->r, cur_v.r, sizeof sv->r);
+                sv->vx = vx, sv->vy = vy, sv->vw = vw, sv->vh = vh, sv->cut = 0;
+                sp_first = sp_pend.nviews == 0;
+                sp_pend.nviews++;
+                SP.comp_exec = *t, SP.comp_frame = frame;
+                do_sp_depth = 1, sp_src_depth = cur_v.depth, sp_dfmt = cur_v.dfmt;
+                sp_sw = cur_v.w, sp_sh = cur_v.h, sp_tw = t->width, sp_th = t->height;
+                sp_vx = vx, sp_vy = vy, sp_vw = vw, sp_vh = vh;
+            }
+        } else if (sp_pend.frame == frame && sp_pend.nviews >= 2 && SP.comp_frame == frame && H.done_frame != frame) {
+            int full_on_comp = t->image == SP.comp_exec.image && !sub_vp;
+            int final_srgb = t->format == VK_FORMAT_R8G8B8A8_SRGB;
+            if (full_on_comp || final_srgb) {
+                src = SP.comp_exec, H.done_frame = frame, copy_after = 1;
+            }
+        }
+    }
+    if (pend.frame == frame && H.done_frame != frame && !is_sub_pend) {
         if (render_size) {
             if (ex->depth.image == pend.depth && t->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
                 H.scene = *t, H.scene_frame = frame;
@@ -847,11 +1336,22 @@ void vk_mv_pass_begin(VkExec *ex) {
         }
     }
     plat_mutex_unlock(&ml);
-    hud_copy(ex, &src, VK_IMAGE_LAYOUT_GENERAL, frame, 0);
+    if (do_sp_depth && sp_depth_images(vk_ctx(), sp_tw, sp_th, sp_dfmt))
+        sp_copy_depth_tile(ex, sp_src_depth, sp_dfmt, sp_sw, sp_sh, sp_vx, sp_vy, sp_vw, sp_vh, frame, sp_first);
+    hud_copy(ex, &src, live_layout(ex, src.image), frame, copy_after);
 }
 
-// The replay thread, in vk_exec_pass_end after vkCmdEndRendering when the pass actually completes (!split_ending).
+// The replay thread (or chunk workers during MKW_REPLAY_PAR), in vk_exec_pass_end after vkCmdEndRendering.
 void vk_mv_pass_end(VkExec *ex) {
+    if (__atomic_load_n(&PP.active, __ATOMIC_ACQUIRE)) {
+        uint64_t pos = vk_exec_op_pos();
+        for (int i = 0; i < PP.nacts; i++) {
+            const MvParAct *act = &PP.acts[i];
+            if (act->kind == PAR_ACT_HUD_END && pos >= act->lo && pos <= act->hi)
+                hud_copy_cb(ex, &act->src, live_layout(ex, act->src.image), PP.frame, act->copy_after);
+        }
+        return;
+    }
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     const VkExecTarget *t = &ex->color[0];
     VkExecTarget src = {0};
@@ -1010,7 +1510,7 @@ static int out_init(VkCtx *c) {
     VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
                                            .bindingCount = 8, .pBindings = b};
-    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 88};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 112};
     if (vkCreateDescriptorSetLayout(c->device, &dci, NULL, &O.dsl) != VK_SUCCESS) return 0;
     VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                      .pSetLayouts = &O.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
@@ -1036,7 +1536,8 @@ static int out_image(VkCtx *c, uint32_t w, uint32_t h) {
         VkImageCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
                                 .format = VK_FORMAT_R16_SFLOAT, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                                 .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                                .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+                                .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
         VmaAllocationCreateInfo bai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         if (vmaCreateImage(c->vma, &bi, &bai, &O.bias, &O.bias_a, NULL) != VK_SUCCESS) return O.bias = VK_NULL_HANDLE, 0;
         VkImageViewCreateInfo bvi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = O.bias,
@@ -1047,7 +1548,8 @@ static int out_image(VkCtx *c, uint32_t w, uint32_t h) {
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
                             .format = VK_FORMAT_R16G16_SFLOAT, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+                            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (vmaCreateImage(c->vma, &ii, &ai, &O.img, &O.a, NULL) != VK_SUCCESS) return O.img = VK_NULL_HANDLE, 0;
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = O.img,
@@ -1058,22 +1560,133 @@ static int out_image(VkCtx *c, uint32_t w, uint32_t h) {
     return 1;
 }
 
+typedef struct {
+    float m[16], size[2], jd[2], has_prev, has_scene, has_vel, pad;
+    int32_t rect[4];
+} MvOutPc;
+
+static int cam_reproj(const float r[32][4], float out_col[16]) {
+    double cur[4][4], prev[4][4], inv[4][4], mm[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) cur[i][j] = r[3 + i][j], prev[i][j] = r[24 + i][j];
+    if (!invert(cur, inv)) return 0;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            mm[i][j] = 0;
+            for (int k = 0; k < 4; k++) mm[i][j] += prev[i][k] * inv[k][j];
+        }
+    for (int col = 0; col < 4; col++)
+        for (int row = 0; row < 4; row++) out_col[col * 4 + row] = (float)mm[row][col];
+    return 1;
+}
+
 // The present thread, before DLSS: the motion vectors of the frame being presented (velocity pass, then mv_out.comp),
 // and what the frame's captures give. 0 when this frame has no 3D scene, no copy without the HUD, or the render size
-// is not the scene's (the caller then presents as before).
+// is not the scene's (the caller then presents as before). Supports both 1P (full-screen scene + XFB object motion)
+// and 2P/3P/4P split-screen (per-player stitched composite depth + per-viewport camera motion vectors).
 int vk_mv_frame_inputs(VkCommandBuffer cb, unsigned slot, const int crop[4], VkMvFrame *f) {
     VkCtx *c = vk_ctx();
     if (vk_mv_armed <= 0) return 0;
     if (!M.tried) init(c);
     if (!O.tried) out_init(c);
+    uint32_t w = (uint32_t)crop[2], h = (uint32_t)crop[3];
+    __atomic_store_n(&last_crop_w, w, __ATOMIC_RELAXED);
+    __atomic_store_n(&last_crop_h, h, __ATOMIC_RELAXED);
     Cam cam;
+    SpFrame sp;
     plat_mutex_lock(&ml);
     cam = ready;
+    sp = sp_ready;
     plat_mutex_unlock(&ml);
-    uint32_t w = (uint32_t)crop[2], h = (uint32_t)crop[3];
+    (void)slot;
+
+    // Split-screen multi-viewport path (2P/3P/4P): every player view was stitched into SP.depth and H.img.
+    if (sp.frame && sp.nviews >= 2 && sp.w == w && sp.h == h) {
+        int sp_s = (int)(sp.frame % SP_SLOTS);
+        VkImageView hv = hud_view(sp.frame);
+        if (!M.ok || !O.ok || !hv || !SP.depth[sp_s] || SP.frame[sp_s] != sp.frame || !out_image(c, w, h)) {
+            static int sp_miss_log;
+            if (sp_miss_log++ < 8)
+                rt_log("mv: split-screen inputs skipped frame %llu (nviews=%d hv=%d sp_depth=%d sp_f=%llu)",
+                       (unsigned long long)sp.frame, sp.nviews, hv != VK_NULL_HANDLE, SP.depth[sp_s] != VK_NULL_HANDLE,
+                       (unsigned long long)SP.frame[sp_s]);
+            return 0;
+        }
+        VkMemoryBarrier2 fb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+        VkDependencyInfo fd = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &fb};
+        vkCmdPipelineBarrier2(cb, &fd);
+        VkImageView velv = vel_pass(cb, sp.frame, SP.v[sp_s], w, h, sp.v[0].r[14][0], sp.v[0].r[14][1]);
+        if (!velv) return 0;
+        barrier(cb, O.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+        barrier(cb, O.bias, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+        // Clear MV to 0 and bias to 1 so any non-3D quadrant (e.g. 3P map) is treated as static UI.
+        VkClearColorValue zclr = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+        VkClearColorValue oclr = {.float32 = {1.0f, 0.0f, 0.0f, 0.0f}};
+        VkImageSubresourceRange rng = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, O.img, VK_IMAGE_LAYOUT_GENERAL, &zclr, 1, &rng);
+        vkCmdClearColorImage(cb, O.bias, VK_IMAGE_LAYOUT_GENERAL, &oclr, 1, &rng);
+        barrier(cb, O.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        barrier(cb, O.bias, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkImageView scene_cur = hv, scene_prev = hud_view(sp.frame - 1);
+        VkImageView prevv = pic_cur ? pic_prev : scene_prev;
+        if (pic_cur) hv = pic_cur;
+        VkDescriptorImageInfo di[8] = {{M.nearest, SP.v[sp_s], VK_IMAGE_LAYOUT_GENERAL},
+                                       {M.nearest, velv, VK_IMAGE_LAYOUT_GENERAL},
+                                       {VK_NULL_HANDLE, O.view, VK_IMAGE_LAYOUT_GENERAL},
+                                       {M.nearest, hv, VK_IMAGE_LAYOUT_GENERAL},
+                                       {M.linear, prevv ? prevv : hv, VK_IMAGE_LAYOUT_GENERAL},
+                                       {VK_NULL_HANDLE, O.bias_view, VK_IMAGE_LAYOUT_GENERAL},
+                                       {M.nearest, scene_cur, VK_IMAGE_LAYOUT_GENERAL},
+                                       {M.linear, scene_prev ? scene_prev : scene_cur, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet wr[8];
+        for (uint32_t i = 0; i < 8; i++)
+            wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1,
+                                           .descriptorType = i == 2 || i == 5 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                                              : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                           .pImageInfo = &di[i]};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.pipe);
+        rec_push(M.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.layout, 0, 8, wr);
+        int any_ok = 0, all_cut = 1;
+        for (int k = 0; k < sp.nviews; k++) {
+            MvOutPc pc = {0};
+            if (!cam_reproj(sp.v[k].r, pc.m)) continue;
+            float has_prev = prevv && O.last_frame + 1 == sp.frame && !sp.v[k].cut;
+            float has_scene = pic_cur && scene_prev && has_prev;
+            pc.size[0] = (float)w, pc.size[1] = (float)h;
+            pc.has_prev = has_prev, pc.has_scene = has_scene, pc.has_vel = 0.0f;
+            pc.rect[0] = sp.v[k].vx, pc.rect[1] = sp.v[k].vy, pc.rect[2] = sp.v[k].vw, pc.rect[3] = sp.v[k].vh;
+            vkCmdPushConstants(cb, O.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+            vkCmdDispatch(cb, ((uint32_t)sp.v[k].vw + 7) / 8, ((uint32_t)sp.v[k].vh + 7) / 8, 1);
+            any_ok = 1;
+            if (!sp.v[k].cut) all_cut = 0;
+        }
+        if (!any_ok) return 0;
+        barrier(cb, O.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        barrier(cb, O.bias, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        int hs = (int)(sp.frame % HUD_SLOTS);
+        memset(f, 0, sizeof *f);
+        f->frame = sp.frame;
+        f->reset = O.last_frame + 1 != sp.frame || all_cut;
+        O.last_frame = sp.frame;
+        f->w = w, f->h = h;
+        f->depth = SP.depth[sp_s], f->depth_view = SP.v[sp_s], f->depth_fmt = sp.dfmt;
+        f->mv = O.img, f->mv_view = O.view;
+        f->bias = O.bias, f->bias_view = O.bias_view;
+        f->color = H.img[hs], f->color_view = H.v[hs], f->color_fmt = H.f;
+        f->jitter[0] = 0.0f, f->jitter[1] = 0.0f;
+        memcpy(f->cam, sp.v[0].r, sizeof f->cam);
+        if (SP.logged != sp.nviews) {
+            SP.logged = sp.nviews;
+            rt_log("mv: split-screen DLSS inputs active (%d views stitched into %ux%u)", sp.nviews, w, h);
+        }
+        return 1;
+    }
+
+    // 1-player path (unchanged): full-screen depth + camera + XFB object velocity.
     VkImageView hv = cam.frame ? hud_view(cam.frame) : VK_NULL_HANDLE;
     if (!M.ok || !O.ok || !cam.frame || !hv || cam.w != w || cam.h != h || !out_image(c, w, h)) return 0;
-    (void)slot;
     // One view of the scene depth for as long as the depth image lasts: DLSS reads it through a view handle
     // (VK_NVX_image_view_handle) and keeps what it learned of a view, so a view made and destroyed per frame (whose
     // handle a later view could reuse) is what it must not get. A new depth image (a resolution change) waits for the
@@ -1093,15 +1706,8 @@ int vk_mv_frame_inputs(VkCommandBuffer cb, unsigned slot, const int crop[4], VkM
         O.depth_img = cam.depth;
         rt_log("mv: scene depth view for image %p", (void *)cam.depth);
     }
-    double cur[4][4], prev[4][4], inv[4][4], mm[4][4];
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) cur[i][j] = cam.r[3 + i][j], prev[i][j] = cam.r[24 + i][j];
-    if (!invert(cur, inv)) return 0;
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) {
-            mm[i][j] = 0;
-            for (int k = 0; k < 4; k++) mm[i][j] += prev[i][k] * inv[k][j];
-        }
+    MvOutPc pc = {0};
+    if (!cam_reproj(cam.r, pc.m)) return 0;
     // everything written before (the replay's targets, the captures) is visible to what follows
     VkMemoryBarrier2 fb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -1135,11 +1741,9 @@ int vk_mv_frame_inputs(VkCommandBuffer cb, unsigned slot, const int crop[4], VkM
                                        .pImageInfo = &di[i]};
     float jc[2], jp[2];
     vk_mv_jitter_px(cam.frame, &jc[0], &jc[1]), vk_mv_jitter_px(cam.frame - 1, &jp[0], &jp[1]);
-    struct { float m[16], size[2], jd[2], has_prev, has_scene; } pc;
-    for (int col = 0; col < 4; col++)
-        for (int row = 0; row < 4; row++) pc.m[col * 4 + row] = (float)mm[row][col];
     pc.size[0] = (float)w, pc.size[1] = (float)h, pc.jd[0] = jc[0] - jp[0], pc.jd[1] = jc[1] - jp[1];
-    pc.has_prev = has_prev, pc.has_scene = has_scene;
+    pc.has_prev = has_prev, pc.has_scene = has_scene, pc.has_vel = 1.0f;
+    pc.rect[0] = 0, pc.rect[1] = 0, pc.rect[2] = (int32_t)w, pc.rect[3] = (int32_t)h;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.pipe);
     rec_push(M.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, O.layout, 0, 8, wr);
     vkCmdPushConstants(cb, O.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);

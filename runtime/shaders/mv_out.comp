@@ -17,6 +17,9 @@ layout(push_constant) uniform P {
     vec2 jd;
     float has_prev;
     float has_scene;
+    float has_vel;
+    float _pad;
+    ivec4 rect;
 } pc;
 
 float tone(vec3 c) { return sqrt(max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0)); }
@@ -26,36 +29,43 @@ vec3 approx_tm(vec3 c) {
 }
 float tone_scene(vec3 c) { return tone(approx_tm(c)); }
 
-vec2 cam_mv(vec2 uv, float d) {
-    vec4 q = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d * 2.0 - 1.0, 1.0);
+vec2 cam_mv(ivec2 px, float d) {
+    vec2 tile_sz = vec2(pc.rect.zw);
+    vec2 luv = (vec2(px - pc.rect.xy) + 0.5) / tile_sz;
+    vec4 q = pc.m * vec4(luv.x * 2.0 - 1.0, 1.0 - luv.y * 2.0, d * 2.0 - 1.0, 1.0);
     vec2 pn = q.xy / q.w;
-    vec2 puv = vec2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
-    return (puv - uv) * pc.size;
+    vec2 pluv = vec2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
+    return (pluv - luv) * tile_sz;
 }
 
 vec2 pixel_mv(ivec2 p, vec2 uv) {
-    vec4 ov = texelFetch(vel, p, 0);
-    if (ov.a > 0.5) return -(ov.xy - pc.jd);
-    return cam_mv(uv, texture(depth, uv).r);
+    if (pc.has_vel > 0.5) {
+        vec4 ov = texelFetch(vel, p, 0);
+        if (ov.a > 0.5) return -(ov.xy - pc.jd);
+    }
+    return cam_mv(p, texture(depth, uv).r);
 }
 
 void main() {
-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 lp = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(lp, pc.rect.zw))) return;
+    ivec2 p = pc.rect.xy + lp;
     if (any(greaterThanEqual(p, ivec2(pc.size)))) return;
     vec2 uv = (vec2(p) + 0.5) / pc.size;
-    vec4 ov = texelFetch(vel, p, 0);
+    vec4 ov = pc.has_vel > 0.5 ? texelFetch(vel, p, 0) : vec4(0.0);
     bool cam = ov.a <= 0.5;
     float d0 = texture(depth, uv).r;
-    vec2 mv = cam ? cam_mv(uv, d0) : -(ov.xy - pc.jd);
+    vec2 mv = cam ? cam_mv(p, d0) : -(ov.xy - pc.jd);
 
-    // Dilate MVs toward closer depth (lamp poles / thin silhouettes).
-    ivec2 max_p = ivec2(pc.size) - 1;
+    // Dilate MVs toward closer depth (lamp poles / thin silhouettes), clamped inside this viewport tile.
+    ivec2 min_p = pc.rect.xy;
+    ivec2 max_p = min(pc.rect.xy + pc.rect.zw, ivec2(pc.size)) - 1;
     float best_d = d0;
     vec2 best_mv = mv;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0) continue;
-            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
+            ivec2 q = clamp(p + ivec2(dx, dy), min_p, max_p);
             vec2 quv = (vec2(q) + 0.5) / pc.size;
             float dq = texture(depth, quv).r;
             if (dq + 0.003 < best_d) {
@@ -67,7 +77,9 @@ void main() {
     mv = best_mv;
 
     vec2 prev_uv = uv + (mv - pc.jd) / pc.size;
-    bool prev_ok = pc.has_prev > 0.5 && all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)));
+    vec2 rect_lo = vec2(pc.rect.xy) / pc.size;
+    vec2 rect_hi = vec2(pc.rect.xy + pc.rect.zw) / pc.size;
+    bool prev_ok = pc.has_prev > 0.5 && all(greaterThanEqual(prev_uv, rect_lo)) && all(lessThanEqual(prev_uv, rect_hi));
     float bias = 0.0;
 
     if (pc.has_prev > 0.5 && !prev_ok) {
@@ -97,8 +109,8 @@ void main() {
             if (shadow > 0.5) {
                 for (int dy = -2; dy <= 2; dy++) {
                     for (int dx = -2; dx <= 2; dx++) {
-                        ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
-                        vec2 puv = clamp(prev_uv + vec2(dx, dy) / pc.size, vec2(0.0), vec2(1.0));
+                        ivec2 q = clamp(p + ivec2(dx, dy), min_p, max_p);
+                        vec2 puv = clamp(prev_uv + vec2(dx, dy) / pc.size, rect_lo, rect_hi);
                         float cq, pq;
                         if (pc.has_scene > 0.5) {
                             cq = tone_scene(texelFetch(cur_scene, q, 0).rgb);
@@ -121,7 +133,7 @@ void main() {
         for (int dy = -1; dy <= 1; dy++) {
             for (int dx = -1; dx <= 1; dx++) {
                 if (dx == 0 && dy == 0) continue;
-                ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
+                ivec2 q = clamp(p + ivec2(dx, dy), min_p, max_p);
                 float dq = texture(depth, (vec2(q) + 0.5) / pc.size).r;
                 edge = max(edge, abs(dq - d0));
                 far_nb = max(far_nb, dq);
@@ -131,15 +143,21 @@ void main() {
             float contrast = 0.0;
             for (int dy = -1; dy <= 1; dy++) {
                 for (int dx = -1; dx <= 1; dx++) {
-                    ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), max_p);
+                    ivec2 q = clamp(p + ivec2(dx, dy), min_p, max_p);
                     contrast = max(contrast, abs(tone(texelFetch(cur_pic, q, 0).rgb) - ct));
                 }
             }
             if (contrast > 0.16) thin = 1.0;
         }
 
-        if (cam) bias = max(shadow, thin);
-        else if (diff > 0.08) bias = 1.0;
+        if (cam) {
+            bias = max(shadow, thin);
+            // Split-screen without XFB object velocity: flag moving objects (karts) whose camera-reprojected
+            // previous pixel disagrees strongly so DLSS/DLSS-G do not warp them with road MVs.
+            if (pc.has_vel < 0.5 && diff > 0.14) bias = 1.0;
+        } else if (diff > 0.08) {
+            bias = 1.0;
+        }
 
         // HUD / title logo: finished must disagree with HUD-less scene (content gap).
         if (pc.has_scene > 0.5) {

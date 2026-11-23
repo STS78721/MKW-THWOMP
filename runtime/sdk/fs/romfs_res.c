@@ -82,7 +82,11 @@ static int patch_dict(uint8_t *b, size_t n, uint32_t keys_off, uint32_t node, co
             memcpy(e + 4, &lod, 4);   // little-endian, as the BYML
             changed++;
         } else if (type == 0xD1 || type == 0xD3) {   // int, uint
-            uint32_t v = strstr(name, "For3D") ? r3d : strstr(name, "Screen") ? screen : 0;
+            // Docked 1P (For3D) and 3-4P (For3DForDiv4) render at 65 % of the BYML line count; 2P (For3DForDiv)
+            // renders at 100 % of For3DForDiv, so dividing it by 0.65 inflated 2P internal pixels by 2.36x.
+            uint32_t v = strstr(name, "For3D")
+                             ? (strstr(name, "For3DForDiv") && !strstr(name, "For3DForDiv4") ? screen : r3d)
+                             : strstr(name, "Screen") ? screen : 0;
             if (v) e[4] = (uint8_t)v, e[5] = (uint8_t)(v >> 8), e[6] = (uint8_t)(v >> 16), e[7] = (uint8_t)(v >> 24), changed++;
         }
     }
@@ -132,7 +136,7 @@ static const char *write_overlay(int lines, float lod) {
     snprintf(man, sizeof man, "%s/manifest.tsv", dir);
     uint64_t mn = 0;
     char *old = (char *)plat_file_read(man, &mn);
-    int fresh = old && strstr(old, ohex) && strstr(old, shex);   // written before from this same source
+    int fresh = old && strstr(old, ohex) && strstr(old, shex) && strstr(old, "div2-1x");   // written before from this same source & formula
     free(old);
     if (fresh) {   // the log still names the mode and the overlay used
         free(z);
@@ -165,7 +169,7 @@ static const char *write_overlay(int lines, float lod) {
     char nhex[65], line[512];
     sha256(out, on, nsha);
     hex(nsha, nhex);
-    snprintf(line, sizeof line, "# from %s\n%s\t%zu\t%s\t%s\n", shex, archive, on, nhex, ohex);
+    snprintf(line, sizeof line, "# from %s div2-1x\n%s\t%zu\t%s\t%s\n", shex, archive, on, nhex, ohex);
     int ok = plat_file_write_atomic(path, out, on) && plat_file_write_atomic(man, line, strlen(line));
     free(out);
     if (!ok) { rt_log("resolution: cannot write %s", dir); return NULL; }
